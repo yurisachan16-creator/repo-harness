@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   chmodSync,
+  copyFileSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
@@ -11,11 +12,40 @@ import {
 import { tmpdir } from "os";
 import { join } from "path";
 import { spawnSync } from "child_process";
+import { createHash } from "crypto";
+import { runSubagentHandler } from "../src/cli/hook/subagent-handler";
 
 const ROOT = join(import.meta.dir, "..");
 const SCRIPT = join(ROOT, "scripts/check-agent-tooling.sh");
 const WAZA_SKILLS = ["think", "hunt", "check", "health"];
 const WAZA_RULES = ["anti-patterns.md", "chinese.md", "durable-context.md", "english.md"];
+const MANAGED_AGENTS = ["explorer", "deep-reasoner", "fast-worker", "deep-worker", "gatekeeper", "root-cause-prover", "harness-evaluator"];
+const FLEET_SOURCE_DIR = join(ROOT, "agents/fleet");
+
+function sha256File(filePath: string) {
+  return createHash("sha256").update(readFileSync(filePath)).digest("hex");
+}
+
+function sha256Text(content: string) {
+  return `sha256:${createHash("sha256").update(content).digest("hex")}`;
+}
+
+function writeAgentFleetReceipt(home: string, files: Array<{ path: string; sha256: string }>, authority = "user-managed-agent-fleet") {
+  mkdirSync(join(home, ".repo-harness"), { recursive: true });
+  writeFileSync(
+    join(home, ".repo-harness", "agent-fleet-user-managed.json"),
+    JSON.stringify(
+      {
+        protocol: 1,
+        authority,
+        accepted_at: "2026-07-30T00:00:00.000Z",
+        files,
+      },
+      null,
+      2
+    )
+  );
+}
 
 function writeExecutable(filePath: string, content: string) {
   writeFileSync(filePath, content);
@@ -112,17 +142,17 @@ function symlinkClaudeWazaToAgents(home: string) {
   }
 }
 
-function writeFakeNpx(fakeBin: string, logFile?: string) {
+function writeFakeBunx(fakeBin: string, logFile?: string) {
   const items = WAZA_SKILLS
     .map((skill) => ({ name: skill, agents: ["Claude Code", "Codex"] }))
     .map((item) => JSON.stringify(item))
     .join(",");
   writeExecutable(
-    join(fakeBin, "npx"),
+    join(fakeBin, "bunx"),
     [
       "#!/bin/bash",
       "set -euo pipefail",
-      logFile ? `echo "npx $*" >> "${logFile}"` : "",
+      logFile ? `echo "bunx $*" >> "${logFile}"` : "",
       "if [[ \"$*\" == *\"skills ls -g --json\"* ]]; then",
       `  echo '[${items}]'`,
       "  exit 0",
@@ -132,38 +162,6 @@ function writeFakeNpx(fakeBin: string, logFile?: string) {
       "  exit 2",
       "fi",
       "exit 1",
-      "",
-    ].join("\n")
-  );
-}
-
-function writeFakeGbrain(fakeBin: string, logFile?: string) {
-  writeExecutable(
-    join(fakeBin, "gbrain"),
-    [
-      "#!/bin/bash",
-      "set -euo pipefail",
-      logFile ? `echo "gbrain $*" >> "${logFile}"` : "",
-      "case \"$*\" in",
-      "  \"--version\")",
-      "    echo 'gbrain 0.12.0'",
-      "    ;;",
-      "  \"doctor --json --fast\")",
-      "    echo '{\"status\":\"warnings\",\"health_score\":90,\"checks\":[{\"name\":\"connection\",\"status\":\"warn\",\"message\":\"fast mode skipped DB checks\"}]}'",
-      "    ;;",
-      "  \"doctor --json\")",
-      "    echo '{\"status\":\"warnings\",\"health_score\":90}'",
-      "    ;;",
-      "  \"integrations list --json\")",
-      "    echo '{\"local\":[\"repo-sync\"]}'",
-      "    ;;",
-      "  \"check-update --json\")",
-      "    echo '{\"update_available\":false}'",
-      "    ;;",
-      "  *)",
-      "    exit 1",
-      "    ;;",
-      "esac",
       "",
     ].join("\n")
   );
@@ -221,6 +219,9 @@ function writeFakeNpm(fakeBin: string, version: string, logFile?: string) {
   );
 }
 
+// Every test that spawns the script with `--check-updates` must stub curl with
+// this helper: without it the run reaches the real network for upstream Waza
+// sources, which makes the test slow and non-deterministic.
 function writeFakeCurl(fakeBin: string, version: string, logFile?: string) {
   writeExecutable(
     join(fakeBin, "curl"),
@@ -266,16 +267,34 @@ function writeFakeCurl(fakeBin: string, version: string, logFile?: string) {
   );
 }
 
+function writeArchctxRepo(repoRoot: string, capabilitySource: "registry" | "archcontext") {
+  mkdirSync(join(repoRoot, ".ai/harness"), { recursive: true });
+  writeFileSync(
+    join(repoRoot, ".ai/harness/policy.json"),
+    JSON.stringify({ version: 1, context: { capability_source: capabilitySource } }, null, 2)
+  );
+  writeFileSync(
+    join(repoRoot, "package.json"),
+    JSON.stringify({ devDependencies: { "archctx-contracts": "0.3.0" } }, null, 2)
+  );
+}
+
+function installFleetForClaude(home: string) {
+  mkdirSync(join(home, ".claude", "agents"), { recursive: true });
+  for (const agent of MANAGED_AGENTS) {
+    copyFileSync(join(FLEET_SOURCE_DIR, `${agent}.md`), join(home, ".claude", "agents", `${agent}.md`));
+  }
+}
+
 describe("check-agent-tooling", () => {
-  test("reports gstack and Waza presence while keeping gbrain manual-only when MCP is disabled", () => {
+  test("reports active tooling without the retired planning provider", () => {
     const envRoot = setupFakeEnvironment("check-agent-tooling");
     try {
-      mkdirSync(join(envRoot.home, ".claude", "skills", "gstack"), { recursive: true });
-      mkdirSync(join(envRoot.home, ".codex", "skills", "gstack"), { recursive: true });
       mkdirSync(join(envRoot.home, ".agents", "skills"), { recursive: true });
-      writeFileSync(join(envRoot.home, ".claude", "skills", "gstack", "VERSION"), "1.2.3\n");
+      mkdirSync(join(envRoot.home, ".claude"), { recursive: true });
+      mkdirSync(join(envRoot.home, ".codex"), { recursive: true });
       writeFileSync(join(envRoot.home, ".claude", "settings.json"), "{}\n");
-      writeFileSync(join(envRoot.home, ".codex", "config.toml"), "[mcp_servers.codegraph]\ncommand = \"codegraph\"\n# no gbrain mcp\n");
+      writeFileSync(join(envRoot.home, ".codex", "config.toml"), "[mcp_servers.codegraph]\ncommand = \"codegraph\"\n");
       writeWazaBundle(join(envRoot.home, ".agents", "skills"), "3.0.0");
       writeWazaBundle(join(envRoot.home, ".codex", "skills"), "3.0.0");
       writeWazaRules(join(envRoot.home, ".agents"), "3.0.0");
@@ -283,8 +302,8 @@ describe("check-agent-tooling", () => {
       writeSkill(join(envRoot.home, ".codex", "skills"), "mermaid", "1.0.0");
       symlinkClaudeWazaToAgents(envRoot.home);
       writeWazaLock(envRoot.home);
-      writeFakeNpx(envRoot.fakeBin);
-      writeFakeGbrain(envRoot.fakeBin);
+
+      writeFakeBunx(envRoot.fakeBin);
       writeFakeCodeGraph(envRoot.fakeBin);
 
       const res = spawnSync("bash", [SCRIPT, "--json", "--host", "both"], {
@@ -304,12 +323,11 @@ describe("check-agent-tooling", () => {
         expect.arrayContaining(["bun", "npm", "npx", "skills_cli", "bash", "rsync", "symlink"])
       );
       expect(report.runtime_capabilities.bun.required).toBe(true);
-      expect(report.runtime_capabilities.npx.owner).toBe("external-skills-cli");
+      expect(report.runtime_capabilities.npx.owner).toBe("npm-registry");
       expect(report.runtime_capabilities.skills_cli.status).toBe("available");
       expect(report.runtime_capabilities.rsync.required).toBe(false);
       expect(report.runtime_capabilities.symlink.required_for).toContain("copy mode remains the fallback");
-      expect(report.tools.gstack.status).toBe("present");
-      expect(report.tools.gstack.hosts.claude.version).toBe("1.2.3");
+      expect(report.tools).not.toHaveProperty("gstack");
       expect(report.tools.waza.status).toBe("present");
       expect(report.tools.waza.source_repo).toBe("tw93/Waza");
       expect(report.tools.waza.primary_host).toBe("codex");
@@ -327,15 +345,7 @@ describe("check-agent-tooling", () => {
         architecture_diagram: "mermaid",
       });
       expect(report.tools.codex_automation_profile.vendoring_policy).toBe("do-not-vendor-skill-body");
-      expect(report.tools.gbrain.status).toBe("present");
-      expect(report.tools.gbrain.required).toBe(false);
-      expect(report.tools.gbrain.reason).toContain("fast doctor only skipped DB checks");
-      expect(report.tools.gbrain.install_command).toBe("bun install -g github:garrytan/gbrain");
-      expect(report.tools.gbrain.install_command).not.toContain("bun add -g gbrain");
-      expect(report.tools.gbrain.install_note).toContain("npm registry package gbrain");
-      expect(report.tools.gbrain.mcp_hosts.claude.status).toBe("disabled");
-      expect(report.tools.gbrain.mcp_hosts.codex.status).toBe("disabled");
-      expect(report.tools.gbrain.impact.knowledge_tasks).toBe("manual-only");
+      expect(report.tools).not.toHaveProperty("gbrain");
       expect(report.tools.codegraph.status).toBe("partial");
       expect(report.tools.codegraph.primary_host).toBe("codex");
       expect(report.tools.codegraph.source).toBe("global");
@@ -343,38 +353,8 @@ describe("check-agent-tooling", () => {
       expect(report.tools.codegraph.mcp_hosts.codex.status).toBe("configured");
       expect(report.tools.codegraph.project_index.status).toBe("up-to-date");
       expect(report.tools.codegraph.impact.code_navigation).toBe("missing");
-    } finally {
-      rmSync(envRoot.root, { recursive: true, force: true });
-    }
-  }, 15000);
 
-  test("keeps gbrain warning when fast doctor reports a real warning", () => {
-    const envRoot = setupFakeEnvironment("check-agent-tooling-gbrain-warning");
-    try {
-      writeExecutable(
-        join(envRoot.fakeBin, "gbrain"),
-        [
-          "#!/bin/bash",
-          "set -euo pipefail",
-          "case \"$*\" in",
-          "  \"--version\")",
-          "    echo 'gbrain 0.12.0'",
-          "    ;;",
-          "  \"doctor --json --fast\")",
-          "    echo '{\"status\":\"warnings\",\"health_score\":80,\"checks\":[{\"name\":\"sync_freshness\",\"status\":\"warn\",\"message\":\"stale source\"}]}'",
-          "    ;;",
-          "  \"integrations list --json\")",
-          "    echo '{}'",
-          "    ;;",
-          "  *)",
-          "    exit 1",
-          "    ;;",
-          "esac",
-          "",
-        ].join("\n")
-      );
-
-      const res = spawnSync("bash", [SCRIPT, "--json", "--host", "codex"], {
+      const textRes = spawnSync("bash", [SCRIPT, "--host", "both"], {
         cwd: ROOT,
         encoding: "utf-8",
         env: {
@@ -384,11 +364,9 @@ describe("check-agent-tooling", () => {
           AGENTIC_DEV_CODEGRAPH_ALLOW_REPO_LOCAL: "0",
         },
       });
-
-      expect(res.status).toBe(0);
-      const report = JSON.parse(res.stdout);
-      expect(report.tools.gbrain.status).toBe("warning");
-      expect(report.tools.gbrain.reason).toContain("doctor status is warnings");
+      expect(textRes.status).toBe(0);
+      expect(textRes.stdout.toLowerCase()).not.toContain("gstack");
+      expect(textRes.stdout).toContain("Waza [present]");
     } finally {
       rmSync(envRoot.root, { recursive: true, force: true });
     }
@@ -398,8 +376,7 @@ describe("check-agent-tooling", () => {
     const envRoot = setupFakeEnvironment("check-agent-tooling-codegraph-claude-deferred");
     try {
       writeClaudeCodeGraphConfig(envRoot.home, false);
-      writeFakeNpx(envRoot.fakeBin);
-      writeFakeGbrain(envRoot.fakeBin);
+      writeFakeBunx(envRoot.fakeBin);
       writeFakeCodeGraph(envRoot.fakeBin);
 
       const res = spawnSync("bash", [SCRIPT, "--json", "--host", "claude"], {
@@ -430,8 +407,7 @@ describe("check-agent-tooling", () => {
     const envRoot = setupFakeEnvironment("check-agent-tooling-codegraph-claude-always-load");
     try {
       writeClaudeCodeGraphConfig(envRoot.home, true);
-      writeFakeNpx(envRoot.fakeBin);
-      writeFakeGbrain(envRoot.fakeBin);
+      writeFakeBunx(envRoot.fakeBin);
       writeFakeCodeGraph(envRoot.fakeBin);
 
       const res = spawnSync("bash", [SCRIPT, "--json", "--host", "claude"], {
@@ -461,12 +437,11 @@ describe("check-agent-tooling", () => {
     const envRoot = setupFakeEnvironment("check-agent-tooling-updates");
     const logFile = join(envRoot.root, "tool.log");
     try {
-      mkdirSync(join(envRoot.home, ".claude", "skills", "gstack", ".git"), { recursive: true });
-      mkdirSync(join(envRoot.home, ".codex", "skills", "gstack", ".git"), { recursive: true });
       mkdirSync(join(envRoot.home, ".agents", "skills"), { recursive: true });
-      writeFileSync(join(envRoot.home, ".claude", "skills", "gstack", "VERSION"), "1.2.3\n");
+      mkdirSync(join(envRoot.home, ".claude"), { recursive: true });
+      mkdirSync(join(envRoot.home, ".codex"), { recursive: true });
       writeFileSync(join(envRoot.home, ".claude", "settings.json"), "{}\n");
-      writeFileSync(join(envRoot.home, ".codex", "config.toml"), "[mcp_servers.codegraph]\ncommand = \"codegraph\"\n# no gbrain mcp\n");
+      writeFileSync(join(envRoot.home, ".codex", "config.toml"), "[mcp_servers.codegraph]\ncommand = \"codegraph\"\n");
       writeWazaBundle(join(envRoot.home, ".agents", "skills"), "3.0.0");
       writeWazaBundle(join(envRoot.home, ".codex", "skills"), "3.0.0");
       writeWazaRules(join(envRoot.home, ".agents"), "3.0.0");
@@ -479,24 +454,18 @@ describe("check-agent-tooling", () => {
         join(envRoot.fakeBin, "git"),
         [
           "#!/bin/bash",
-          "set -euo pipefail",
           `echo "git $*" >> "${logFile}"`,
-          "case \"$*\" in",
-          "  *\"remote get-url origin\"*) echo 'https://github.com/garrytan/gstack.git' ;;",
-          "  *\"rev-parse HEAD\"*) echo 'abc123' ;;",
-          "  *\"ls-remote --symref origin HEAD\"*) printf 'ref: refs/heads/main\\tHEAD\\nabc123\\tHEAD\\n' ;;",
-          "  *) exit 1 ;;",
-          "esac",
+          "exit 1",
           "",
-        ].join("\n")
+        ].join("\n"),
       );
 
       writeExecutable(
-        join(envRoot.fakeBin, "npx"),
+        join(envRoot.fakeBin, "bunx"),
         [
           "#!/bin/bash",
           "set -euo pipefail",
-          `echo "npx $*" >> "${logFile}"`,
+          `echo "bunx $*" >> "${logFile}"`,
           "if [[ \"$*\" == *\"skills ls -g --json\"* ]]; then",
           `  echo '[${WAZA_SKILLS.map((skill) => JSON.stringify({ name: skill, agents: ["Claude Code", "Codex"] })).join(",")}]'`,
           "  exit 0",
@@ -514,7 +483,6 @@ describe("check-agent-tooling", () => {
         ].join("\n")
       );
 
-      writeFakeGbrain(envRoot.fakeBin, logFile);
       writeFakeCodeGraph(envRoot.fakeBin, { logFile });
       writeFakeNpm(envRoot.fakeBin, "0.9.6", logFile);
       writeFakeCurl(envRoot.fakeBin, "3.0.0", logFile);
@@ -533,24 +501,15 @@ describe("check-agent-tooling", () => {
       expect(res.status).toBe(0);
       const report = JSON.parse(res.stdout);
       const log = readFileSync(logFile, "utf-8");
-      expect(log).toContain("git -C");
-      expect(log).toContain("remote get-url origin");
-      expect(log).toContain("rev-parse HEAD");
-      expect(log).toContain("ls-remote --symref origin HEAD");
+      expect(log).not.toContain("git ");
       expect(log).toContain("curl -fsSL --max-time 5 https://raw.githubusercontent.com/tw93/Waza/main/skills/check/SKILL.md");
       expect(log).toContain("curl -fsSL --max-time 5 https://raw.githubusercontent.com/tw93/Waza/main/rules/durable-context.md");
-      expect(log).toContain("gbrain doctor --json --fast");
-      expect(log).toContain("gbrain check-update --json");
-      expect(log).toContain("gbrain integrations list --json");
       expect(log).toContain("codegraph --version");
       expect(log).toContain("codegraph status .");
       expect(log).toContain("npm view @colbymchenry/codegraph version --json");
       expect(log).not.toContain("setup");
       expect(log).not.toContain("skills check");
       expect(log).not.toContain("skills update");
-      expect(log).not.toContain("gbrain serve");
-      expect(log).not.toContain("gbrain sync");
-      expect(log).not.toContain("gbrain upgrade");
       expect(log).not.toContain("codegraph init");
       expect(log).not.toContain("codegraph sync");
       expect(log).not.toContain("codegraph install");
@@ -570,8 +529,7 @@ describe("check-agent-tooling", () => {
     try {
       mkdirSync(join(envRoot.home, ".codex"), { recursive: true });
       writeFileSync(join(envRoot.home, ".codex", "config.toml"), "# no codegraph mcp\n");
-      writeFakeNpx(envRoot.fakeBin);
-      writeFakeGbrain(envRoot.fakeBin);
+      writeFakeBunx(envRoot.fakeBin);
       writeFakeCodeGraph(envRoot.fakeBin);
 
       const res = spawnSync("bash", [SCRIPT, "--json", "--host", "codex", "--strict-readiness"], {
@@ -603,7 +561,7 @@ describe("check-agent-tooling", () => {
       mkdirSync(join(envRoot.home, ".claude"), { recursive: true });
       mkdirSync(join(envRoot.home, ".codex"), { recursive: true });
       writeFileSync(join(envRoot.home, ".claude", "settings.json"), "{}\n");
-      writeFileSync(join(envRoot.home, ".codex", "config.toml"), "[mcp_servers.codegraph]\ncommand = \"codegraph\"\n# no gbrain mcp\n");
+      writeFileSync(join(envRoot.home, ".codex", "config.toml"), "[mcp_servers.codegraph]\ncommand = \"codegraph\"\n");
       writeWazaBundle(join(envRoot.home, ".agents", "skills"), "9.0.0");
       writeWazaBundle(join(envRoot.home, ".codex", "skills"), "1.0.0");
       writeWazaRules(join(envRoot.home, ".agents"), "9.0.0");
@@ -611,8 +569,7 @@ describe("check-agent-tooling", () => {
       writeSkill(join(envRoot.home, ".codex", "skills"), "mermaid", "1.0.0");
       symlinkClaudeWazaToAgents(envRoot.home);
       writeWazaLock(envRoot.home);
-      writeFakeNpx(envRoot.fakeBin);
-      writeFakeGbrain(envRoot.fakeBin);
+      writeFakeBunx(envRoot.fakeBin);
       writeFakeCodeGraph(envRoot.fakeBin);
       writeFakeNpm(envRoot.fakeBin, "0.9.6");
       writeFakeCurl(envRoot.fakeBin, "9.0.0");
@@ -656,7 +613,7 @@ describe("check-agent-tooling", () => {
       mkdirSync(join(envRoot.home, ".claude"), { recursive: true });
       mkdirSync(join(envRoot.home, ".codex"), { recursive: true });
       writeFileSync(join(envRoot.home, ".claude", "settings.json"), "{}\n");
-      writeFileSync(join(envRoot.home, ".codex", "config.toml"), "[mcp_servers.codegraph]\ncommand = \"codegraph\"\n# no gbrain mcp\n");
+      writeFileSync(join(envRoot.home, ".codex", "config.toml"), "[mcp_servers.codegraph]\ncommand = \"codegraph\"\n");
       writeWazaBundle(join(envRoot.home, ".agents", "skills"), "3.0.0");
       writeWazaBundle(join(envRoot.home, ".codex", "skills"), "3.0.0");
       writeWazaRules(join(envRoot.home, ".agents"), "3.0.0");
@@ -667,8 +624,7 @@ describe("check-agent-tooling", () => {
       writeSkill(join(envRoot.home, ".codex", "skills"), "mermaid", "1.0.0");
       symlinkClaudeWazaToAgents(envRoot.home);
       writeWazaLock(envRoot.home);
-      writeFakeNpx(envRoot.fakeBin);
-      writeFakeGbrain(envRoot.fakeBin);
+      writeFakeBunx(envRoot.fakeBin);
       writeFakeCodeGraph(envRoot.fakeBin);
       writeFakeNpm(envRoot.fakeBin, "0.9.6");
       writeFakeCurl(envRoot.fakeBin, "3.0.0");
@@ -710,8 +666,7 @@ describe("check-agent-tooling", () => {
       mkdirSync(localBin, { recursive: true });
       mkdirSync(join(envRoot.home, ".codex"), { recursive: true });
       writeFileSync(join(envRoot.home, ".codex", "config.toml"), "[mcp_servers.codegraph]\ncommand = \"codegraph\"\n");
-      writeFakeNpx(envRoot.fakeBin);
-      writeFakeGbrain(envRoot.fakeBin);
+      writeFakeBunx(envRoot.fakeBin);
       writeFakeCodeGraph(localBin, { version: "0.9.6" });
       writeFakeCodeGraph(envRoot.fakeBin, { version: "0.8.0" });
 
@@ -756,8 +711,7 @@ describe("check-agent-tooling", () => {
         join(envRoot.root, "package.json"),
         JSON.stringify({ devDependencies: { "@colbymchenry/codegraph": "1.0.1" } }, null, 2)
       );
-      writeFakeNpx(envRoot.fakeBin);
-      writeFakeGbrain(envRoot.fakeBin);
+      writeFakeBunx(envRoot.fakeBin);
       writeFakeCodeGraph(bundleBin, { version: "1.0.1" });
       writeExecutable(join(shimBin, "codegraph"), "#!/bin/bash\necho 'bad shim used' >&2\nexit 99\n");
 
@@ -778,6 +732,748 @@ describe("check-agent-tooling", () => {
       expect(report.tools.codegraph.bin_path).toContain(`@colbymchenry/codegraph-${process.platform}-${process.arch}`);
       expect(report.tools.codegraph.local_version).toBe("1.0.1");
       expect(report.tools.codegraph.project_index.status).toBe("up-to-date");
+    } finally {
+      rmSync(envRoot.root, { recursive: true, force: true });
+    }
+  }, 15000);
+
+  test("fails strict readiness when the managed agent fleet is missing from an empty agents directory", () => {
+    const envRoot = setupFakeEnvironment("check-agent-tooling-fleet-missing");
+    try {
+      writeClaudeCodeGraphConfig(envRoot.home, true);
+      writeFakeBunx(envRoot.fakeBin);
+      writeFakeCodeGraph(envRoot.fakeBin);
+
+      const res = spawnSync("bash", [SCRIPT, "--json", "--host", "claude", "--strict-readiness"], {
+        cwd: ROOT,
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          HOME: envRoot.home,
+          PATH: `${envRoot.fakeBin}:${process.env.PATH ?? ""}`,
+          AGENTIC_DEV_CODEGRAPH_LOCAL_BIN: join(envRoot.fakeBin, "codegraph"),
+        },
+      });
+
+      expect(res.status).toBe(2);
+      const report = JSON.parse(res.stdout);
+      expect(report.tools.codegraph.status).toBe("present");
+      expect(report.tools.agent_fleet.status).toBe("missing");
+      expect(report.tools.agent_fleet.managed_agents).toEqual(MANAGED_AGENTS);
+      expect(report.tools.agent_fleet.hosts.claude.status).toBe("missing");
+      expect(report.tools.agent_fleet.hosts.claude.missing_agents).toEqual(MANAGED_AGENTS);
+      expect(res.stderr).toContain("Agent fleet readiness is missing");
+      expect(res.stderr.toLowerCase()).toContain("fleet");
+    } finally {
+      rmSync(envRoot.root, { recursive: true, force: true });
+    }
+  }, 15000);
+
+  test("fails strict readiness when the managed agent fleet is only partially installed", () => {
+    const envRoot = setupFakeEnvironment("check-agent-tooling-fleet-partial");
+    try {
+      writeClaudeCodeGraphConfig(envRoot.home, true);
+      writeFakeBunx(envRoot.fakeBin);
+      writeFakeCodeGraph(envRoot.fakeBin);
+
+      mkdirSync(join(envRoot.home, ".claude", "agents"), { recursive: true });
+      for (const agent of ["deep-reasoner", "fast-worker"]) {
+        copyFileSync(join(FLEET_SOURCE_DIR, `${agent}.md`), join(envRoot.home, ".claude", "agents", `${agent}.md`));
+      }
+
+      const res = spawnSync("bash", [SCRIPT, "--json", "--host", "claude", "--strict-readiness"], {
+        cwd: ROOT,
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          HOME: envRoot.home,
+          PATH: `${envRoot.fakeBin}:${process.env.PATH ?? ""}`,
+          AGENTIC_DEV_CODEGRAPH_LOCAL_BIN: join(envRoot.fakeBin, "codegraph"),
+        },
+      });
+
+      expect(res.status).toBe(2);
+      const report = JSON.parse(res.stdout);
+      expect(report.tools.codegraph.status).toBe("present");
+      expect(report.tools.agent_fleet.status).toBe("partial");
+      expect(report.tools.agent_fleet.hosts.claude.status).toBe("partial");
+      expect(report.tools.agent_fleet.hosts.claude.installed_agents).toEqual(["deep-reasoner", "fast-worker"]);
+      expect(report.tools.agent_fleet.hosts.claude.missing_agents).toEqual([
+        "explorer",
+        "deep-worker",
+        "gatekeeper",
+        "root-cause-prover",
+        "harness-evaluator",
+      ]);
+      expect(res.stderr).toContain("Agent fleet readiness is partial");
+      expect(res.stderr.toLowerCase()).toContain("fleet");
+    } finally {
+      rmSync(envRoot.root, { recursive: true, force: true });
+    }
+  }, 15000);
+
+  test("requires native role evidence before strict readiness passes for an installed Codex fleet", () => {
+    const envRoot = setupFakeEnvironment("check-agent-tooling-fleet-present");
+    try {
+      writeClaudeCodeGraphConfig(envRoot.home, true);
+      mkdirSync(join(envRoot.home, ".codex"), { recursive: true });
+      writeFileSync(join(envRoot.home, ".codex", "config.toml"), "[mcp_servers.codegraph]\ncommand = \"codegraph\"\n");
+      mkdirSync(join(envRoot.home, ".claude", "agents"), { recursive: true });
+      mkdirSync(join(envRoot.home, ".codex", "agents"), { recursive: true });
+      for (const agent of MANAGED_AGENTS) {
+        copyFileSync(join(FLEET_SOURCE_DIR, `${agent}.md`), join(envRoot.home, ".claude", "agents", `${agent}.md`));
+        copyFileSync(join(ROOT, ".codex", "agents", `${agent}.toml`), join(envRoot.home, ".codex", "agents", `${agent}.toml`));
+      }
+      writeFakeBunx(envRoot.fakeBin);
+      writeFakeCodeGraph(envRoot.fakeBin);
+
+      const res = spawnSync("bash", [SCRIPT, "--json", "--host", "both", "--strict-readiness"], {
+        cwd: envRoot.root,
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          HOME: envRoot.home,
+          PATH: `${envRoot.fakeBin}:${process.env.PATH ?? ""}`,
+          AGENTIC_DEV_CODEGRAPH_LOCAL_BIN: join(envRoot.fakeBin, "codegraph"),
+        },
+      });
+
+      expect(res.status).toBe(2);
+      const report = JSON.parse(res.stdout);
+      expect(report.tools.codegraph.status).toBe("present");
+      expect(report.tools.agent_fleet.status).toBe("present");
+      expect(report.tools.agent_fleet.hosts.claude.status).toBe("present");
+      expect(report.tools.agent_fleet.hosts.claude.installed_agents).toEqual(MANAGED_AGENTS);
+      expect(report.tools.agent_fleet.hosts.codex.status).toBe("present");
+      expect(report.tools.agent_fleet.hosts.codex.installed_agents).toEqual(MANAGED_AGENTS);
+      expect(report.tools.agent_fleet.source).toBe("package:agents/fleet");
+      expect(report.tools.agent_fleet.install_command).toBe("repo-harness run install-agent-fleet");
+      expect(report.tools.agent_fleet.native_role_routing.status).toBe("unverified");
+      expect(res.stderr).toContain("Codex native role routing is unverified");
+    } finally {
+      rmSync(envRoot.root, { recursive: true, force: true });
+    }
+  }, 15000);
+
+  test("fails strict readiness on aggregated negative or malformed Codex role-routing evidence and accepts verified evidence", () => {
+    for (const testCase of [
+      { evidenceStatus: "unavailable", reportedStatus: "unavailable", exitCode: 2 },
+      { evidenceStatus: "mismatch", reportedStatus: "mismatch", exitCode: 2 },
+      { evidenceStatus: "unverified", reportedStatus: "unverified", exitCode: 2 },
+      { evidenceStatus: "malformed-verified", reportedStatus: "invalid", exitCode: 2 },
+      { evidenceStatus: "malformed-unverified", reportedStatus: "invalid", exitCode: 2 },
+      { evidenceStatus: "verified-config-drift", reportedStatus: "invalid", exitCode: 2 },
+      { evidenceStatus: "pointer-missing-effort", reportedStatus: "invalid", exitCode: 2, omitPointerEffort: true },
+      { evidenceStatus: "observation-missing-effort", reportedStatus: "invalid", exitCode: 2, omitObservationEffort: true },
+      { evidenceStatus: "verified", reportedStatus: "verified", exitCode: 0 },
+    ]) {
+      const envRoot = setupFakeEnvironment(`check-agent-tooling-role-${testCase.evidenceStatus}`);
+      try {
+        mkdirSync(join(envRoot.home, ".codex", "agents"), { recursive: true });
+        writeFileSync(
+          join(envRoot.home, ".codex", "config.toml"),
+          "[mcp_servers.codegraph]\ncommand = \"codegraph\"\n",
+        );
+        for (const agent of MANAGED_AGENTS) {
+          copyFileSync(
+            join(ROOT, ".codex", "agents", `${agent}.toml`),
+            join(envRoot.home, ".codex", "agents", `${agent}.toml`),
+          );
+        }
+        const delegationRoot = join(envRoot.root, ".ai", "harness", "delegation");
+        const evidenceDir = join(delegationRoot, "role-routing", "fixture-current");
+        mkdirSync(evidenceDir, { recursive: true });
+        writeFileSync(
+          join(delegationRoot, "native-role-routing.json"),
+          `${JSON.stringify({
+            schema_version: 1,
+            required: true,
+            status: "unverified",
+            reason: "awaiting observations",
+            evidence_dir: "role-routing/fixture-current",
+            ...("omitPointerEffort" in testCase ? {} : { reasoning_effort_status: "configured_unverified" }),
+          }, null, 2)}\n`,
+        );
+        const semanticStatus = ["malformed-verified", "verified-config-drift", "pointer-missing-effort", "observation-missing-effort"].includes(testCase.evidenceStatus)
+          ? "verified"
+          : testCase.evidenceStatus === "malformed-unverified"
+            ? "unverified"
+            : testCase.evidenceStatus;
+        writeFileSync(
+          join(evidenceDir, "agent-a.json"),
+          `${JSON.stringify({
+            schema_version: 1,
+            required: true,
+            status: semanticStatus,
+            reason: `fixture ${testCase.evidenceStatus}`,
+            agent_id: semanticStatus === "unverified" ? null : "agent-a",
+            turn_id: semanticStatus === "unverified" ? null : "turn-a",
+            agent_type: semanticStatus === "unavailable" ? "default" : semanticStatus === "unverified" ? null : "fast-worker",
+            observed_model: semanticStatus === "unverified" ? null : semanticStatus === "mismatch" ? "gpt-5.6-sol" : "gpt-5.6-terra",
+            configured_model: semanticStatus === "unavailable" || testCase.evidenceStatus === "unverified" ? null : "gpt-5.6-terra",
+            config_path: testCase.evidenceStatus === "malformed-verified"
+              ? null
+              : semanticStatus === "unavailable" || testCase.evidenceStatus === "unverified"
+                ? null
+                : join(envRoot.home, ".codex", "agents", "fast-worker.toml"),
+            config_sha256: semanticStatus === "unavailable" || testCase.evidenceStatus === "malformed-verified" || testCase.evidenceStatus === "unverified"
+              ? null
+              : sha256File(join(envRoot.home, ".codex", "agents", "fast-worker.toml")),
+            ...("omitObservationEffort" in testCase ? {} : { reasoning_effort_status: "configured_unverified" }),
+            checked_at: "2026-07-12T00:00:00.000Z",
+          }, null, 2)}\n`,
+        );
+        if (testCase.evidenceStatus === "verified-config-drift") {
+          const configPath = join(envRoot.home, ".codex", "agents", "fast-worker.toml");
+          writeFileSync(configPath, `${readFileSync(configPath, "utf8")}# drift\n`);
+        }
+        writeFakeCodeGraph(envRoot.fakeBin);
+
+        const res = spawnSync("bash", [SCRIPT, "--json", "--host", "codex", "--strict-readiness"], {
+          cwd: envRoot.root,
+          encoding: "utf-8",
+          env: {
+            ...process.env,
+            HOME: envRoot.home,
+            PATH: `${envRoot.fakeBin}:${process.env.PATH ?? ""}`,
+            AGENTIC_DEV_CODEGRAPH_ALLOW_REPO_LOCAL: "0",
+          },
+        });
+
+        expect(res.status).toBe(testCase.exitCode);
+        const report = JSON.parse(res.stdout);
+        expect(report.tools.agent_fleet.status).toBe("present");
+        expect(report.tools.agent_fleet.native_role_routing.status).toBe(testCase.reportedStatus);
+        if (testCase.exitCode === 2) {
+          expect(res.stderr).toContain(`Codex native role routing is ${testCase.reportedStatus}`);
+        } else {
+          expect(res.stderr).not.toContain("Codex native role routing is");
+        }
+      } finally {
+        rmSync(envRoot.root, { recursive: true, force: true });
+      }
+    }
+  }, 30000);
+
+  test("accepts the top-level evidence pointer written by a real SubagentStart handler", () => {
+    const envRoot = setupFakeEnvironment("check-agent-tooling-hook-e2e");
+    try {
+      mkdirSync(join(envRoot.root, ".ai", "harness"), { recursive: true });
+      writeFileSync(join(envRoot.root, ".ai", "harness", "policy.json"), "{}\n");
+      mkdirSync(join(envRoot.home, ".codex", "agents"), { recursive: true });
+      writeFileSync(
+        join(envRoot.home, ".codex", "config.toml"),
+        "[mcp_servers.codegraph]\ncommand = \"codegraph\"\n",
+      );
+      for (const agent of MANAGED_AGENTS) {
+        copyFileSync(
+          join(ROOT, ".codex", "agents", `${agent}.toml`),
+          join(envRoot.home, ".codex", "agents", `${agent}.toml`),
+        );
+      }
+      writeFakeCodeGraph(envRoot.fakeBin);
+      const hook = runSubagentHandler({
+        event: "SubagentStart",
+        repoRoot: envRoot.root,
+        env: {
+          ...process.env,
+          HOME: envRoot.home,
+          PATH: `${envRoot.fakeBin}:${process.env.PATH ?? ""}`,
+          HOOK_HOST: "codex",
+        },
+        input: JSON.stringify({
+          hook_event_name: "SubagentStart",
+          session_id: "session-hook-e2e",
+          turn_id: "turn-hook-e2e",
+          agent_id: "agent-hook-e2e",
+          agent_type: "fast-worker",
+          model: "gpt-5.6-luna",
+        }),
+      });
+      expect(hook.exitCode).toBe(0);
+      expect(hook.stdout).toContain("[repo-harness:native-role-routing] verified");
+
+      const res = spawnSync("bash", [SCRIPT, "--json", "--host", "codex", "--strict-readiness"], {
+        cwd: envRoot.root,
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          HOME: envRoot.home,
+          PATH: `${envRoot.fakeBin}:${process.env.PATH ?? ""}`,
+          AGENTIC_DEV_CODEGRAPH_ALLOW_REPO_LOCAL: "0",
+        },
+      });
+      expect(res.status).toBe(0);
+      const report = JSON.parse(res.stdout);
+      expect(report.tools.agent_fleet.native_role_routing.status).toBe("verified");
+      expect(report.tools.agent_fleet.native_role_routing.observations).toEqual([
+        expect.objectContaining({
+          agent_type: "fast-worker",
+          observed_model: "gpt-5.6-luna",
+          reasoning_effort_status: "configured_unverified",
+        }),
+      ]);
+
+      const incompleteHook = runSubagentHandler({
+        event: "SubagentStart",
+        repoRoot: envRoot.root,
+        env: {
+          ...process.env,
+          HOME: envRoot.home,
+          PATH: `${envRoot.fakeBin}:${process.env.PATH ?? ""}`,
+          HOOK_HOST: "codex",
+        },
+        input: JSON.stringify({
+          hook_event_name: "SubagentStart",
+          session_id: "session-hook-e2e",
+          agent_type: "fast-worker",
+          model: "gpt-5.6-luna",
+        }),
+      });
+      expect(incompleteHook.stdout).toContain("[repo-harness:native-role-routing] unverified");
+
+      const incompleteRes = spawnSync("bash", [SCRIPT, "--json", "--host", "codex", "--strict-readiness"], {
+        cwd: envRoot.root,
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          HOME: envRoot.home,
+          PATH: `${envRoot.fakeBin}:${process.env.PATH ?? ""}`,
+          AGENTIC_DEV_CODEGRAPH_ALLOW_REPO_LOCAL: "0",
+        },
+      });
+      expect(incompleteRes.status).toBe(2);
+      const incompleteReport = JSON.parse(incompleteRes.stdout);
+      expect(incompleteReport.tools.agent_fleet.native_role_routing.status).toBe("unverified");
+      expect(incompleteReport.tools.agent_fleet.native_role_routing.observations).toHaveLength(2);
+    } finally {
+      rmSync(envRoot.root, { recursive: true, force: true });
+    }
+  }, 15000);
+
+  test("does not revive a historical canary when the current evidence scope is empty", () => {
+    const envRoot = setupFakeEnvironment("check-agent-tooling-role-aggregate");
+    try {
+      mkdirSync(join(envRoot.home, ".codex", "agents"), { recursive: true });
+      writeFileSync(join(envRoot.home, ".codex", "config.toml"), "[mcp_servers.codegraph]\ncommand = \"codegraph\"\n");
+      for (const agent of MANAGED_AGENTS) {
+        copyFileSync(join(ROOT, ".codex", "agents", `${agent}.toml`), join(envRoot.home, ".codex", "agents", `${agent}.toml`));
+      }
+      const delegationRoot = join(envRoot.root, ".ai", "harness", "delegation");
+      const previousDir = join(delegationRoot, "role-routing", "previous");
+      mkdirSync(previousDir, { recursive: true });
+      const base = {
+        schema_version: 1,
+        required: true,
+        turn_id: "turn-a",
+        reasoning_effort_status: "configured_unverified",
+        checked_at: "2026-07-12T00:00:00.000Z",
+      };
+      writeFileSync(join(previousDir, "negative.json"), `${JSON.stringify({
+        ...base,
+        status: "unavailable",
+        reason: "default child",
+        agent_id: "agent-negative",
+        agent_type: "default",
+        observed_model: "gpt-5.6-sol",
+        configured_model: null,
+        config_path: null,
+        config_sha256: null,
+      })}\n`);
+      writeFileSync(join(previousDir, "verified.json"), `${JSON.stringify({
+        ...base,
+        status: "verified",
+        reason: "verified child",
+        agent_id: "agent-verified",
+        agent_type: "fast-worker",
+        observed_model: "gpt-5.6-sol",
+        configured_model: "gpt-5.6-sol",
+        config_path: join(envRoot.home, ".codex", "agents", "fast-worker.toml"),
+        config_sha256: sha256File(join(envRoot.home, ".codex", "agents", "fast-worker.toml")),
+      })}\n`);
+      mkdirSync(join(delegationRoot, "role-routing", "empty-current"), { recursive: true });
+      writeFileSync(join(delegationRoot, "native-role-routing.json"), `${JSON.stringify({
+        schema_version: 1,
+        required: true,
+        status: "unverified",
+        reason: "awaiting observations",
+        evidence_dir: "role-routing/empty-current",
+        reasoning_effort_status: "configured_unverified",
+      })}\n`);
+      writeFakeCodeGraph(envRoot.fakeBin);
+
+      const res = spawnSync("bash", [SCRIPT, "--json", "--host", "codex", "--strict-readiness"], {
+        cwd: envRoot.root,
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          HOME: envRoot.home,
+          PATH: `${envRoot.fakeBin}:${process.env.PATH ?? ""}`,
+          AGENTIC_DEV_CODEGRAPH_ALLOW_REPO_LOCAL: "0",
+        },
+      });
+      expect(res.status).toBe(2);
+      const report = JSON.parse(res.stdout);
+      expect(report.tools.agent_fleet.native_role_routing.status).toBe("unverified");
+      expect(report.tools.agent_fleet.native_role_routing.observations).toHaveLength(0);
+    } finally {
+      rmSync(envRoot.root, { recursive: true, force: true });
+    }
+  }, 15000);
+
+  test("fails closed when the native evidence pointer targets a missing scope", () => {
+    const envRoot = setupFakeEnvironment("check-agent-tooling-role-dangling");
+    try {
+      mkdirSync(join(envRoot.home, ".codex", "agents"), { recursive: true });
+      writeFileSync(join(envRoot.home, ".codex", "config.toml"), "[mcp_servers.codegraph]\ncommand = \"codegraph\"\n");
+      for (const agent of MANAGED_AGENTS) {
+        copyFileSync(join(ROOT, ".codex", "agents", `${agent}.toml`), join(envRoot.home, ".codex", "agents", `${agent}.toml`));
+      }
+      const delegationRoot = join(envRoot.root, ".ai", "harness", "delegation");
+      mkdirSync(delegationRoot, { recursive: true });
+      writeFileSync(join(delegationRoot, "native-role-routing.json"), `${JSON.stringify({
+        schema_version: 1,
+        required: true,
+        status: "unverified",
+        reason: "awaiting observations",
+        evidence_dir: "role-routing/missing-current",
+        reasoning_effort_status: "configured_unverified",
+      })}\n`);
+      writeFakeCodeGraph(envRoot.fakeBin);
+
+      const res = spawnSync("bash", [SCRIPT, "--json", "--host", "codex", "--strict-readiness"], {
+        cwd: envRoot.root,
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          HOME: envRoot.home,
+          PATH: `${envRoot.fakeBin}:${process.env.PATH ?? ""}`,
+          AGENTIC_DEV_CODEGRAPH_ALLOW_REPO_LOCAL: "0",
+        },
+      });
+      expect(res.status).toBe(2);
+      const report = JSON.parse(res.stdout);
+      expect(report.tools.agent_fleet.native_role_routing.status).toBe("invalid");
+      expect(report.tools.agent_fleet.native_role_routing.reason).toContain("missing directory");
+    } finally {
+      rmSync(envRoot.root, { recursive: true, force: true });
+    }
+  }, 15000);
+
+  test("classifies Claude agent drift against the packaged repo-owned source without network access", () => {
+    const envRoot = setupFakeEnvironment("check-agent-tooling-fleet-updates");
+    try {
+      const localContent: Record<string, string> = {};
+      for (const agent of MANAGED_AGENTS) {
+        localContent[agent] = readFileSync(join(FLEET_SOURCE_DIR, `${agent}.md`), "utf-8");
+      }
+      localContent["fast-worker"] += "\n# local drift\n";
+
+      mkdirSync(join(envRoot.home, ".claude", "agents"), { recursive: true });
+      mkdirSync(join(envRoot.home, ".codex", "agents"), { recursive: true });
+      for (const agent of MANAGED_AGENTS) {
+        writeFileSync(join(envRoot.home, ".claude", "agents", `${agent}.md`), localContent[agent]);
+        writeFileSync(join(envRoot.home, ".codex", "agents", `${agent}.toml`), `name = "${agent}"\n`);
+      }
+
+      writeFakeBunx(envRoot.fakeBin);
+      writeFakeCodeGraph(envRoot.fakeBin);
+      writeFakeNpm(envRoot.fakeBin, "0.9.6");
+      writeFakeCurl(envRoot.fakeBin, "3.0.0");
+
+      const res = spawnSync("bash", [SCRIPT, "--json", "--check-updates", "--host", "both"], {
+        cwd: ROOT,
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          HOME: envRoot.home,
+          PATH: `${envRoot.fakeBin}:${process.env.PATH ?? ""}`,
+          AGENTIC_DEV_CODEGRAPH_ALLOW_REPO_LOCAL: "0",
+        },
+      });
+
+      expect(res.status).toBe(0);
+      const report = JSON.parse(res.stdout);
+      const claude = report.tools.agent_fleet.hosts.claude;
+      expect(claude.update_status).toBe("drift");
+      expect(claude.drift_agents).toEqual(["fast-worker"]);
+      expect(claude.synced_agents).toEqual([
+        "explorer",
+        "deep-reasoner",
+        "deep-worker",
+        "gatekeeper",
+        "root-cause-prover",
+        "harness-evaluator",
+      ]);
+      expect(claude.source_missing_agents).toEqual([]);
+      expect(claude.user_managed_agents).toEqual([]);
+      const codex = report.tools.agent_fleet.hosts.codex;
+      expect(codex.update_status).toBe("not-applicable");
+      expect(codex.drift_agents).toEqual([]);
+      expect(codex.synced_agents).toEqual([]);
+      expect(codex.user_managed_agents).toEqual([]);
+
+      expect(readFileSync(SCRIPT, "utf-8")).not.toContain("Fable-agents");
+      expect(readFileSync(SCRIPT, "utf-8")).not.toContain("fetchAgentFleetUpstream");
+    } finally {
+      rmSync(envRoot.root, { recursive: true, force: true });
+    }
+  }, 15000);
+
+  test("exempts files covered by a valid user-managed receipt from drift and reports up-to-date", () => {
+    const envRoot = setupFakeEnvironment("check-agent-tooling-fleet-receipt-valid");
+    try {
+      const localContent: Record<string, string> = {};
+      for (const agent of MANAGED_AGENTS) {
+        localContent[agent] = readFileSync(join(FLEET_SOURCE_DIR, `${agent}.md`), "utf-8");
+      }
+      localContent["deep-reasoner"] += "\n# user-managed customization\n";
+      localContent["gatekeeper"] += "\n# user-managed customization\n";
+
+      mkdirSync(join(envRoot.home, ".claude", "agents"), { recursive: true });
+      mkdirSync(join(envRoot.home, ".codex", "agents"), { recursive: true });
+      for (const agent of MANAGED_AGENTS) {
+        writeFileSync(join(envRoot.home, ".claude", "agents", `${agent}.md`), localContent[agent]);
+        writeFileSync(join(envRoot.home, ".codex", "agents", `${agent}.toml`), `name = "${agent}"\n`);
+      }
+
+      writeAgentFleetReceipt(envRoot.home, [
+        {
+          path: join(envRoot.home, ".claude", "agents", "deep-reasoner.md"),
+          sha256: sha256Text(localContent["deep-reasoner"]),
+        },
+        {
+          path: join(envRoot.home, ".claude", "agents", "gatekeeper.md"),
+          sha256: sha256Text(localContent["gatekeeper"]),
+        },
+      ]);
+
+      writeFakeBunx(envRoot.fakeBin);
+      writeFakeCodeGraph(envRoot.fakeBin);
+      writeFakeNpm(envRoot.fakeBin, "0.9.6");
+      writeFakeCurl(envRoot.fakeBin, "3.0.0");
+
+      const res = spawnSync("bash", [SCRIPT, "--json", "--check-updates", "--host", "both"], {
+        cwd: ROOT,
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          HOME: envRoot.home,
+          PATH: `${envRoot.fakeBin}:${process.env.PATH ?? ""}`,
+          AGENTIC_DEV_CODEGRAPH_ALLOW_REPO_LOCAL: "0",
+        },
+      });
+
+      expect(res.status).toBe(0);
+      const report = JSON.parse(res.stdout);
+      const claude = report.tools.agent_fleet.hosts.claude;
+      expect(claude.update_status).toBe("up-to-date");
+      expect(claude.drift_agents).toEqual([]);
+      expect(claude.user_managed_agents).toEqual(["deep-reasoner", "gatekeeper"]);
+      expect(claude.synced_agents).toEqual([
+        "explorer",
+        "fast-worker",
+        "deep-worker",
+        "root-cause-prover",
+        "harness-evaluator",
+      ]);
+      expect(claude.source_missing_agents).toEqual([]);
+      expect(claude.update_reason).toContain("deep-reasoner, gatekeeper");
+      const codex = report.tools.agent_fleet.hosts.codex;
+      expect(codex.user_managed_agents).toEqual([]);
+
+      const textRes = spawnSync("bash", [SCRIPT, "--check-updates", "--host", "both"], {
+        cwd: ROOT,
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          HOME: envRoot.home,
+          PATH: `${envRoot.fakeBin}:${process.env.PATH ?? ""}`,
+          AGENTIC_DEV_CODEGRAPH_ALLOW_REPO_LOCAL: "0",
+        },
+      });
+      expect(textRes.status).toBe(0);
+      expect(textRes.stdout).toContain("user-managed (receipt): deep-reasoner, gatekeeper");
+      expect(textRes.stdout).not.toContain("updates: drift");
+    } finally {
+      rmSync(envRoot.root, { recursive: true, force: true });
+    }
+  }, 15000);
+
+  test("keeps drift when a receipt entry's sha256 no longer matches the installed file", () => {
+    const envRoot = setupFakeEnvironment("check-agent-tooling-fleet-receipt-stale-hash");
+    try {
+      const localContent: Record<string, string> = {};
+      for (const agent of MANAGED_AGENTS) {
+        localContent[agent] = readFileSync(join(FLEET_SOURCE_DIR, `${agent}.md`), "utf-8");
+      }
+      const acceptedContent = `${localContent["fast-worker"]}\n# accepted customization\n`;
+      localContent["fast-worker"] = `${acceptedContent}\n# edited again after acceptance\n`;
+
+      mkdirSync(join(envRoot.home, ".claude", "agents"), { recursive: true });
+      mkdirSync(join(envRoot.home, ".codex", "agents"), { recursive: true });
+      for (const agent of MANAGED_AGENTS) {
+        writeFileSync(join(envRoot.home, ".claude", "agents", `${agent}.md`), localContent[agent]);
+        writeFileSync(join(envRoot.home, ".codex", "agents", `${agent}.toml`), `name = "${agent}"\n`);
+      }
+
+      // The receipt records the hash of the previously accepted bytes, not the
+      // file's current (further-edited) content, so it must not exempt it.
+      writeAgentFleetReceipt(envRoot.home, [
+        {
+          path: join(envRoot.home, ".claude", "agents", "fast-worker.md"),
+          sha256: sha256Text(acceptedContent),
+        },
+      ]);
+
+      writeFakeBunx(envRoot.fakeBin);
+      writeFakeCodeGraph(envRoot.fakeBin);
+      writeFakeNpm(envRoot.fakeBin, "0.9.6");
+      writeFakeCurl(envRoot.fakeBin, "3.0.0");
+
+      const res = spawnSync("bash", [SCRIPT, "--json", "--check-updates", "--host", "both"], {
+        cwd: ROOT,
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          HOME: envRoot.home,
+          PATH: `${envRoot.fakeBin}:${process.env.PATH ?? ""}`,
+          AGENTIC_DEV_CODEGRAPH_ALLOW_REPO_LOCAL: "0",
+        },
+      });
+
+      expect(res.status).toBe(0);
+      const report = JSON.parse(res.stdout);
+      const claude = report.tools.agent_fleet.hosts.claude;
+      expect(claude.update_status).toBe("drift");
+      expect(claude.drift_agents).toEqual(["fast-worker"]);
+      expect(claude.user_managed_agents).toEqual([]);
+    } finally {
+      rmSync(envRoot.root, { recursive: true, force: true });
+    }
+  }, 15000);
+
+  test("fails closed on a malformed receipt and exempts nothing even if a hash would otherwise match", () => {
+    const envRoot = setupFakeEnvironment("check-agent-tooling-fleet-receipt-invalid");
+    try {
+      const localContent: Record<string, string> = {};
+      for (const agent of MANAGED_AGENTS) {
+        localContent[agent] = readFileSync(join(FLEET_SOURCE_DIR, `${agent}.md`), "utf-8");
+      }
+      localContent["deep-reasoner"] += "\n# user-managed customization\n";
+
+      mkdirSync(join(envRoot.home, ".claude", "agents"), { recursive: true });
+      mkdirSync(join(envRoot.home, ".codex", "agents"), { recursive: true });
+      for (const agent of MANAGED_AGENTS) {
+        writeFileSync(join(envRoot.home, ".claude", "agents", `${agent}.md`), localContent[agent]);
+        writeFileSync(join(envRoot.home, ".codex", "agents", `${agent}.toml`), `name = "${agent}"\n`);
+      }
+
+      // The hash entry matches the current file exactly, but the receipt's
+      // authority tag is wrong: the whole receipt must be rejected rather than
+      // exempting the one entry that "would" match.
+      writeAgentFleetReceipt(
+        envRoot.home,
+        [
+          {
+            path: join(envRoot.home, ".claude", "agents", "deep-reasoner.md"),
+            sha256: sha256Text(localContent["deep-reasoner"]),
+          },
+        ],
+        "not-the-expected-authority"
+      );
+
+      writeFakeBunx(envRoot.fakeBin);
+      writeFakeCodeGraph(envRoot.fakeBin);
+      writeFakeNpm(envRoot.fakeBin, "0.9.6");
+      writeFakeCurl(envRoot.fakeBin, "3.0.0");
+
+      const res = spawnSync("bash", [SCRIPT, "--json", "--check-updates", "--host", "both"], {
+        cwd: ROOT,
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          HOME: envRoot.home,
+          PATH: `${envRoot.fakeBin}:${process.env.PATH ?? ""}`,
+          AGENTIC_DEV_CODEGRAPH_ALLOW_REPO_LOCAL: "0",
+        },
+      });
+
+      expect(res.status).toBe(0);
+      const report = JSON.parse(res.stdout);
+      const claude = report.tools.agent_fleet.hosts.claude;
+      expect(claude.update_status).toBe("drift");
+      expect(claude.drift_agents).toEqual(["deep-reasoner"]);
+      expect(claude.user_managed_agents).toEqual([]);
+    } finally {
+      rmSync(envRoot.root, { recursive: true, force: true });
+    }
+  }, 15000);
+
+  test("reports archctx as present under the registry capability source and keeps strict readiness green", () => {
+    const envRoot = setupFakeEnvironment("check-agent-tooling-archctx-registry");
+    try {
+      writeArchctxRepo(envRoot.root, "registry");
+      installFleetForClaude(envRoot.home);
+      writeClaudeCodeGraphConfig(envRoot.home, true);
+      writeFakeBunx(envRoot.fakeBin);
+      writeFakeCodeGraph(envRoot.fakeBin);
+
+      const res = spawnSync("bash", [SCRIPT, "--json", "--host", "claude", "--strict-readiness"], {
+        cwd: envRoot.root,
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          HOME: envRoot.home,
+          PATH: `${envRoot.fakeBin}:${process.env.PATH ?? ""}`,
+          AGENTIC_DEV_CODEGRAPH_LOCAL_BIN: join(envRoot.fakeBin, "codegraph"),
+        },
+      });
+
+      // archctx is advisory: it never contributes to strictFailures, so a fully
+      // ready environment still exits 0 regardless of the archctx status.
+      expect(res.status).toBe(0);
+      const report = JSON.parse(res.stdout);
+      expect(report.tools.archctx.status).toBe("present");
+      expect(report.tools.archctx.capability_source).toBe("registry");
+      expect(report.tools.archctx.readiness).toBe("advisory");
+      expect(report.tools.archctx.nodes_dir_present).toBe(false);
+      expect(report.tools.archctx.node_count).toBe(0);
+      expect(report.tools.archctx.contracts_package_version).toBe("0.3.0");
+      expect(report.tools.archctx.impact.hook_correctness).toBe("unaffected");
+    } finally {
+      rmSync(envRoot.root, { recursive: true, force: true });
+    }
+  }, 15000);
+
+  test("reports archctx as partial when the archcontext source has no model nodes but still exits 0 under strict readiness", () => {
+    const envRoot = setupFakeEnvironment("check-agent-tooling-archctx-missing-model");
+    try {
+      writeArchctxRepo(envRoot.root, "archcontext");
+      installFleetForClaude(envRoot.home);
+      writeClaudeCodeGraphConfig(envRoot.home, true);
+      writeFakeBunx(envRoot.fakeBin);
+      writeFakeCodeGraph(envRoot.fakeBin);
+
+      const res = spawnSync("bash", [SCRIPT, "--json", "--host", "claude", "--strict-readiness"], {
+        cwd: envRoot.root,
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          HOME: envRoot.home,
+          PATH: `${envRoot.fakeBin}:${process.env.PATH ?? ""}`,
+          AGENTIC_DEV_CODEGRAPH_LOCAL_BIN: join(envRoot.fakeBin, "codegraph"),
+        },
+      });
+
+      // Advisory proof: a partial archctx status must not add a strict failure.
+      expect(res.status).toBe(0);
+      const report = JSON.parse(res.stdout);
+      expect(report.tools.archctx.status).toBe("partial");
+      expect(report.tools.archctx.capability_source).toBe("archcontext");
+      expect(report.tools.archctx.nodes_dir_present).toBe(false);
+      expect(report.tools.archctx.reason).toContain(".archcontext/model/nodes");
+      expect(res.stderr).not.toContain("[readiness]");
     } finally {
       rmSync(envRoot.root, { recursive: true, force: true });
     }

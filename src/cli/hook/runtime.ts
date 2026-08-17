@@ -1,102 +1,155 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { fileURLToPath } from 'url';
-import { execFileSync, spawnSync, type StdioOptions } from 'child_process';
-import { getRoute, type HookEvent, type RouteId } from './route-registry';
+import { execFileSync } from 'child_process';
+import { getRoute, type HookEvent, type HookHandlerId, type RouteId } from './route-registry';
+import { getHandlerForRoute } from './handler-registry';
+import {
+  budgetSessionContext,
+  createSessionContextProviderDiagnostic,
+  type SessionContextProviderDiagnostic,
+  type SessionContextSection,
+} from './session-context-budget';
+import { writeAllSync } from '../runtime/write-all-sync';
+import { createStateInputCollector } from '../../effects/loop/state-input-collector';
+import { createHookEventTelemetry } from './event-telemetry';
+import { resolveEffectiveState } from '../../effects/state/resolve-effective-state';
+import type { EffectiveState, EffectiveStateRiskInput } from '../../core/state/types';
+import type { WorkflowProfile } from '../../core/workflow/profile';
+import { createHookEffectTracker, hookEffectFailureMetadata, type HookHandlerResult } from './handler-contract';
 
 const OPT_IN_MARKER = '.ai/harness/workflow-contract.json';
-const POLICY_FILE = '.ai/harness/policy.json';
-const PACKAGE_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 
 export interface RunHookOptions {
-  event: HookEvent;
-  routeId: RouteId;
-  args?: readonly string[];
-  cwd?: string;
-  /** Pass-through stdio for the spawned hook script. Defaults to inherit. */
-  stdio?: 'inherit' | 'pipe' | 'ignore';
-  /** Optional override for the hooks dir (test only); defaults to resolveHooksDir(). */
-  hooksDir?: string;
-  /** Diagnostic command name for stderr messages. */
-  commandName?: string;
+  readonly event: HookEvent;
+  readonly routeId: RouteId;
+  readonly cwd?: string;
+  /** Host output mode. The runtime owns all fd shaping; handlers never write to host fds. */
+  readonly stdio?: 'inherit' | 'pipe' | 'ignore';
+  readonly commandName?: string;
+  readonly input?: string | Buffer;
+  readonly env?: NodeJS.ProcessEnv;
+  /**
+   * Narrow observer seam used by fault-injection tests. It is invoked only
+   * after an existing handler-owned durable phase has committed; production
+   * hosts do not supply a retry scheduler or fault flag.
+   */
+  readonly afterEffectCommit?: (phase: string) => void;
 }
 
 export interface RunHookResult {
-  exitCode: number;
-  reason:
+  readonly exitCode: number;
+  readonly reason:
     | 'not-in-git-repo'
     | 'repo-root-mismatch'
     | 'non-opt-in'
     | 'unknown-route'
-    | 'missing-script'
-    | 'script-failed'
+    | 'handler-unbound'
+    | 'handler-failed'
     | 'ok';
-  repoRoot?: string;
-  scriptsRun: string[];
-  skippedScripts: string[];
-  failedScript?: string;
+  readonly repoRoot?: string;
+  readonly handler?: HookHandlerId;
 }
 
-function looksLikeHookDecisionJson(output: Buffer | string | null | undefined): boolean {
-  if (!output) return false;
-  const text = output.toString().trim();
-  if (!text.startsWith('{')) return false;
+function outputBytes(output: string | null | undefined): number | null {
+  return output == null ? null : Buffer.byteLength(output, 'utf8');
+}
+
+function parseJson(output: string): Record<string, unknown> | null {
+  const text = output.trim();
+  if (!text.startsWith('{')) return null;
   try {
-    const parsed = JSON.parse(text) as { decision?: unknown };
-    return parsed.decision === 'block' || parsed.decision === 'allow';
+    const parsed: unknown = JSON.parse(text);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
-function looksLikeHookAdditionalContextJson(
-  output: Buffer | string | null | undefined,
-  hookEventName: HookEvent,
-): boolean {
-  if (!output) return false;
-  const text = output.toString().trim();
-  if (!text.startsWith('{')) return false;
-  try {
-    const parsed = JSON.parse(text) as {
-      hookSpecificOutput?: { hookEventName?: unknown; additionalContext?: unknown };
-    };
-    const specific = parsed.hookSpecificOutput;
-    return (
-      specific?.hookEventName === hookEventName &&
-      typeof specific.additionalContext === 'string' &&
-      specific.additionalContext.trim().length > 0
-    );
-  } catch {
-    return false;
-  }
+function isDecisionOutput(output: string): boolean {
+  const decision = parseJson(output)?.decision;
+  return decision === 'allow' || decision === 'block';
 }
 
-function extractSessionStartContext(output: Buffer | string | null | undefined): string | null {
-  if (!output) return null;
-  const text = output.toString().trim();
-  if (!text) return null;
-  if (!text.startsWith('{')) return text;
-  try {
-    const parsed = JSON.parse(text) as {
-      hookSpecificOutput?: { hookEventName?: unknown; additionalContext?: unknown };
-    };
-    const specific = parsed.hookSpecificOutput;
-    if (
-      specific?.hookEventName === 'SessionStart' &&
-      typeof specific.additionalContext === 'string'
-    ) {
-      return specific.additionalContext;
-    }
-  } catch {
-    return text;
+function isAdditionalContextOutput(output: string, event: HookEvent): boolean {
+  const parsed = parseJson(output);
+  const specific = parsed?.hookSpecificOutput;
+  return Boolean(
+    specific && typeof specific === 'object' && !Array.isArray(specific) &&
+    (specific as Record<string, unknown>).hookEventName === event &&
+    typeof (specific as Record<string, unknown>).additionalContext === 'string' &&
+    String((specific as Record<string, unknown>).additionalContext).trim(),
+  );
+}
+
+function isStructuredHookOutput(output: string, event: HookEvent): boolean {
+  return isDecisionOutput(output) || isAdditionalContextOutput(output, event);
+}
+
+function writeText(fd: 1 | 2, value: string): void {
+  if (value) writeAllSync(fd, value);
+}
+
+function hostOutput(
+  opts: RunHookOptions,
+  result: HookHandlerResult,
+  repoRoot: string,
+  providerDiagnostics: readonly SessionContextProviderDiagnostic[],
+): void {
+  const env = opts.env ?? process.env;
+  const mode = opts.stdio;
+  if (mode === 'ignore' || mode === 'pipe') return;
+
+  const isSessionDefault = opts.event === 'SessionStart' && opts.routeId === 'default';
+  const isDefaultSessionCapture = isSessionDefault && mode === undefined;
+  if (isDefaultSessionCapture) {
+    if (result.stderr) writeText(2, result.stderr);
+    const sections = result.sessionContexts ?? [];
+    if (sections.length === 0 && providerDiagnostics.length === 0) return;
+    const sessionId = env.HOOK_SESSION_ID ?? env.CODEX_SESSION_ID ?? env.CLAUDE_SESSION_ID ?? null;
+    const budgeted = budgetSessionContext(repoRoot, sections, sessionId, providerDiagnostics);
+    if (!budgeted.context) return;
+    writeText(1, `${JSON.stringify({
+      hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: budgeted.context },
+    })}\n`);
+    return;
   }
-  return text;
+
+  if (mode === 'inherit') {
+    writeText(1, result.stdout);
+    writeText(2, result.stderr);
+    return;
+  }
+
+  // Claude's default adapter consumes both streams. Codex's adapter consumes
+  // only the explicitly structured success envelope for decision/context
+  // routes; all other successful stdout is intentionally quiet.
+  if (env.HOOK_HOST !== 'codex') {
+    writeText(1, result.stdout);
+    writeText(2, result.stderr);
+    return;
+  }
+
+  const structuredSuccess = result.exitCode === 0 && isStructuredHookOutput(result.stdout, opts.event);
+  const structuredRoute =
+    (opts.event === 'PreToolUse' && opts.routeId === 'subagent') ||
+    (opts.event === 'UserPromptSubmit' && opts.routeId === 'delegation') ||
+    (opts.event === 'SubagentStart' && opts.routeId === 'context') ||
+    (opts.event === 'SubagentStop' && opts.routeId === 'quality');
+  if (structuredRoute && structuredSuccess) writeText(1, result.stdout);
+  if (result.exitCode !== 0) {
+    writeText(2, result.stderr);
+    if (result.stdout) writeText(2, result.stdout);
+  } else {
+    writeText(2, result.stderr);
+  }
 }
 
 export function resolveRepoRoot(cwd: string): string | null {
   try {
     const out = execFileSync('git', ['-C', cwd, 'rev-parse', '--show-toplevel'], {
-      encoding: 'utf-8',
+      encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
     });
     return out.trim() || null;
@@ -114,21 +167,18 @@ function canonicalPath(input: string): string {
   }
 }
 
-function resolveExplicitRepoRoot(cwd: string, env: NodeJS.ProcessEnv = process.env): {
-  repoRoot: string | null;
-  mismatch: boolean;
+function resolveExplicitRepoRoot(cwd: string, env: NodeJS.ProcessEnv): {
+  readonly repoRoot: string | null;
+  readonly mismatch: boolean;
 } {
   const explicit = env.HOOK_REPO_ROOT?.trim();
   if (!explicit) return { repoRoot: resolveRepoRoot(cwd), mismatch: false };
-
   const explicitRoot = resolveRepoRoot(explicit);
   if (!explicitRoot) return { repoRoot: null, mismatch: false };
-
   const cwdRoot = resolveRepoRoot(cwd);
   if (cwdRoot && canonicalPath(cwdRoot) !== canonicalPath(explicitRoot)) {
     return { repoRoot: null, mismatch: true };
   }
-
   return { repoRoot: explicitRoot, mismatch: false };
 }
 
@@ -136,268 +186,292 @@ export function isOptIn(repoRoot: string): boolean {
   return fs.existsSync(path.join(repoRoot, OPT_IN_MARKER));
 }
 
-/**
- * Central-first hook script resolution. The packaged copy ships inside the
- * globally installed repo-harness package, so upgrading the CLI upgrades hook
- * behavior for every repo at once — no per-repo .ai/hooks refresh. Repos that
- * develop the hooks themselves (e.g. the repo-harness self-host checkout) pin
- * `"hook_source": "repo"` in .ai/harness/policy.json to keep running their
- * vendored copy.
- *
- * Order (mirrors scripts/hook-shim.sh, where "central" is the installed
- * ~/.repo-harness/hooks bundle instead of the packaged directory):
- *   1. REPO_HARNESS_HOOK_SOURCE env: `repo` | `central` | absolute hooks dir
- *   2. repo policy pin `"hook_source": "repo"`
- *   3. packaged assets/hooks (when present)
- *   4. vendored <repo>/.ai/hooks fallback
- */
-export type HookSource = 'env' | 'repo-pin' | 'packaged' | 'repo-fallback';
+export type SessionStateResolution =
+  | { readonly kind: 'resolved_actionable'; readonly state: EffectiveState }
+  | { readonly kind: 'resolved_non_actionable'; readonly state: EffectiveState }
+  | { readonly kind: 'unavailable'; readonly diagnostic: SessionContextProviderDiagnostic };
 
-export interface ResolvedHooksDir {
-  dir: string;
-  source: HookSource;
-}
-
-function repoPinsHookSource(repoRoot: string): boolean {
-  try {
-    const raw = fs.readFileSync(path.join(repoRoot, POLICY_FILE), 'utf-8');
-    const policy = JSON.parse(raw) as { hook_source?: unknown };
-    return policy.hook_source === 'repo';
-  } catch {
-    return false;
-  }
-}
-
-function packagedHooksDir(): string {
-  return path.join(PACKAGE_ROOT, 'assets', 'hooks');
-}
-
-export function resolveHooksDir(
+type EffectiveStateResolver = (
   repoRoot: string,
-  env: NodeJS.ProcessEnv = process.env,
-): ResolvedHooksDir {
-  const repoDir = path.join(repoRoot, '.ai/hooks');
-  const override = env.REPO_HARNESS_HOOK_SOURCE?.trim();
-  if (override === 'repo') return { dir: repoDir, source: 'env' };
-  if (override === 'central') return { dir: packagedHooksDir(), source: 'env' };
-  if (override && path.isAbsolute(override)) return { dir: override, source: 'env' };
+  nowMs: number,
+  risk?: EffectiveStateRiskInput,
+) => EffectiveState;
 
-  if (repoPinsHookSource(repoRoot)) return { dir: repoDir, source: 'repo-pin' };
+function effectiveStateIsActionable(state: EffectiveState): boolean {
+  return state.task_id !== null || state.blockers.length > 0 ||
+    Boolean(state.active_sprint.path && state.active_sprint.freshness === 'fresh');
+}
 
-  const packaged = packagedHooksDir();
-  if (fs.existsSync(path.join(packaged, 'run-hook.sh'))) {
-    return { dir: packaged, source: 'packaged' };
+export function projectEffectiveStateSessionSection(
+  state: EffectiveState,
+): SessionContextSection | null {
+  if (!effectiveStateIsActionable(state)) return null;
+  const compact = {
+    task_id: state.task_id,
+    phase: state.phase,
+    state_version: state.state_version,
+    state_revision: state.state_revision,
+    workflow_profile: state.workflow_profile,
+    next_action: state.next_action,
+    guidance: state.guidance,
+    blockers: state.blockers,
+    allowed_paths: state.allowed_paths,
+    checks: state.checks,
+    references: {
+      plan: state.authoritative_plan?.path ?? null,
+      contract: state.contract?.path ?? null,
+      sprint: state.active_sprint.path,
+      handoff: state.handoff.path,
+      resume: state.resume.path,
+    },
+  };
+  return {
+    id: 'effective-state',
+    priority: 2,
+    content: `[HarnessState] ${JSON.stringify(compact)}`,
+    mandatory: true,
+    actionable: true,
+    reference: 'repo-harness state resolve --json',
+  };
+}
+
+export function projectUnavailableStateSessionSection(
+  diagnostic: SessionContextProviderDiagnostic,
+): SessionContextSection {
+  const content = `[HarnessStateUnavailable] ${JSON.stringify({
+    fail_closed: true,
+    reason_code: diagnostic.reason_code,
+    error_hash: diagnostic.error_hash,
+    guidance: 'Do not infer task, scope, or edit permission.',
+    required_action: 'repo-harness state resolve --json',
+  })}`;
+  return {
+    id: 'effective-state',
+    priority: 2,
+    content,
+    mandatory: true,
+    actionable: true,
+    reference: 'repo-harness state resolve --json',
+  };
+}
+
+export function resolveSessionEffectiveState(
+  repoRoot: string,
+  nowMs: number,
+  resolve: EffectiveStateResolver = resolveEffectiveState,
+): SessionStateResolution {
+  try {
+    // Match `repo-harness state resolve --json` exactly: that command passes
+    // no operation/profile override, even when hook-only env vars are set.
+    const state = resolveEffectiveStateWithTransientRetry(() => resolve(repoRoot, nowMs, {}));
+    return effectiveStateIsActionable(state)
+      ? { kind: 'resolved_actionable', state }
+      : { kind: 'resolved_non_actionable', state };
+  } catch (error) {
+    return {
+      kind: 'unavailable',
+      diagnostic: createSessionContextProviderDiagnostic(
+        'effective-state',
+        isTransientResolutionInstability(error) ? 'state_resolution_unstable' : 'state_resolution_failed',
+        error,
+        'repo-harness state resolve --json',
+      ),
+    };
   }
-
-  return { dir: repoDir, source: 'repo-fallback' };
 }
 
-function isSoftMissingRoute(event: HookEvent, routeId: RouteId): boolean {
-  return (
-    (event === 'SessionStart' && routeId === 'default') ||
-    (event === 'PreToolUse' && routeId === 'subagent') ||
-    (event === 'UserPromptSubmit' && routeId === 'delegation') ||
-    (event === 'SubagentStart' && routeId === 'context') ||
-    (event === 'SubagentStop' && routeId === 'quality') ||
-    (event === 'Stop' && routeId === 'default') ||
-    (event === 'PostToolUse' && routeId === 'always')
-  );
+const EFFECTIVE_STATE_RESOLUTION_MAX_ATTEMPTS = 3;
+const STABILITY_UNSTABLE_MESSAGE = 'workflow authority changed repeatedly while resolving effective state';
+const LOCK_TIMEOUT_MESSAGE_PREFIX = 'timed out waiting for exclusive lock ';
+
+/**
+ * The two known transient-instability throw signatures resolveEffectiveState
+ * can raise: the stability contract's re-read exhaustion (partitioned to
+ * authority sources only in resolve-effective-state.ts, but still reachable
+ * under sustained AUTHORITY churn) and the exclusive state-lock timeout
+ * (src/effects/locking/exclusive-directory-lock.ts). Both are concurrent-
+ * write contention, not a genuinely unresolvable workflow profile -- the
+ * bounded retry below gives ordinary contention a chance to clear. Each
+ * adapter owns the final mapping: PreEdit preserves its existing null versus
+ * re-throw partition, while SessionStart emits bounded unavailable evidence.
+ */
+function isTransientResolutionInstability(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return error.message === STABILITY_UNSTABLE_MESSAGE
+    || error.message.startsWith(LOCK_TIMEOUT_MESSAGE_PREFIX);
 }
 
-function isSoftMissingScript(event: HookEvent, routeId: RouteId, script: string): boolean {
-  if (isSoftMissingRoute(event, routeId)) return true;
-  return event === 'PostToolUse' && routeId === 'edit' && script === 'minimal-change-observer.sh';
+function resolveEffectiveStateWithTransientRetry(
+  resolveAttempt: () => EffectiveState,
+): EffectiveState {
+  let lastInstability: unknown = null;
+  for (let attempt = 1; attempt <= EFFECTIVE_STATE_RESOLUTION_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      return resolveAttempt();
+    } catch (error) {
+      if (!isTransientResolutionInstability(error)) throw error;
+      lastInstability = error;
+    }
+  }
+  throw lastInstability;
+}
+
+function resolvePreEditEffectiveState(
+  repoRoot: string,
+  targetPaths: readonly string[],
+  env: NodeJS.ProcessEnv,
+): EffectiveState | null {
+  const explicitOverride = env.REPO_HARNESS_WORKFLOW_PROFILE as WorkflowProfile | undefined;
+  try {
+    return resolveEffectiveStateWithTransientRetry(() => resolveEffectiveState(repoRoot, Date.now(), {
+      targetPaths,
+      operationKind: 'edit',
+      explicitOverride,
+    }));
+  } catch (error) {
+    if (!isTransientResolutionInstability(error)) return null;
+    throw error;
+  }
+}
+
+function resolveStopEffectiveState(repoRoot: string, env: NodeJS.ProcessEnv): EffectiveState | null {
+  const explicitOverride = env.REPO_HARNESS_WORKFLOW_PROFILE as WorkflowProfile | undefined;
+  try {
+    return resolveEffectiveState(repoRoot, Date.now(), {
+      operationKind: 'inspect',
+      explicitOverride,
+    });
+  } catch {
+    return null;
+  }
 }
 
 export function runHook(opts: RunHookOptions): RunHookResult {
+  const env = opts.env ?? process.env;
   const cwd = opts.cwd ?? process.cwd();
   const commandName = opts.commandName ?? 'repo-harness hook';
-  const scriptsRun: string[] = [];
-  const skippedScripts: string[] = [];
-
-  const resolvedRepo = resolveExplicitRepoRoot(cwd);
-  if (resolvedRepo.mismatch) {
-    return { exitCode: 0, reason: 'repo-root-mismatch', scriptsRun, skippedScripts };
-  }
-  const repoRoot = resolvedRepo.repoRoot;
-  if (!repoRoot) {
-    return { exitCode: 0, reason: 'not-in-git-repo', scriptsRun, skippedScripts };
-  }
-  if (!isOptIn(repoRoot)) {
-    return { exitCode: 0, reason: 'non-opt-in', repoRoot, scriptsRun, skippedScripts };
-  }
+  const resolved = resolveExplicitRepoRoot(cwd, env);
+  if (resolved.mismatch) return { exitCode: 0, reason: 'repo-root-mismatch' };
+  const repoRoot = resolved.repoRoot;
+  if (!repoRoot) return { exitCode: 0, reason: 'not-in-git-repo' };
+  if (!isOptIn(repoRoot)) return { exitCode: 0, reason: 'non-opt-in', repoRoot };
 
   const route = getRoute(opts.event, opts.routeId);
   if (!route) {
-    process.stderr.write(
-      `${commandName}: unknown route ${opts.event}.${opts.routeId}\n`,
-    );
-    return { exitCode: 2, reason: 'unknown-route', repoRoot, scriptsRun, skippedScripts };
+    writeAllSync(2, `${commandName}: unknown route ${opts.event}.${opts.routeId}\n`);
+    return { exitCode: 2, reason: 'unknown-route', repoRoot };
+  }
+  const handler = getHandlerForRoute(route);
+  if (!handler) {
+    writeAllSync(2, `${commandName}: no typed handler for ${opts.event}.${opts.routeId}\n`);
+    return { exitCode: 2, reason: 'handler-unbound', repoRoot };
   }
 
-  const resolved: ResolvedHooksDir = opts.hooksDir
-    ? { dir: opts.hooksDir, source: 'env' }
-    : resolveHooksDir(repoRoot);
-  const hooksDir = resolved.dir;
-  const syncHint =
-    resolved.source === 'packaged'
-      ? 'upgrade the repo-harness CLI (bun add -g repo-harness@latest) to refresh packaged hooks'
-      : resolved.source === 'repo-fallback'
-        ? 'upgrade the repo-harness CLI to restore packaged hooks, or set "hook_source": "repo" before syncing a full vendored hook runtime'
-        : `run 'repo-harness adopt --repo ${repoRoot}' to sync pinned .ai/hooks`;
-  const sessionStartCollectStdout = opts.event === 'SessionStart' && opts.stdio === undefined;
-  const sessionStartContexts: string[] = [];
-  // Codex Desktop rejects Stop decision stdout at turn finalization, so collect
-  // and suppress successful Stop output while preserving failure diagnostics.
-  const codexStopSuppressSuccessOutput =
-    process.env.HOOK_HOST === 'codex' &&
-    opts.event === 'Stop' &&
-    opts.stdio === undefined;
-  const codexSubagentStopDecisionStdout =
-    process.env.HOOK_HOST === 'codex' &&
-    opts.event === 'SubagentStop' &&
-    opts.routeId === 'quality' &&
-    opts.stdio === undefined;
-  const codexDecisionStdout = codexSubagentStopDecisionStdout;
-  const codexAdditionalContextStdout =
-    process.env.HOOK_HOST === 'codex' &&
-    opts.stdio === undefined &&
-    (
-      (opts.event === 'UserPromptSubmit' && opts.routeId === 'delegation') ||
-      (opts.event === 'SubagentStart' && opts.routeId === 'context')
-    );
-  const codexQuietStdout =
-    process.env.HOOK_HOST === 'codex' &&
-    opts.event !== 'SessionStart' &&
-    !codexStopSuppressSuccessOutput &&
-    !codexDecisionStdout &&
-    !codexAdditionalContextStdout &&
-    opts.stdio === undefined;
-  const stdio: StdioOptions = sessionStartCollectStdout
-    ? ['inherit', 'pipe', 'inherit']
-    : codexStopSuppressSuccessOutput
-    ? ['inherit', 'pipe', 'pipe']
-    : codexDecisionStdout
-    ? ['inherit', 'pipe', 'pipe']
-    : codexAdditionalContextStdout
-    ? ['inherit', 'pipe', 'inherit']
-    : codexQuietStdout
-    ? ['inherit', 'pipe', 'inherit']
-    : (opts.stdio ?? 'inherit');
-
-  for (const script of route.scripts) {
-    const scriptPath = path.join(hooksDir, script);
-    if (!fs.existsSync(scriptPath)) {
-      if (isSoftMissingScript(opts.event, opts.routeId, script)) {
-        process.stderr.write(
-          `${commandName}: skipping missing script ${scriptPath} (route ${opts.event}.${opts.routeId}); ${syncHint}\n`,
-        );
-        skippedScripts.push(script);
-        continue;
+  const telemetry = createHookEventTelemetry({ repoRoot, event: opts.event, routeId: opts.routeId, input: opts.input, env });
+  const providerDiagnostics: SessionContextProviderDiagnostic[] = [];
+  const observeSessionContextDiagnostic = (diagnostic: SessionContextProviderDiagnostic): void => {
+    providerDiagnostics.push(diagnostic);
+  };
+  const collector = createStateInputCollector({
+    event: opts.event,
+    repoRoot,
+    resolveSessionEffectiveState: () => {
+      telemetry.recordStateResolution();
+      telemetry.markMetricsComplete(['state_resolutions']);
+      const outcome = resolveSessionEffectiveState(repoRoot, Date.now());
+      if (outcome.kind === 'unavailable') {
+        observeSessionContextDiagnostic(outcome.diagnostic);
+        return projectUnavailableStateSessionSection(outcome.diagnostic);
       }
+      if (outcome.kind === 'resolved_non_actionable') return null;
+      return projectEffectiveStateSessionSection(outcome.state);
+    },
+    resolvePreEditEffectiveState: (targetPaths) => {
+      telemetry.recordStateResolution();
+      telemetry.markMetricsComplete(['state_resolutions']);
+      return resolvePreEditEffectiveState(repoRoot, targetPaths, env);
+    },
+    resolveStopEffectiveState: () => {
+      telemetry.recordStateResolution();
+      telemetry.markMetricsComplete(['state_resolutions']);
+      return resolveStopEffectiveState(repoRoot, env);
+    },
+  });
 
-      process.stderr.write(
-        `${commandName}: script not found at ${scriptPath} (route ${opts.event}.${opts.routeId})\n`,
-      );
-      return {
-        exitCode: 3,
-        reason: 'missing-script',
-        repoRoot,
-        scriptsRun,
-        skippedScripts,
-        failedScript: script,
-      };
-    }
-
-    scriptsRun.push(script);
-    const child = spawnSync('bash', [scriptPath, ...(opts.args ?? [])], {
-      cwd: repoRoot,
-      stdio,
-      env: { ...process.env, HOOK_REPO_ROOT: repoRoot },
-    });
-
-    if (child.error) {
-      process.stderr.write(
-        `${commandName}: failed to run ${scriptPath}: ${child.error.message}\n`,
-      );
-      return {
-        exitCode: 1,
-        reason: 'script-failed',
-        repoRoot,
-        scriptsRun,
-        skippedScripts,
-        failedScript: script,
-      };
-    }
-
-    if (
-      codexDecisionStdout &&
-      child.status === 0 &&
-      looksLikeHookDecisionJson(child.stdout)
-    ) {
-      process.stdout.write(child.stdout);
-    }
-
-    if (
-      codexAdditionalContextStdout &&
-      child.status === 0 &&
-      looksLikeHookAdditionalContextJson(child.stdout, opts.event)
-    ) {
-      process.stdout.write(child.stdout);
-    }
-
-    if (sessionStartCollectStdout && child.status === 0) {
-      const context = extractSessionStartContext(child.stdout);
-      if (context) sessionStartContexts.push(context);
-    }
-
-    if (
-      (codexStopSuppressSuccessOutput || codexDecisionStdout) &&
-      child.status !== 0 &&
-      child.stderr
-    ) {
-      process.stderr.write(child.stderr);
-    }
-
-    if (
-      (
-        codexQuietStdout ||
-        codexStopSuppressSuccessOutput ||
-        codexDecisionStdout ||
-        codexAdditionalContextStdout
-      ) &&
-      child.status !== 0 &&
-      child.stdout
-    ) {
-      process.stderr.write(child.stdout);
-    }
-
-    if (child.status !== 0) {
-      return {
-        exitCode: child.status ?? 1,
-        reason: 'script-failed',
-        repoRoot,
-        scriptsRun,
-        skippedScripts,
-        failedScript: script,
-      };
-    }
-  }
-
-  if (sessionStartCollectStdout && skippedScripts.length > 0) {
-    sessionStartContexts.push(
-      `[repo-harness] hooks drift (source=${resolved.source}): missing ${skippedScripts.join(', ')}; ${syncHint}.`,
-    );
-  }
-
-  if (sessionStartCollectStdout && sessionStartContexts.length > 0) {
-    process.stdout.write(`${JSON.stringify({
-      hookSpecificOutput: {
-        hookEventName: 'SessionStart',
-        additionalContext: sessionStartContexts.join('\n'),
+  let handlerResult: HookHandlerResult;
+  let handlerThrew = false;
+  let effectRecoveryOverride: ReturnType<typeof hookEffectFailureMetadata> = null;
+  const effectTracker = handler.effectContract ? createHookEffectTracker(handler.effectContract) : null;
+  const startedAt = new Date();
+  try {
+    handlerResult = handler.run({
+      event: opts.event,
+      routeId: opts.routeId,
+      repoRoot,
+      input: opts.input,
+      env,
+      now: startedAt,
+      collector,
+      dependencies: {
+        observeJournalWrite: (journalPath) => {
+          telemetry.recordEventWrite(journalPath);
+          telemetry.recordWriteTransaction();
+          effectTracker?.recordCommittedPhase('journal');
+        },
+        observeProjectionWrite: (target) => {
+          telemetry.recordDurableWrite(target.path);
+          effectTracker?.recordCommittedPhase(target.kind);
+        },
+        observeProjectionTransaction: () => telemetry.recordWriteTransaction(),
+        observeSessionContextDiagnostic,
+        afterEffectCommit: opts.afterEffectCommit,
       },
-    })}\n`);
+      collectSessionStdout: opts.event === 'SessionStart' && opts.stdio === undefined,
+    });
+  } catch (error) {
+    handlerThrew = true;
+    effectRecoveryOverride = hookEffectFailureMetadata(error);
+    const detail = error instanceof Error ? error.message : String(error);
+    handlerResult = {
+      exitCode: 1,
+      stdout: '',
+      stderr: `${commandName}: ${handler.id} failed: ${detail}\n`,
+      reason: effectRecoveryOverride?.telemetryReason ?? 'handler-failed',
+    };
   }
 
-  return { exitCode: 0, reason: 'ok', repoRoot, scriptsRun, skippedScripts };
+  telemetry.recordStep({
+    name: handler.id,
+    execution: 'in_process',
+    startedAt,
+    elapsedMs: Date.now() - startedAt.getTime(),
+    exitCode: handlerResult.exitCode,
+    outputBytes: outputBytes(handlerResult.stdout),
+    blocked: isDecisionOutput(handlerResult.stdout) && parseJson(handlerResult.stdout)?.decision === 'block',
+  });
+  // A typed step is observable, but being in-process does not make every
+  // logical filesystem access observable automatically. The handler's
+  // optional effect contract is the sole authority for complete write metrics;
+  // handlers without one remain explicitly uninstrumented. A thrown targeted
+  // handler never receives complete write metrics merely because a counter is
+  // zero.
+  if (!handlerThrew && handler.effectContract) {
+    telemetry.markMetricsComplete(handler.effectContract.completeMetrics);
+  }
+  hostOutput(opts, handlerResult, repoRoot, providerDiagnostics);
+  const exitCode = handlerResult.exitCode;
+  const publicReason: RunHookResult['reason'] = exitCode === 0 ? 'ok' : 'handler-failed';
+  // Handler-specific detail is retained only in the event telemetry record;
+  // the public runtime result has one stable success/failure vocabulary.
+  telemetry.finalize({
+    exitCode,
+    reason: handlerResult.reason ?? publicReason,
+    blocked: exitCode !== 0,
+    effectObservation: effectTracker?.observation(
+      exitCode === 0,
+      handlerThrew,
+      effectRecoveryOverride?.recovery,
+    ),
+  });
+  return { exitCode, reason: publicReason, repoRoot, handler: handler.id };
 }

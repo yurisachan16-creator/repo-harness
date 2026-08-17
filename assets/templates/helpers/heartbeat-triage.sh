@@ -17,6 +17,12 @@ inbox_path=".ai/harness/triage/inbox.md"
 run_id=""
 run_source="manual"
 json_output=0
+helper_source="$0"
+if [[ -n "${REPO_HARNESS_HELPER_SOURCE_PATH:-}" && -f "$REPO_HARNESS_HELPER_SOURCE_PATH" \
+      && "$(basename "$REPO_HARNESS_HELPER_SOURCE_PATH")" == "$(basename "$0")" ]]; then
+  helper_source="$REPO_HARNESS_HELPER_SOURCE_PATH"
+fi
+SCRIPT_DIR="$(cd "$(dirname "$helper_source")" && pwd)"
 
 if [[ "${1:-}" == "run" ]]; then
   shift
@@ -115,22 +121,9 @@ policy_get() {
   printf '%s' "$default_value"
 }
 
-helper_runtime_dir="$(policy_get '.harness.helper_runtime_dir' '.ai/harness/scripts')"
-
 helper_path() {
   local helper_name="$1"
-
-  if [[ -f "$helper_runtime_dir/$helper_name" ]]; then
-    printf '%s/%s' "$helper_runtime_dir" "$helper_name"
-    return 0
-  fi
-
-  if [[ -f "scripts/$helper_name" ]]; then
-    printf '%s/%s' "scripts" "$helper_name"
-    return 0
-  fi
-
-  printf '%s/%s' "$helper_runtime_dir" "$helper_name"
+  printf '%s/%s' "$SCRIPT_DIR" "$helper_name"
 }
 
 repo_relative() {

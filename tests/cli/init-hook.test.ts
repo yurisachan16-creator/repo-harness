@@ -10,6 +10,8 @@ import {
 } from '../../src/cli/commands/init-hook';
 import type { DoctorReport } from '../../src/cli/commands/doctor';
 import type { StatusReport } from '../../src/cli/commands/status';
+import { planAdoption } from '../../src/core/adoption/plan';
+import { applyAdoptionPlan } from '../../src/effects/fs-transaction';
 
 const ROOT = join(import.meta.dir, '..', '..');
 const CLI = join(ROOT, 'src/cli/index.ts');
@@ -56,7 +58,7 @@ function baseStatusReport(overrides: Partial<StatusReport['targets'][number]> = 
     repo: {
       inGitRepo: true,
       repoRoot: '/tmp/repo',
-      optIn: true,
+      optIn: false,
       optInMarker: '.ai/harness/workflow-contract.json',
     },
     routes: {
@@ -71,7 +73,25 @@ function baseStatusReport(overrides: Partial<StatusReport['targets'][number]> = 
         Stop: 1,
       },
     },
+    installedProfile: { recorded: false },
   };
+}
+
+function statusReportForRepo(repo: string, optIn = true): StatusReport {
+  const report = baseStatusReport();
+  return {
+    ...report,
+    repo: {
+      inGitRepo: true,
+      repoRoot: repo,
+      optIn,
+      optInMarker: '.ai/harness/workflow-contract.json',
+    },
+  };
+}
+
+function shellQuoted(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
 function baseDoctorReport(checks: DoctorReport['checks'] = []): DoctorReport {
@@ -177,6 +197,94 @@ describe('init-hook command', () => {
     });
   });
 
+  test('accepts a complete profile-relative adapter count', () => {
+    withTempHome((home, repo) => {
+      mkdirSync(join(home, '.codex'), { recursive: true });
+      writeFileSync(join(home, '.codex', 'AGENTS.md'), '# Global Working Rules\n');
+
+      const report = runInitHook({
+        cwd: repo,
+        target: 'codex',
+        env: { ...process.env, HOME: home },
+        statusReport: baseStatusReport({
+          managedEntryCount: 7,
+          expectedEntryCount: 7,
+        }),
+        doctorReport: baseDoctorReport(),
+        toolingReport: baseToolingReport(),
+      });
+
+      const adapter = report.checks.find((entry) => entry.id === 'status.adapter.codex');
+      const action = report.agent_actions.find((entry) => entry.id === 'adapter.codex.install');
+      expect(adapter?.status).toBe('ok');
+      expect(adapter?.detail).toContain('7/7 managed entries');
+      expect(action).toBeUndefined();
+    });
+  });
+
+  test('invalid installed profile state requires migration even when adapter count is complete', () => {
+    withTempHome((home, repo) => {
+      mkdirSync(join(home, '.codex'), { recursive: true });
+      writeFileSync(join(home, '.codex', 'AGENTS.md'), '# Global Working Rules\n');
+      const statusReport = baseStatusReport();
+      statusReport.installedProfile = {
+        recorded: 'invalid',
+        kind: 'legacy_protocol',
+        error: 'legacy installed profile state requires explicit migration',
+        path: join(home, '.repo-harness', 'install-state.json'),
+      };
+
+      const report = runInitHook({
+        cwd: repo,
+        target: 'codex',
+        env: { ...process.env, HOME: home },
+        statusReport,
+        doctorReport: baseDoctorReport(),
+        toolingReport: baseToolingReport(),
+      });
+
+      const adapter = report.checks.find((entry) => entry.id === 'status.adapter.codex');
+      const migration = report.agent_actions.find((entry) => entry.id === 'install-profile.migrate');
+      expect(adapter?.status).toBe('needs_agent');
+      expect(adapter?.detail).toContain('legacy installed profile state');
+      expect(migration?.command).toBe(
+        'repo-harness install --migrate-profile-state --profile full --target codex',
+      );
+      expect(migration?.targets).toEqual([join(home, '.repo-harness', 'install-state.json')]);
+      expect(report.agent_actions.find((entry) => entry.id === 'adapter.codex.install')).toBeUndefined();
+    });
+  });
+
+  test('corrupt installed profile state requires manual repair without an inapplicable command', () => {
+    withTempHome((home, repo) => {
+      mkdirSync(join(home, '.codex'), { recursive: true });
+      writeFileSync(join(home, '.codex', 'AGENTS.md'), '# Global Working Rules\n');
+      const statusReport = baseStatusReport();
+      statusReport.installedProfile = {
+        recorded: 'invalid',
+        kind: 'corrupt_current',
+        error: 'invalid installed profile state',
+        path: join(home, '.repo-harness', 'install-state.json'),
+      };
+
+      const report = runInitHook({
+        cwd: repo,
+        target: 'codex',
+        env: { ...process.env, HOME: home },
+        statusReport,
+        doctorReport: baseDoctorReport(),
+        toolingReport: baseToolingReport(),
+      });
+
+      expect(report.checks.find((entry) => entry.id === 'status.adapter.codex')?.status).toBe('needs_agent');
+      const repair = report.agent_actions.find((entry) => entry.id === 'install-profile.repair');
+      expect(repair?.command).toBeUndefined();
+      expect(repair?.targets).toEqual([join(home, '.repo-harness', 'install-state.json')]);
+      expect(report.agent_actions.find((entry) => entry.id === 'install-profile.migrate')).toBeUndefined();
+      expect(report.agent_actions.find((entry) => entry.id === 'adapter.codex.install')).toBeUndefined();
+    });
+  });
+
   test('turns stale CLI advisory into an Agent update action', () => {
     withTempHome((home, repo) => {
       mkdirSync(join(home, '.codex'), { recursive: true });
@@ -205,6 +313,162 @@ describe('init-hook command', () => {
     });
   });
 
+  test('scopes the Codex CLI version doctor check to targets that include Codex', () => {
+    withTempHome((home, repo) => {
+      mkdirSync(join(home, '.codex'), { recursive: true });
+      mkdirSync(join(home, '.claude'), { recursive: true });
+      writeFileSync(join(home, '.codex', 'AGENTS.md'), '# Global Working Rules\n');
+      writeFileSync(join(home, '.claude', 'CLAUDE.md'), '# Global Working Rules\n');
+      const doctorReport = baseDoctorReport([
+        {
+          id: 'codex-cli-version',
+          describe: 'Codex CLI supports generated GPT-5.6 agent profiles',
+          status: 'warn',
+          detail: 'current=0.143.0; minimum=0.144.0',
+        },
+      ]);
+
+      for (const target of ['claude', 'codex', 'both'] as const) {
+        const report = runInitHook({
+          cwd: repo,
+          target,
+          env: { ...process.env, HOME: home },
+          statusReport: baseStatusReport(),
+          doctorReport,
+          toolingReport: baseToolingReport(),
+        });
+        const check = report.checks.find((entry) => entry.id === 'doctor.codex-cli-version');
+
+        if (target === 'claude') {
+          expect(check).toBeUndefined();
+          expect(report.summary.warn).toBe(0);
+          expect(report.status).toBe('ok');
+        } else {
+          expect(check?.status).toBe('warn');
+          expect(report.summary.warn).toBe(1);
+          expect(report.status).toBe('attention');
+        }
+      }
+    });
+  });
+
+  test('keeps repo adoption refresh check disabled unless update checks are requested', () => {
+    withTempHome((home, repo) => {
+      mkdirSync(join(home, '.codex'), { recursive: true });
+      writeFileSync(join(home, '.codex', 'AGENTS.md'), '# Global Working Rules\n');
+
+      const report = runInitHook({
+        cwd: repo,
+        target: 'codex',
+        env: { ...process.env, HOME: home },
+        statusReport: statusReportForRepo(repo),
+        doctorReport: baseDoctorReport(),
+        toolingReport: baseToolingReport(),
+      });
+
+      const check = report.checks.find((entry) => entry.id === 'repo.init-refresh');
+      expect(check?.status).toBe('na');
+      expect(check?.detail).toContain('disabled');
+      expect(report.agent_actions.find((entry) => entry.id === 'repo.init-refresh')).toBeUndefined();
+    });
+  });
+
+  test('turns pending adoption plan operations into an Agent refresh action', () => {
+    withTempHome((home, repo) => {
+      mkdirSync(join(home, '.codex'), { recursive: true });
+      mkdirSync(join(repo, '.ai', 'harness'), { recursive: true });
+      writeFileSync(join(home, '.codex', 'AGENTS.md'), '# Global Working Rules\n');
+      writeFileSync(join(repo, '.ai', 'harness', 'workflow-contract.json'), '{}\n');
+
+      const report = runInitHook({
+        cwd: repo,
+        target: 'codex',
+        checkUpdates: true,
+        env: { ...process.env, HOME: home },
+        statusReport: statusReportForRepo(repo),
+        doctorReport: baseDoctorReport(),
+        toolingReport: baseToolingReport(),
+      });
+
+      const check = report.checks.find((entry) => entry.id === 'repo.init-refresh');
+      const action = report.agent_actions.find((entry) => entry.id === 'repo.init-refresh');
+      expect(check?.status).toBe('needs_agent');
+      expect(check?.detail).toContain('planned=');
+      expect(action?.command).toBe(`repo-harness init --repo ${shellQuoted(repo)}`);
+      expect(action?.verification).toBe('repo-harness setup check --target codex --check-updates --json');
+      expect(existsSync(join(repo, 'docs', 'spec.md'))).toBe(false);
+    });
+  });
+
+  test('reports adopted repo refresh as ok when the adoption dry-run is a no-op', () => {
+    withTempHome((home, repo) => {
+      mkdirSync(join(home, '.codex'), { recursive: true });
+      writeFileSync(join(home, '.codex', 'AGENTS.md'), '# Global Working Rules\n');
+      const apply = applyAdoptionPlan(planAdoption({ repoRoot: repo, mode: 'standard', apply: false }));
+      expect(apply.ok).toBe(true);
+
+      const report = runInitHook({
+        cwd: repo,
+        target: 'codex',
+        checkUpdates: true,
+        env: { ...process.env, HOME: home },
+        statusReport: statusReportForRepo(repo),
+        doctorReport: baseDoctorReport(),
+        toolingReport: baseToolingReport(),
+      });
+
+      const check = report.checks.find((entry) => entry.id === 'repo.init-refresh');
+      expect(check?.status).toBe('ok');
+      expect(check?.detail).toContain('up-to-date');
+      expect(report.agent_actions.find((entry) => entry.id === 'repo.init-refresh')).toBeUndefined();
+    });
+  });
+
+  test('does not recommend downstream init refresh for the repo-harness source checkout', () => {
+    withTempHome((home) => {
+      mkdirSync(join(home, '.codex'), { recursive: true });
+      writeFileSync(join(home, '.codex', 'AGENTS.md'), '# Global Working Rules\n');
+
+      const report = runInitHook({
+        cwd: ROOT,
+        sourceRoot: join(home, '.bun', 'install', 'global', 'node_modules', 'repo-harness'),
+        target: 'codex',
+        checkUpdates: true,
+        env: { ...process.env, HOME: home },
+        statusReport: statusReportForRepo(ROOT),
+        doctorReport: baseDoctorReport(),
+        toolingReport: baseToolingReport(),
+      });
+
+      const check = report.checks.find((entry) => entry.id === 'repo.init-refresh');
+      expect(check?.status).toBe('na');
+      expect(check?.detail).toContain('self-host source checkout');
+      expect(report.agent_actions.find((entry) => entry.id === 'repo.init-refresh')).toBeUndefined();
+    });
+  });
+
+  test('does not ask Agents to refresh adoption for non-adopted repos', () => {
+    withTempHome((home, repo) => {
+      mkdirSync(join(home, '.codex'), { recursive: true });
+      writeFileSync(join(home, '.codex', 'AGENTS.md'), '# Global Working Rules\n');
+
+      const report = runInitHook({
+        cwd: repo,
+        target: 'codex',
+        checkUpdates: true,
+        env: { ...process.env, HOME: home },
+        statusReport: statusReportForRepo(repo, false),
+        doctorReport: baseDoctorReport(),
+        toolingReport: baseToolingReport(),
+      });
+
+      const check = report.checks.find((entry) => entry.id === 'repo.init-refresh');
+      expect(check?.status).toBe('na');
+      expect(check?.detail).toContain('not repo-harness adopted');
+      expect(report.agent_actions.find((entry) => entry.id === 'repo.init-refresh')).toBeUndefined();
+    });
+  });
+
   test('turns missing and outdated tooling into Agent actions', () => {
     withTempHome((home, repo) => {
       mkdirSync(join(home, '.codex'), { recursive: true });
@@ -218,11 +482,11 @@ describe('init-hook command', () => {
         statusReport: baseStatusReport(),
         doctorReport: baseDoctorReport(),
         toolingReport: baseToolingReport({
-          gstack: {
-            name: 'gstack',
+          planner: {
+            name: 'planner',
             status: 'missing',
-            reason: 'gstack is missing from all requested hosts.',
-            install_command: 'install-gstack',
+            reason: 'planner is missing from all requested hosts.',
+            install_command: 'install-planner',
           },
           codegraph: {
             name: 'codegraph',
@@ -234,15 +498,15 @@ describe('init-hook command', () => {
         }),
       });
 
-      expect(report.checks.find((entry) => entry.id === 'tooling.gstack')?.status).toBe('needs_agent');
-      expect(report.agent_actions.find((entry) => entry.id === 'tooling.gstack.repair')?.command).toBe('install-gstack');
+      expect(report.checks.find((entry) => entry.id === 'tooling.planner')?.status).toBe('needs_agent');
+      expect(report.agent_actions.find((entry) => entry.id === 'tooling.planner.repair')?.command).toBe('install-planner');
       expect(report.agent_actions.find((entry) => entry.id === 'tooling.codegraph.update')?.command).toBe(
         'upgrade-codegraph',
       );
     });
   });
 
-  test('keeps optional gbrain gaps out of setup dependency actions', () => {
+  test('keeps optional tooling gaps out of setup dependency actions', () => {
     withTempHome((home, repo) => {
       mkdirSync(join(home, '.codex'), { recursive: true });
       writeFileSync(join(home, '.codex', 'AGENTS.md'), '# Global Working Rules\n');
@@ -255,22 +519,22 @@ describe('init-hook command', () => {
         statusReport: baseStatusReport(),
         doctorReport: baseDoctorReport(),
         toolingReport: baseToolingReport({
-          gbrain: {
-            name: 'gbrain',
+          advisory_tool: {
+            name: 'advisory_tool',
             required: false,
             status: 'missing',
-            reason: 'gbrain CLI is not installed.',
+            reason: 'Optional advisory tool is not installed.',
             update_status: 'update-available',
-            install_command: 'install-gbrain',
-            upgrade_command: 'upgrade-gbrain',
+            install_command: 'install-advisory-tool',
+            upgrade_command: 'upgrade-advisory-tool',
           },
         }),
       });
 
-      const check = report.checks.find((entry) => entry.id === 'tooling.gbrain');
+      const check = report.checks.find((entry) => entry.id === 'tooling.advisory_tool');
       expect(check?.status).toBe('ok');
       expect(check?.detail).toContain('optional');
-      expect(report.agent_actions.find((entry) => entry.id.startsWith('tooling.gbrain.'))).toBeUndefined();
+      expect(report.agent_actions.find((entry) => entry.id.startsWith('tooling.advisory_tool.'))).toBeUndefined();
       expect(report.status).toBe('ok');
     });
   });
@@ -352,7 +616,7 @@ describe('init-hook command', () => {
     expect(res.stdout).toContain('Usage: repo-harness init-hook');
     expect(res.stdout).toContain('--target <target>');
     expect(res.stdout).toContain('--check-updates');
-  });
+  }, 30_000);
 
   test('CLI exposes setup check help', () => {
     const res = spawnSync('bun', [CLI, 'setup', 'check', '--help'], {
@@ -363,5 +627,5 @@ describe('init-hook command', () => {
     expect(res.stdout).toContain('Usage: repo-harness setup check');
     expect(res.stdout).toContain('--target <target>');
     expect(res.stdout).toContain('--check-updates');
-  });
+  }, 30_000);
 });

@@ -4,17 +4,18 @@ set -euo pipefail
 usage() {
   cat <<'USAGE_EOF'
 Usage:
-  scripts/architecture-queue.sh record --file <path>
-  scripts/architecture-queue.sh status [--format text|json|summary] [--gate]
-  scripts/architecture-queue.sh reindex [--check] [--quiet]
-  scripts/architecture-queue.sh triage --before <YYYY-MM-DD>
-  scripts/architecture-queue.sh check
+  repo-harness run architecture-queue record --file <path>
+  repo-harness run architecture-queue status [--format text|json|summary] [--gate]
+  repo-harness run architecture-queue reindex [--check] [--quiet]
+  repo-harness run architecture-queue triage --before <YYYY-MM-DD>
+  repo-harness run architecture-queue check
 USAGE_EOF
 }
 
 repo="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 repo="$(cd "$repo" && pwd)"
 cd "$repo"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 command_name="${1:-status}"
 shift || true
@@ -73,8 +74,9 @@ event_file=".ai/harness/architecture/events.jsonl"
 
 helper_sibling() {
   local helper_name="$1"
-  local helper_dir=""
-  if [[ -n "${REPO_HARNESS_HELPER_SOURCE_PATH:-}" ]]; then
+  local helper_dir="$SCRIPT_DIR"
+  if [[ -n "${REPO_HARNESS_HELPER_SOURCE_PATH:-}" && -f "$REPO_HARNESS_HELPER_SOURCE_PATH" \
+        && "$(basename "$REPO_HARNESS_HELPER_SOURCE_PATH")" == "$(basename "${BASH_SOURCE[0]}")" ]]; then
     helper_dir="$(dirname "$REPO_HARNESS_HELPER_SOURCE_PATH")"
   fi
   if [[ -n "$helper_dir" && -f "$helper_dir/$helper_name" ]]; then
@@ -86,10 +88,6 @@ helper_sibling() {
 
 architecture_event() {
   local sibling=""
-  if command -v bun >/dev/null 2>&1 && [[ -f "scripts/architecture-event.ts" ]]; then
-    bun scripts/architecture-event.ts "$@"
-    return $?
-  fi
   sibling="$(helper_sibling architecture-event.ts || true)"
   if command -v bun >/dev/null 2>&1 && [[ -n "$sibling" ]]; then
     bun "$sibling" "$@"
@@ -108,10 +106,6 @@ architecture_event_required() {
 
 capability_resolver() {
   local sibling=""
-  if command -v bun >/dev/null 2>&1 && [[ -f "scripts/capability-resolver.ts" ]]; then
-    bun scripts/capability-resolver.ts "$@"
-    return $?
-  fi
   sibling="$(helper_sibling capability-resolver.ts || true)"
   if command -v bun >/dev/null 2>&1 && [[ -n "$sibling" ]]; then
     bun "$sibling" "$@"
@@ -236,8 +230,10 @@ metadata_value() {
 }
 
 selected_blocks() {
-  if [[ -x "scripts/select-agent-context-blocks.sh" ]]; then
-    "scripts/select-agent-context-blocks.sh" "$repo" 2>/dev/null || true
+  local sibling=""
+  sibling="$(helper_sibling select-agent-context-blocks.sh || true)"
+  if [[ -n "$sibling" ]]; then
+    "$sibling" "$repo" 2>/dev/null || true
     return 0
   fi
 
@@ -294,10 +290,12 @@ classify_change() {
   esac
 
   if [[ "$rel_path" =~ ^(\.ai/hooks/|assets/hooks/) ]] ||
+     [[ "$rel_path" =~ ^src/cli/hook/ ]] ||
+     [[ "$rel_path" == "src/cli/hook-entry.ts" ]] ||
      [[ "$rel_path" == ".ai/harness/policy.json" ]] ||
      [[ "$rel_path" == ".ai/harness/workflow-contract.json" ]] ||
      [[ "$rel_path" == "assets/workflow-contract.v1.json" ]] ||
-     [[ "$rel_path" =~ ^scripts/(architecture-queue|context-contract-sync|workstream-sync|migrate-project-template|migrate-workflow-docs|inspect-project-state|check-skill-version|capability-resolver|capability-config|create-project-dirs|init-project|ensure-task-workflow|check-task-workflow|check-deploy-sql-order|refresh-current-status|workflow-contract|select-agent-context-blocks)\.(sh|ts)$ ]] ||
+     [[ "$rel_path" =~ ^scripts/(architecture-queue|context-contract-sync|workstream-sync|inspect-project-state|check-skill-version|capability-resolver|capability-config|create-project-dirs|init-project|ensure-task-workflow|check-task-workflow|check-deploy-sql-order|refresh-current-status|workflow-contract|select-agent-context-blocks)\.(sh|ts)$ ]] ||
      [[ "$rel_path" == "scripts/lib/project-init-lib.sh" ]]; then
     printf 'high workflow-surface\n'
     return
@@ -324,6 +322,15 @@ classify_change() {
   fi
 
   printf 'none unrelated\n'
+}
+
+is_capability_source_change() {
+  local rel_path="$1"
+  local matched_prefix="$2"
+
+  [[ -n "$matched_prefix" && "$matched_prefix" != "root" ]] || return 1
+  [[ "$rel_path" == "$matched_prefix/"* ]] || return 1
+  [[ "/$rel_path" == */src/* ]]
 }
 
 policy_arch_value() {
@@ -404,6 +411,8 @@ reindex_requests() {
 
 status_command() {
   local count mode threshold blocking
+  architecture_event_required
+  architecture_event validate-requests --requests-dir "$requests_dir"
   count="$(pending_count)"
   mode="$(policy_arch_value "freshness_gate" "advisory")"
   threshold="$(policy_arch_value "gate_min_severity" "medium")"
@@ -460,7 +469,7 @@ record_command() {
     exit 2
   fi
 
-  local rel_path severity change_type capability_match resolver_stderr
+  local rel_path severity change_type capability_match resolver_stderr architecture_event_ready
   rel_path="$(repo_relative_path "$file_path" || true)"
   if [[ -z "$rel_path" ]]; then
     echo "[ArchitectureDrift] Skipped unsafe path: $file_path"
@@ -468,18 +477,22 @@ record_command() {
   fi
 
   read -r severity change_type < <(classify_change "$rel_path")
-  if [[ "$severity" == "none" ]]; then
+  if [[ "$severity" == "none" && "$change_type" != "unrelated" ]]; then
     echo "[ArchitectureDrift] No architecture drift request for $rel_path ($change_type)."
     exit 0
   fi
 
-  if ! architecture_event_required >/dev/null 2>&1; then
-    echo "[ArchitectureQueue] WARN: architecture-event helper is required to record $rel_path; skipping advisory queue update"
-    exit 0
+  architecture_event_ready="false"
+  if [[ "$severity" != "none" ]]; then
+    if ! architecture_event_required >/dev/null 2>&1; then
+      echo "[ArchitectureQueue] WARN: architecture-event helper is required to record $rel_path; skipping advisory queue update"
+      exit 0
+    fi
+    architecture_event_ready="true"
   fi
 
   capability_match=""
-  if capability_resolver_available; then
+  if [[ "$severity" != "none" || "/$rel_path" == */src/* ]] && capability_resolver_available; then
     resolver_stderr="$(mktemp)"
     if ! capability_match="$(capability_resolver match --path "$rel_path" --format json 2>"$resolver_stderr")"; then
       [[ -n "$capability_match" ]] && echo "$capability_match" >&2
@@ -493,6 +506,23 @@ record_command() {
       capability_match=""
     fi
     rm -f "$resolver_stderr"
+  fi
+
+  if [[ "$severity" == "none" ]] &&
+     [[ "$(json_get "$capability_match" "matched" || true)" == "true" ]] &&
+     is_capability_source_change "$rel_path" "$(json_get "$capability_match" "matched_prefix" || true)"; then
+    severity="low"
+    change_type="source-change"
+  fi
+
+  if [[ "$severity" == "none" ]]; then
+    echo "[ArchitectureDrift] No architecture drift request for $rel_path ($change_type)."
+    exit 0
+  fi
+
+  if [[ "$architecture_event_ready" != "true" ]] && ! architecture_event_required >/dev/null 2>&1; then
+    echo "[ArchitectureQueue] WARN: architecture-event helper is required to record $rel_path; skipping advisory queue update"
+    exit 0
   fi
 
   local functional_block matched_prefix capability_id contract_agents contract_claude capability_resolved
@@ -535,7 +565,7 @@ record_command() {
     read -r architecture_domain architecture_capability architecture_module workstream_dir < <(architecture_event derive-scope --block "$functional_block" --format lines)
   fi
 
-  local iso_timestamp request_file spawn_recommended contract_sync_required request_event_json event_json
+  local iso_timestamp request_file spawn_recommended contract_sync_required request_event_json request_update
   iso_timestamp="$(date '+%Y-%m-%dT%H:%M:%S%z')"
   request_file="$(request_card_path "$capability_id")"
   spawn_recommended="false"
@@ -565,31 +595,26 @@ record_command() {
     --contract-sync-required "$contract_sync_required" \
     --pretty)"
 
-  mkdir -p "$requests_dir" "$(dirname "$event_file")" docs/architecture/snapshots docs/architecture/diagrams docs/architecture/domains docs/architecture/modules tasks/workstreams
-  architecture_event upsert-request --request-file "$request_file" --event-json "$request_event_json"
-
-  event_json="$(architecture_event event-json \
-    --ts "$iso_timestamp" \
-    --file-path "$rel_path" \
-    --severity "$severity" \
-    --functional-block "$functional_block" \
-    --capability-id "$capability_id" \
-    --matched-prefix "$matched_prefix" \
-    --architecture-domain "$architecture_domain" \
-    --architecture-capability "$architecture_capability" \
-    --architecture-module "$architecture_module" \
-    --workstream-dir "$workstream_dir" \
-    --contract-agents "$contract_agents" \
-    --contract-claude "$contract_claude" \
-    --change-type "$change_type" \
+  request_update="$(architecture_event record-event \
     --request-file "$request_file" \
-    --spawn-recommended "$spawn_recommended" \
-    --contract-sync-required "$contract_sync_required")"
-  printf '%s\n' "$event_json" >> "$event_file"
-
-  quiet="true"
-  check_mode="false"
-  reindex_requests
+    --event-file "$event_file" \
+    --index-file "$index_file" \
+    --requests-dir "$requests_dir" \
+    --event-json "$request_event_json")"
+  case "$request_update" in
+    unchanged)
+      echo "[ArchitectureDrift] No architecture drift update for $rel_path (unchanged request)."
+      echo "[ArchitectureDrift] Request: $request_file"
+      echo "[ArchitectureDrift] severity=$severity capability_id=$capability_id functional_block=$functional_block spawn_recommended=$spawn_recommended contract_sync_required=$contract_sync_required"
+      exit 0
+      ;;
+    changed)
+      ;;
+    *)
+      echo "architecture-queue: architecture-event returned invalid upsert status: ${request_update:-empty}" >&2
+      exit 1
+      ;;
+  esac
 
   echo "[ArchitectureDrift] Request: $request_file"
   echo "[ArchitectureDrift] Event: $event_file"
@@ -630,8 +655,12 @@ triage_command() {
     capability_id="${capability_id:-root}"
     card="$(request_card_path "$capability_id")"
     architecture_event upsert-from-request --source-request "$request" --request-file "$card"
-    if [[ -x "scripts/archive-architecture-request.sh" ]]; then
-      bash scripts/archive-architecture-request.sh \
+    quiet="true"
+    check_mode="false"
+    reindex_requests
+    archive_sibling="$(helper_sibling archive-architecture-request.sh || true)"
+    if [[ -n "$archive_sibling" ]]; then
+      bash "$archive_sibling" \
         --request "$request" \
         --status superseded \
         --artifact "$card" \

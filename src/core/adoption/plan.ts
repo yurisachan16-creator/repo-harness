@@ -1,147 +1,55 @@
-import { existsSync, readFileSync, statSync } from "fs";
 import { resolve } from "path";
 import type { AdoptionMode } from "./modes";
-import type { AdoptionOperation, AdoptionPlan, AdoptionWarning } from "./operations";
-import { makeOperationId } from "./operations";
-import { gitignoreManagedBlockOperation } from "./gitignore-plan";
+import type { AdoptionPlan } from "./operations";
 import { summarizeOperations } from "./summary";
-import { managedBlockNeedsUpdate } from "../../effects/managed-block";
-import { workflowContractInstallOperation } from "./workflow-contract-plan";
-import { adoptionTemplateFile } from "./manifest-templates";
-import { helperWrapperGitignoreContent, helperWrapperOperations } from "./helper-wrapper-plan";
 import { withRollbackMetadata } from "./rollback";
+import { planStandardAdoption } from "./standard-plan";
+import { isRepoHarnessSourceCheckout } from "./source-checkout";
 
 export interface PlanAdoptionOptions {
   readonly repoRoot: string;
   readonly mode?: AdoptionMode;
   readonly apply?: boolean;
-  readonly helperCompatibilityWrappers?: boolean;
+  readonly env?: NodeJS.ProcessEnv;
 }
 
-const MINIMAL_DIRS = [
-  "plans",
-  "tasks",
-  "tasks/contracts",
-  "tasks/reviews",
-  "tasks/notes",
-  "docs",
-  ".ai/harness/checks",
-  ".ai/harness/handoff",
-] as const;
-
-const STANDARD_EXTRA_DIRS = [
-  "plans/archive",
-  "plans/prds",
-  "plans/sprints",
-  "tasks/workstreams",
-  "docs/reference-configs",
-  ".ai/context",
-  ".ai/harness/failures",
-  ".ai/harness/architecture",
-  ".ai/harness/runs",
-] as const;
-
-function directoryPaths(mode: AdoptionMode): readonly string[] {
-  return mode === "minimal" ? MINIMAL_DIRS : [...MINIMAL_DIRS, ...STANDARD_EXTRA_DIRS];
-}
-
-function repoFileStatus(repoRoot: string, relPath: string): "planned" | "skipped" {
-  return existsSync(resolve(repoRoot, relPath)) ? "skipped" : "planned";
-}
-
-function repoDirStatus(repoRoot: string, relPath: string): "planned" | "skipped" {
-  const target = resolve(repoRoot, relPath);
-  return existsSync(target) && statSync(target).isDirectory() ? "skipped" : "planned";
-}
-
-function writeIfMissingOperations(repoRoot: string): AdoptionOperation[] {
-  const files = [
-    adoptionTemplateFile(repoRoot, "spec"),
-    adoptionTemplateFile(repoRoot, "deferredGoalLedger"),
-    adoptionTemplateFile(repoRoot, "currentStatus"),
-    adoptionTemplateFile(repoRoot, "lessonsLog"),
-  ] as const;
-
-  return files.map((file) => ({
-    id: makeOperationId("writeFile", file.path, "ifMissing"),
-    kind: "writeFile",
-    path: file.path,
-    content: file.content,
-    ifMissing: true,
-    reason: file.reason,
-    risk: "low",
-    status: repoFileStatus(repoRoot, file.path),
-  }));
-}
-
-function workflowContractOperations(repoRoot: string): AdoptionOperation[] {
-  return [workflowContractInstallOperation(repoRoot)];
-}
-
-function selfHostOperations(mode: AdoptionMode): AdoptionOperation[] {
-  if (mode !== "self-host") return [];
-  return [
-    {
-      id: makeOperationId("runCheck", "self-host-adoption-boundary-review"),
-      kind: "runCheck",
-      command: "manual:self-host-hook-helper-pin-review",
-      reason: "Self-host adoption must preserve repo-pinned hook/helper runtime boundaries",
-      risk: "medium",
-      status: "skipped",
-    },
-  ];
-}
-
-function selfHostWarnings(mode: AdoptionMode): AdoptionWarning[] {
-  if (mode !== "self-host") return [];
-  return [
-    {
-      code: "self-host-hook-helper-pin",
-      message: "Self-host mode only records the hook/helper pin review boundary in this sprint; it does not migrate hooks.",
-      risk: "medium",
-    },
-  ];
-}
-
+/**
+ * Produce the complete repo-local adoption transaction before the executor
+ * writes anything. The plan contains source-derived bytes, ownership-gated
+ * cleanup, and all filesystem mutations; callers may only add explicit
+ * post-apply effects such as registry or CodeGraph readiness.
+ */
 export function planAdoption(opts: PlanAdoptionOptions): AdoptionPlan {
   const repoRoot = resolve(opts.repoRoot);
   const mode = opts.mode ?? "standard";
-  const helperCompatibilityWrappers = opts.helperCompatibilityWrappers !== false;
-  const operations: AdoptionOperation[] = [
-    ...directoryPaths(mode).map((path) => ({
-      id: makeOperationId("mkdir", path),
-      kind: "mkdir" as const,
-      path,
-      reason: "Ensure repo-harness workflow surface directory exists",
-      risk: "low" as const,
-      status: repoDirStatus(repoRoot, path),
-    })),
-    ...writeIfMissingOperations(repoRoot),
-    ...workflowContractOperations(repoRoot),
-    ...(helperCompatibilityWrappers ? helperWrapperOperations(repoRoot, mode) : []),
-  ];
-
-  const gitignorePath = resolve(repoRoot, ".gitignore");
-  const gitignoreExtraContent = helperCompatibilityWrappers ? helperWrapperGitignoreContent(repoRoot, mode) : "";
-  const plannedGitignoreOperation = gitignoreManagedBlockOperation("planned", gitignoreExtraContent);
-  const gitignoreOperation = gitignoreManagedBlockOperation(
-    managedBlockNeedsUpdate(existsSync(gitignorePath) ? readFileSync(gitignorePath, "utf-8") : "", plannedGitignoreOperation)
-      ? "planned"
-      : "skipped",
-    gitignoreExtraContent,
-  );
-
-  operations.push(gitignoreOperation, ...selfHostOperations(mode));
-  const operationsWithRollback = operations.map(withRollbackMetadata);
+  if (mode === "standard" && isRepoHarnessSourceCheckout(repoRoot)) {
+    const operations: AdoptionPlan["operations"] = [];
+    return {
+      protocol: 1,
+      command: "init",
+      repoRoot,
+      mode,
+      apply: opts.apply === true,
+      operations,
+      summary: summarizeOperations(operations),
+      warnings: [{
+        code: "self-host-source-noop",
+        message: "The repo-harness source checkout owns its workflow surfaces; downstream init is not applicable.",
+        risk: "low",
+      }],
+    };
+  }
+  const planned = planStandardAdoption({ repoRoot, mode, env: opts.env });
+  const operations = planned.operations.map(withRollbackMetadata);
 
   return {
     protocol: 1,
-    command: "adopt",
+    command: "init",
     repoRoot,
     mode,
     apply: opts.apply === true,
-    operations: operationsWithRollback,
-    summary: summarizeOperations(operationsWithRollback),
-    warnings: selfHostWarnings(mode),
+    operations,
+    summary: summarizeOperations(operations),
+    warnings: planned.warnings,
   };
 }

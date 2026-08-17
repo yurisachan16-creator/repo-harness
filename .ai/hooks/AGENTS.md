@@ -11,7 +11,7 @@ Keep this file focused on the local contract for this primary functional block.
 - Treat `.ai/context/context-map.json` as the index of discoverable context files.
 - Do not keep pushing context files deeper by default; add lower-level files only for a separately owned functional block with its own commands and invariants.
 - Prefer repo-local workflow artifacts over tool-specific chat memory.
-- `assets/hooks/` is the only human-authored hook source. Treat `.ai/hooks/` as the generated self-host projection; after editing hook files, run `bun run sync:hooks`, then `bun run check:hooks`.
+- `assets/hooks/` owns only operator helper assets and their local context. Host-event runtime authority lives in `src/cli/hook/`; treat `.ai/hooks/` as the generated operator-helper projection, then run `bun run sync:hooks` and `bun run check:hooks` after edits.
 - Do not hand-edit generated `.ai/hooks/` drift. Classify package-only or repo-only exceptions in `assets/hooks/projection.json`.
 
 <!-- BEGIN CAPABILITY CONTEXT -->
@@ -26,7 +26,7 @@ Keep this file focused on the local contract for this primary functional block.
 
 ## Positioning
 
-Owns the runtime-harness-hook-adapters capability boundary declared in .ai/context/capabilities.json.
+Owns the runtime-harness-hook-adapters capability boundary declared in .archcontext/model/nodes.
 
 ## Source Map
 
@@ -43,31 +43,33 @@ Owns the runtime-harness-hook-adapters capability boundary declared in .ai/conte
 <!-- BEGIN ARCHITECTURE CONTRACT -->
 ## Architecture Contract
 
-- Functional block: `.ai/hooks`
+- Functional block: `src/cli/hook`
 - Capability ID: `runtime-harness-hook-adapters`
-- Matched prefix: `.ai/hooks`
+- Matched prefix: `src/cli/hook`
 - Architecture domain: `runtime-harness`
 - Architecture capability: `hook-adapters`
 - Architecture module: `docs/architecture/modules/runtime-harness/hook-adapters.md`
-- Last architecture event: 2026-06-13T00:04:13+0800
-- Last changed path: `.ai/hooks/post-tool-observer.sh`
-- Severity: high
-- Change type: workflow-surface
+- Last architecture event: 2026-08-05T00:46:12+0800
+- Last changed path: `tasks/workstreams/runtime-harness/hook-adapters/github-issues-158-159.md`
+- Severity: medium
+- Change type: workstream-sync
 - Module responsibility: Keep this block aligned with the local boundary described by surrounding human-owned context.
-- Entrypoints: `.ai/hooks`
+- Entrypoints: `src/cli/hook`
 - Allowed dependencies: Follow root `AGENTS.md` / `CLAUDE.md` and this local contract.
 - Forbidden dependencies: Do not cross sibling app/service/package boundaries without an architecture snapshot or explicit plan.
-- Runtime path: `.ai/hooks`
+- Runtime path: `src/cli/hook`
 - LSP/tooling profile: `typescript-lsp`
 - Verification: Use root required checks plus local commands recorded in this capability contract.
 - Latest snapshot: `(none yet)`
 - Semantic diagram source: `docs/architecture/modules/runtime-harness/hook-adapters.md`
-- Latest human diagram: `(none yet)`
 - Pending architecture request: `(none)`
 
 ## Active Workstreams
 
-- (none yet)
+- `tasks/workstreams/runtime-harness/hook-adapters/github-issues-158-159.md`
+  - status: completed
+  - current_slice: completed-20260805-contract-scoped-check-repair
+  - source_plan: plans/plan-20260805-0001-github-issues-158-159.md
 
 ## Current Session Projection
 

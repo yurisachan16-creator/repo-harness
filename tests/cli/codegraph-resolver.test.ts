@@ -50,26 +50,9 @@ function writeFakeCodeGraph(fakeBin: string, logFile: string) {
   );
 }
 
-function writeFakeGbrain(fakeBin: string) {
+function writeFakeBunx(fakeBin: string) {
   writeExecutable(
-    join(fakeBin, "gbrain"),
-    [
-      "#!/bin/bash",
-      "set -euo pipefail",
-      "case \"$1 ${2:-}\" in",
-      "  \"--version \") echo 'gbrain 0.12.0' ;;",
-      "  \"doctor --json\") echo '{\"status\":\"warnings\",\"health_score\":90}' ;;",
-      "  \"integrations list\") echo '{\"local\":[]}' ;;",
-      "  *) exit 1 ;;",
-      "esac",
-      "",
-    ].join("\n")
-  );
-}
-
-function writeFakeNpx(fakeBin: string) {
-  writeExecutable(
-    join(fakeBin, "npx"),
+    join(fakeBin, "bunx"),
     [
       "#!/bin/bash",
       "set -euo pipefail",
@@ -88,8 +71,7 @@ describe("ensure-codegraph", () => {
       mkdirSync(join(envRoot.home, ".codex"), { recursive: true });
       writeFileSync(join(envRoot.home, ".codex", "config.toml"), "[mcp_servers.codegraph]\ncommand = \"codegraph\"\n");
       writeFakeCodeGraph(envRoot.fakeBin, logFile);
-      writeFakeGbrain(envRoot.fakeBin);
-      writeFakeNpx(envRoot.fakeBin);
+      writeFakeBunx(envRoot.fakeBin);
 
       const res = spawnSync("bash", [SCRIPT, "--check", "--json", "--repo", ROOT], {
         cwd: ROOT,

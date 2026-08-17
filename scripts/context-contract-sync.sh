@@ -155,6 +155,19 @@ metadata_value() {
   ' "$file" 2>/dev/null
 }
 
+active_pending_request_file() {
+  local file="$1"
+  if [[ -z "$file" || "$file" == "unknown" || "$file" == *"/archive/"* || ! -f "$file" ]]; then
+    echo "(none)"
+    return 0
+  fi
+  if [[ "$(metadata_value "$file" "Status" | tr '[:upper:]' '[:lower:]')" == "pending" ]]; then
+    echo "$file"
+  else
+    echo "(none)"
+  fi
+}
+
 format_active_workstreams() {
   local dir="$1"
   local count=0
@@ -282,7 +295,7 @@ sync_context_map() {
   "version": 1,
   "profile": "stable-root-progressive-subdir",
   "functional_block_selector": {
-    "script": "scripts/select-agent-context-blocks.sh",
+    "script": "repo-harness run select-agent-context-blocks",
     "config_file": ".ai/context/agent-context-blocks.txt",
     "env": "REPO_HARNESS_CONTEXT_BLOCKS",
     "rule": "compatibility selector; capability registry is the source of truth"
@@ -432,14 +445,13 @@ if architecture_event sync-contract-files \
 fi
 
 latest_snapshot="$({ find docs/architecture/snapshots -type f -name "*${block_slug}*.md" 2>/dev/null || true; } | sort | tail -1)"
-latest_human_diagram="$({ find docs/architecture/diagrams -type f -name "*${block_slug}*.html" 2>/dev/null || true; } | sort | tail -1)"
 latest_snapshot="${latest_snapshot:-(none yet)}"
-latest_human_diagram="${latest_human_diagram:-(none yet)}"
 semantic_diagram_source="$architecture_module"
 if [[ "$latest_snapshot" != "(none yet)" ]]; then
   semantic_diagram_source="$latest_snapshot"
 fi
 active_workstreams="$(format_active_workstreams "$workstream_dir")"
+pending_request_file="$(active_pending_request_file "${request_file:-}")"
 
 block_tmp="$(mktemp)"
 cat > "$block_tmp" <<EOF_BLOCK
@@ -465,8 +477,7 @@ cat > "$block_tmp" <<EOF_BLOCK
 - Verification: Use root required checks plus local commands recorded in this capability contract.
 - Latest snapshot: \`${latest_snapshot}\`
 - Semantic diagram source: \`${semantic_diagram_source}\`
-- Latest human diagram: \`${latest_human_diagram}\`
-- Pending architecture request: \`${request_file:-unknown}\`
+- Pending architecture request: \`${pending_request_file}\`
 
 ## Active Workstreams
 

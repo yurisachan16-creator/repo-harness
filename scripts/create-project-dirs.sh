@@ -23,17 +23,8 @@ ASSETS_WORKFLOW_CONTRACT="$SCRIPT_DIR/../assets/workflow-contract.v1.json"
 
 write_runtime_gitignore_block() {
   local extra_entries=""
-  local helper_entries=""
   if pi_should_enable_factor_factory "$(pi_plan_type)"; then
     extra_entries="$(pi_factor_factory_gitignore_entries)"
-  fi
-  helper_entries="$(pi_helper_wrapper_gitignore_entries "$ASSETS_WORKFLOW_CONTRACT")"
-  if [[ -n "$helper_entries" ]]; then
-    if [[ -n "$extra_entries" ]]; then
-      extra_entries="${extra_entries}"$'\n'"${helper_entries}"
-    else
-      extra_entries="$helper_entries"
-    fi
   fi
   pi_ensure_gitignore_block ".gitignore" "$PI_DEFAULT_GITIGNORE_CONTENT" "$extra_entries" "apply"
 }
@@ -185,7 +176,6 @@ fi
 ensure_task_sync_package_script
 write_runtime_gitignore_block
 
-pi_install_hook_adapters "$PWD" "$ASSETS_HOOKS_DIR" "apply"
 pi_print_codex_hook_trust_notice
 
 cat > docs/spec.md << 'DOCS_SPEC_EOF'
@@ -267,9 +257,11 @@ cat > deploy/README.md << 'DEPLOY_README_EOF'
 - `deploy/scripts/` for operational scripts.
 - `deploy/submissions/` for submission or review materials.
 - `deploy/runbooks/` and `deploy/release-checklists/` for operational documentation.
-- `deploy/sql/` for ordered deployment SQL files named like `0001_create_tables.sql`.
+- `deploy/sql/` as the default SQL root for ordered files named like `0001_create_tables.sql`.
 - `deploy/*.md` for runbooks and operating notes.
 - `deploy/env/.env.example` for documented variable shapes only.
+
+If `.ai/harness/policy.json` defines `operations.deploy_sql`, its roots, naming modes, and `invariant_file` are the sole authority for an established alternate SQL layout. When it is absent, SQL files remain direct children of `deploy/sql/` with `ordered4` names.
 
 ## Do Not Track
 

@@ -15,6 +15,18 @@ coverage/
 
 # External references
 _ref/
+.archcontext/*
+!.archcontext/manifest.yaml
+!.archcontext/product.yaml
+!.archcontext/model/
+.archcontext/model/*
+!.archcontext/model/nodes/
+!.archcontext/model/relations/
+!.archcontext/model/flows/
+!.archcontext/decisions/
+!.archcontext/policies/
+!.archcontext/practices/
+!.archcontext/projections/
 .codegraph/
 
 # Local operations state
@@ -53,6 +65,8 @@ tasks/.current.md.tmp.*
 .ai/harness/handoff/current.md
 .ai/harness/handoff/resume.md
 .ai/harness/capability-context/
+.ai/harness/journal/
+.ai/harness/architecture-projection/
 .ai/harness/security/*
 !.ai/harness/security/.gitkeep
 .ai/harness/planning/*
@@ -63,16 +77,16 @@ tasks/.current.md.tmp.*
 .ai/harness/active-worktree
 .ai/harness/sprint/
 .ai/harness/worktrees/
+.ai/harness/evidence/
 .ai/harness/runs/
+.ai/harness/state/
 .ai/harness/chatgpt/browser-lock.json
 .ai/harness/chatgpt/tmp/
 .ai/harness/chatgpt/sessions/
 .ai/harness/triage/*
 !.ai/harness/triage/.gitkeep
-.repo-harness/chatgpt-browser.local.json
-.repo-harness/chatgpt-browser.tokens.json
+.repo-harness/
 .codex/*
-.claude/.active-plan
 .claude/.plan-state/
 EOF_RUNTIME
 )
@@ -176,8 +190,8 @@ Complete this inventory before implementation. If any line is unknown, keep the 
 - Current checks: `.ai/harness/checks/latest.json`
 - Run snapshots: `.ai/harness/runs/`
 - Scope authority: `tasks/contracts/{{ARTIFACT_STEM}}.contract.md` `allowed_paths`
-- Concurrency rule: `.ai/harness/active-plan` selects the active plan for this worktree when present; `.ai/harness/active-worktree` records the owning worktree; `.claude/.active-plan` is a legacy fallback during transition. If another worktree already owns active work, open or switch to the matching worktree instead of serializing unrelated plans.
-- Execution isolation: approved contract-level work projects through `.ai/harness/scripts/plan-to-todo.sh --plan {{PLAN_FILE}}` and may start `.ai/harness/scripts/contract-worktree.sh start --plan {{PLAN_FILE}}`.
+- Concurrency rule: `.ai/harness/active-plan` selects the active plan for this worktree when present; `.ai/harness/active-worktree` records the owning worktree. If another worktree already owns active work, open or switch to the matching worktree instead of serializing unrelated plans.
+- Execution isolation: approved contract-level work projects through `repo-harness run plan-to-todo --plan {{PLAN_FILE}}` and may start `repo-harness run contract-worktree start --plan {{PLAN_FILE}}`.
 
 ## Approach
 ### Strategy
@@ -202,8 +216,8 @@ Complete this inventory before implementation. If any line is unknown, keep the 
 - Review file: `tasks/reviews/{{ARTIFACT_STEM}}.review.md`
 - Implementation notes file: `tasks/notes/{{ARTIFACT_STEM}}.notes.md`
 - Template: `.claude/templates/contract.template.md`
-- Verification command: `bash .ai/harness/scripts/verify-contract.sh --contract tasks/contracts/{{ARTIFACT_STEM}}.contract.md --strict`
-- Active plan rule: `.ai/harness/active-plan` is authoritative for this worktree when present; `.ai/harness/active-worktree` records the owning worktree; `.claude/.active-plan` is a legacy fallback during transition. Do not infer active execution from the latest non-archived plan.
+- Verification command: `repo-harness run verify-contract --contract tasks/contracts/{{ARTIFACT_STEM}}.contract.md --strict`
+- Active plan rule: `.ai/harness/active-plan` is authoritative for this worktree when present; `.ai/harness/active-worktree` records the owning worktree. Do not infer active execution from the latest non-archived plan.
 
 ## Handoff
 
@@ -234,17 +248,24 @@ Complete this inventory before implementation. If any line is unknown, keep the 
 - [ ] ...
 EOF_TEMPLATE_PLAN
 )
-PI_TEMPLATE_CONTRACT=$(cat <<'EOF_TEMPLATE_CONTRACT'
+PI_TEMPLATE_CONTRACT_TMP="$(mktemp)"
+cat > "$PI_TEMPLATE_CONTRACT_TMP" <<'EOF_TEMPLATE_CONTRACT'
 # Task Contract: {{TASK_SLUG}}
 
-> **Status**: Pending
+> **Status**: Active
 > **Plan**: {{PLAN_FILE}}
 > **Task Profile**: {{TASK_PROFILE}}
+> <!-- legal values: code-change | docs-only | ledger-closeout | migration | eval-only | delegated-run | bugfix (omit for legacy passthrough); see docs/reference-configs/sprint-contracts.md -->
 > **Owner**: {{OWNER}}
 > **Capability ID**: {{CAPABILITY_ID}}
 > **Last Updated**: {{TIMESTAMP}}
 > **Review File**: `{{REVIEW_FILE}}`
 > **Notes File**: `{{NOTES_FILE}}`
+> **Exemplar**: `docs/reference-configs/contract-brief-example.md`
+
+## Why
+
+Why this task matters and what breaks downstream if it ships wrong or is skipped.
 
 ## Goal
 
@@ -254,6 +275,26 @@ Describe the exact outcome this task must deliver.
 
 - In scope:
 - Out of scope:
+- Taste constraints: <!-- advisory only, no run gate; default style/taste lives in AGENTS.md and the minimal-change policy, use this to record a per-task override -->
+
+## Stop Conditions
+
+- Stop and hand back to the parent if the change would require editing a path outside Allowed Paths.
+- Stop if an Exit Criteria command cannot be run in this environment.
+- Stop if Goal, Scope, or Exit Criteria are internally contradictory.
+
+## Falsifier
+
+What observable evidence would prove this task's direction wrong, and the cheapest proof point to check first. Leave as-is if not applicable.
+
+## Root Cause Evidence
+
+Required when Task Profile is `bugfix`; leave as-is otherwise.
+
+- root_cause: one sentence naming file:line/condition (testable, not "a state issue").
+- repro: the command or UI path that reproduces the symptom.
+- regression_guard: path to a test that fails on the unfixed code and passes after the fix (must also appear under exit_criteria.tests_pass).
+- pre_fix_failure_artifact: path to a captured run of regression_guard on the UNFIXED code. Capture with `bun test <regression_guard> > <artifact> 2>&1; echo "PRE_FIX_EXIT=$?" >> <artifact>` (no pipes — pipes swallow the exit status). The gate requires a non-zero `PRE_FIX_EXIT=` line plus the regression_guard path string in the artifact (see the Root Cause Evidence Gate section in docs/reference-configs/sprint-contracts.md).
 
 ## Workflow Inventory
 
@@ -264,20 +305,42 @@ Describe the exact outcome this task must deliver.
 - Checks file: `.ai/harness/checks/latest.json`
 - Run snapshots: `.ai/harness/runs/`
 - Scope gate: edit only paths listed under `allowed_paths`; update this contract before widening scope.
-- Completion gate: `scripts/verify-sprint.sh` must see this contract pass, the review recommend pass, and `## External Acceptance Advice` pass or record a manual override.
+- Completion gate: run `verify-sprint --prepare-acceptance`, record one typed AcceptanceReceipt under the frozen policy below, then run `verify-sprint`; review Markdown is projection only.
+
+## Change Assessment
+
+```json
+{"protocol":1,"oracles":[]}
+```
+
+## Acceptance Policy
+
+```json
+{"protocol":1,"reviewer":"Claude","user_waiver":"allowed"}
+```
 
 ## Allowed Paths
 
 ```yaml
 allowed_paths:
+  - docs/spec.md
   - plans/
   - tasks/todos.md
   - {{CONTRACT_FILE}}
   - {{REVIEW_FILE}}
   - {{NOTES_FILE}}
   - .ai/context/capabilities.json
+  - .claude/templates/
   - src/
   - tests/
+```
+
+## Evidence Requirements
+
+```yaml
+evidence_requirements:
+  # Set benchmark to required when this contract consumes the harness profile benchmark matrix.
+  benchmark: not_applicable
 ```
 
 ## Delegation Contract
@@ -286,7 +349,7 @@ allowed_paths:
 delegation:
   budget:
     tokens: null
-    tool_calls: null
+    runner_invocations: null
     wall_time_minutes: null
   permission_scope:
     mode: inherit_allowed_paths
@@ -305,6 +368,11 @@ delegation:
     verifier:
       mode: read_only
       purpose: exit_criteria_review
+  runner:
+    preferred:
+      - subagent
+    fallback: null
+    brief_is_authoritative: true
 ```
 
 ## Exit Criteria (Machine Verifiable)
@@ -312,15 +380,14 @@ delegation:
 ```yaml
 exit_criteria:
   files_exist:
-    - src/modules/{{TASK_SLUG}}/index.ts
+    - docs/spec.md
+  artifacts_exist:
+    - .ai/harness/checks/latest.json
     - {{NOTES_FILE}}
   tests_pass:
     - path: tests/unit/{{TASK_SLUG}}.test.ts
   commands_succeed:
-    - bun run typecheck
-  files_contain:
-    - path: src/modules/{{TASK_SLUG}}/index.ts
-      pattern: "export"
+    - bun run check:type
 ```
 
 ## Acceptance Notes (Human Review)
@@ -334,7 +401,8 @@ exit_criteria:
 - Commit / checkpoint:
 - Revert strategy:
 EOF_TEMPLATE_CONTRACT
-)
+PI_TEMPLATE_CONTRACT="$(cat "$PI_TEMPLATE_CONTRACT_TMP")"
+rm -f "$PI_TEMPLATE_CONTRACT_TMP"
 PI_TEMPLATE_REVIEW=$(cat <<'EOF_TEMPLATE_REVIEW'
 # Task Review: {{TASK_SLUG}}
 
@@ -345,15 +413,18 @@ PI_TEMPLATE_REVIEW=$(cat <<'EOF_TEMPLATE_REVIEW'
 > **Checks File**: {{CHECKS_FILE}}
 > **Last Updated**: {{TIMESTAMP}}
 > **Recommendation**: fail
+> **Review Rubric Version**: 2
+> **Reviewed Subject SHA256**: pending
+> **Reviewed Subject Scope**: normalized-final-content
+> **Reviewed Target Revision**: pending
 
 ## Human Review Card
 
 - Verdict: pending
-- Change type: code-change | docs-only | ledger-closeout | migration | eval-only | delegated-run
+- Change type: code-change | docs-only | ledger-closeout | migration | eval-only | delegated-run | frontend
 - Intended files changed:
 - Actual files changed:
 - Commands passed:
-- External acceptance: unavailable
 - Residual risks:
 - Reviewer action required: inspect diff and card
 - Rollback:
@@ -365,17 +436,29 @@ PI_TEMPLATE_REVIEW=$(cat <<'EOF_TEMPLATE_REVIEW'
 - Manual checks:
 - Supporting artifacts:
 
-## External Acceptance Advice
+## Manual Check Evidence
 
-> **External Acceptance**: unavailable
-> **External Reviewer**:
-> **External Source**:
-> **External Started**:
-> **External Completed**:
+Copy each non-built-in contract `manual_checks` requirement exactly. Check it only after
+the observation is complete and replace the placeholder with concrete command output,
+screenshot/artifact path, or reviewer observation.
 
-- P1 blockers:
-- P2 advisories:
-- Acceptance checklist:
+- [ ] Exact manual_checks requirement
+  - Evidence: concrete observation, command output, screenshot path, or reviewer note
+
+## Acceptance Receipt Projection
+
+> **Disposition**: unavailable
+> **Reviewer**: unavailable
+> **Source**: unavailable
+> **Actor**: not-applicable
+> **Reviewed Subject SHA256**: pending
+> **Reviewed Subject Scope**: normalized-final-content
+> **Reviewed Target Revision**: pending
+> **Verification Evidence SHA256**: pending
+> **Issued At**: pending
+
+- Summary: No AcceptanceReceipt has been recorded.
+- Findings: none
 
 ## Behavior Diff Notes
 
@@ -497,94 +580,8 @@ pi_copy_file_if_apply() {
   cp "$src" "$dest"
 }
 
-pi_install_hook_adapters() {
-  local repo="$1"
-  local _hooks_dir="$2"
-  local mode="${3:-apply}"
-
-  pi_retire_project_hook_adapter "$mode" "$repo/.claude/settings.json"
-  pi_retire_project_hook_adapter "$mode" "$repo/.claude/settings.local.json"
-  pi_retire_project_hook_adapter "$mode" "$repo/.codex/hooks.json"
-}
-
-pi_retire_project_hook_adapter() {
-  local mode="${1:-apply}"
-  local file_path="$2"
-
-  if [[ ! -f "$file_path" ]]; then
-    return 0
-  fi
-
-  if [[ "$mode" != "apply" ]]; then
-    echo "[dry-run] retire project hook adapter $file_path"
-    return 0
-  fi
-
-  if ! command -v node >/dev/null 2>&1; then
-    echo "[project-init] Skipping project hook adapter retirement for $file_path because node is unavailable" >&2
-    return 0
-  fi
-
-  node - "$file_path" <<'NODE_EOF'
-const fs = require("fs");
-const path = process.argv[2];
-
-function writeJson(file, value) {
-  fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
-}
-
-let data;
-try {
-  const raw = fs.readFileSync(path, "utf8");
-  data = raw.trim() ? JSON.parse(raw) : {};
-} catch (err) {
-  console.error(`[project-init] Skipping invalid JSON while retiring project hook adapter: ${path}`);
-  process.exit(0);
-}
-
-if (!Object.prototype.hasOwnProperty.call(data, "hooks")) {
-  if (Object.keys(data).length === 0) fs.rmSync(path, { force: true });
-  process.exit(0);
-}
-
-const backup = `${path}.repo-harness-migrate-backup`;
-if (!fs.existsSync(backup)) fs.copyFileSync(path, backup);
-delete data.hooks;
-
-if (Object.keys(data).length === 0) {
-  fs.rmSync(path, { force: true });
-} else {
-  writeJson(path, data);
-}
-NODE_EOF
-}
-
 pi_print_codex_hook_trust_notice() {
   echo "Host hook adapters are user-level: run repo-harness install --target both --location global, then trust ~/.codex/hooks.json in Codex Settings."
-}
-
-pi_repo_pins_hook_source() {
-  local repo="$1"
-  local policy_file="$repo/.ai/harness/policy.json"
-
-  if [[ "${REPO_HARNESS_HOOK_SOURCE:-}" == "repo" ]]; then
-    return 0
-  fi
-
-  [[ -f "$policy_file" ]] || return 1
-  grep -Eq '"hook_source"[[:space:]]*:[[:space:]]*"repo"' "$policy_file"
-}
-
-pi_repo_pins_helper_source() {
-  local repo="$1"
-  local policy_file="$repo/.ai/harness/policy.json"
-
-  if [[ "${REPO_HARNESS_HELPER_SOURCE:-}" == "repo" ]]; then
-    return 0
-  fi
-
-  [[ -f "$policy_file" ]] || return 1
-  grep -Eq '"helper_source"[[:space:]]*:[[:space:]]*"repo"' "$policy_file"
 }
 
 pi_write_hook_runtime_readme() {
@@ -599,44 +596,12 @@ pi_write_hook_runtime_readme() {
 
   mkdir -p "$hooks_dir"
   cat > "$readme" <<'EOF_HOOK_README'
-# Repo-Local Hook Fallback
+# Repo-Local Workflow Helpers
 
-This repo does not pin `"hook_source": "repo"`, so active hook execution is
-user-level and central-first:
-
-`~/.codex/hooks.json` / `~/.claude/settings.json` -> `repo-harness-hook` ->
-packaged hooks from the installed repo-harness runtime.
-
-The files under `.ai/hooks/lib/` are kept only for repo workflow helper scripts
-that source shared shell utilities. Full hook runtime scripts are not vendored
-here by default because stale copies can be mistaken for the active hook path.
-
-Set `"hook_source": "repo"` in `.ai/harness/policy.json` only for self-hosted
-hook development or an explicitly reviewed repo-local hook override.
+Host events execute through the user-level `repo-harness-hook` typed runtime.
+Files under `.ai/hooks/lib/` are operator helper libraries only; no repo-local
+host-event dispatcher or route script is supported.
 EOF_HOOK_README
-}
-
-pi_prune_repo_local_hook_runtime() {
-  local hooks_dir="$1"
-  local mode="${2:-apply}"
-
-  if [[ ! -d "$hooks_dir" ]]; then
-    return 0
-  fi
-
-  if [[ "$mode" != "apply" ]]; then
-    echo "[dry-run] remove repo-local hook entry scripts from $hooks_dir unless hook_source is repo"
-    return 0
-  fi
-
-  find "$hooks_dir" -mindepth 1 -maxdepth 1 -type f \
-    \( -name '*.sh' \
-      -o -name 'AGENTS.md' \
-      -o -name 'CLAUDE.md' \
-      -o -name 'settings.template.json' \
-      -o -name 'codex.hooks.template.json' \
-      -o -name '.version' \) \
-    -delete
 }
 
 pi_install_hook_assets() {
@@ -656,38 +621,6 @@ pi_install_hook_assets() {
   else
     mkdir -p "$hooks_dir"
   fi
-
-  if pi_repo_pins_hook_source "$target_dir"; then
-    while IFS= read -r hook; do
-      local rel_path rel_dir dest_dir hook_name hook_mode
-      rel_path="${hook#"$hooks_assets_dir"/}"
-      case "$rel_path" in
-        projection.json|codex.hooks.template.json|settings.template.json)
-          continue
-          ;;
-      esac
-      rel_dir="$(dirname "$rel_path")"
-      if [[ "$rel_dir" == "." ]]; then
-        dest_dir="$hooks_dir"
-      else
-        dest_dir="$hooks_dir/$rel_dir"
-      fi
-      hook_name="$(basename "$hook")"
-      if [[ "$mode" != "apply" ]]; then
-        echo "[dry-run] mkdir -p \"$dest_dir\""
-        echo "[dry-run] cp \"$hook\" \"$dest_dir/$hook_name\""
-        continue
-      fi
-      mkdir -p "$dest_dir"
-      cp "$hook" "$dest_dir/$hook_name"
-      hook_mode=0644
-      [[ -x "$hook" ]] && hook_mode=0755
-      chmod "$hook_mode" "$dest_dir/$hook_name" 2>/dev/null || true
-    done < <(find "$hooks_assets_dir" -type f | sort)
-    return 0
-  fi
-
-  pi_prune_repo_local_hook_runtime "$hooks_dir" "$mode"
 
   if [[ "$mode" != "apply" ]]; then
     echo "[dry-run] mkdir -p \"$hooks_dir/lib\""
@@ -747,7 +680,7 @@ pi_default_runtime_block() {
   printf '%s\n%s\n%s\n' "$PI_RUNTIME_BLOCK_BEGIN" "$runtime_entries" "$PI_RUNTIME_BLOCK_END"
 }
 
-pi_helper_wrapper_paths() {
+pi_legacy_root_helper_paths() {
   local workflow_contract="$1"
   local helper_names
   local helper_name
@@ -756,18 +689,6 @@ pi_helper_wrapper_paths() {
   for helper_name in $helper_names; do
     printf 'scripts/%s\n' "$helper_name"
   done
-}
-
-pi_helper_wrapper_gitignore_entries() {
-  local workflow_contract="$1"
-  local paths
-
-  paths="$(pi_helper_wrapper_paths "$workflow_contract")"
-  [[ -n "$paths" ]] || return 0
-
-  printf '%s\n' "# repo-harness generated helper wrappers"
-  printf '%s\n' "$paths"
-  printf '%s\n' "scripts/repo-harness/"
 }
 
 pi_is_runtime_block_begin() {
@@ -1082,15 +1003,18 @@ pi_install_templates() {
   if [[ -f "$templates_dir/prd.template.md" ]]; then
     cp "$templates_dir/prd.template.md" "$output_dir/prd.template.md"
   fi
+
+  if [[ -f "$templates_dir/design-brief.template.md" ]]; then
+    cp "$templates_dir/design-brief.template.md" "$output_dir/design-brief.template.md"
+  fi
 }
 
 pi_install_helpers() {
   local target_dir="$1"
   local helpers_dir="$2"
   local mode="${3:-apply}"
-  local helper_names="${4:-new-spec.sh new-sprint.sh new-plan.sh capture-plan.sh plan-to-todo.sh contract-run.ts contract-worktree.sh ship-worktrees.sh archive-workflow.sh refresh-current-status.sh prepare-handoff.sh verify-contract.sh summarize-failures.sh verify-sprint.sh harness-trace-grade.sh sprint-backlog.sh check-task-sync.sh check-deploy-sql-order.sh check-architecture-sync.sh check-agent-tooling.sh check-context-files.sh check-brain-manifest.sh sync-brain-docs.sh check-skill-version.ts select-agent-context-blocks.sh ensure-task-workflow.sh check-task-workflow.sh maintenance-triage.sh heartbeat-triage.sh switch-plan.sh workflow-contract.ts inspect-project-state.ts migrate-workflow-docs.ts migrate-project-template.sh capability-resolver.ts architecture-event.ts capability-config.ts architecture-queue.sh archive-architecture-request.sh context-contract-sync.sh workstream-sync.sh prepare-codex-handoff.sh codex-handoff-resume.sh}"
+  local helper_names="${4:?pi_install_helpers requires contract helper inventory}"
   local scripts_dir="$target_dir/scripts"
-  local runtime_dir="$target_dir/.ai/harness/scripts"
   local helper_name
   local source_repo_target=0
 
@@ -1104,160 +1028,28 @@ pi_install_helpers() {
   fi
 
   if [[ "$mode" != "apply" ]]; then
-    if [[ "$source_repo_target" -eq 1 || "$(pi_repo_pins_helper_source "$target_dir" && printf yes || true)" == "yes" ]]; then
+    if [[ "$source_repo_target" -eq 1 ]]; then
       echo "[dry-run] install source helpers into $scripts_dir"
     else
-      echo "[dry-run] install helper compatibility wrappers in $scripts_dir; package runtime dispatches through repo-harness run"
+      echo "[dry-run] use global repo-harness helper runtime; do not write local helper scripts"
     fi
     return 0
   fi
 
-  mkdir -p "$scripts_dir"
-  mkdir -p "$runtime_dir"
-
   if [[ -d "$helpers_dir" ]]; then
     for helper_name in $helper_names; do
       if [[ -f "$helpers_dir/$helper_name" ]]; then
-        if [[ "$helper_name" == "migrate-project-template.sh" ]]; then
-          local target_abs=""
-          local skill_abs=""
-          target_abs="$(cd "$target_dir" && pwd)"
-          if [[ -n "${SKILL_ROOT:-}" ]]; then
-            skill_abs="$(cd "$SKILL_ROOT" && pwd)"
-          else
-            skill_abs="$(cd "$helpers_dir/../.." && pwd)"
-          fi
-          if [[ "$target_abs" == "$skill_abs" ]]; then
-            continue
-          fi
-        fi
         if [[ "$source_repo_target" -eq 1 ]]; then
+          mkdir -p "$scripts_dir"
           cp "$helpers_dir/$helper_name" "$scripts_dir/$helper_name"
-        elif pi_repo_pins_helper_source "$target_dir"; then
-          cp "$helpers_dir/$helper_name" "$runtime_dir/$helper_name"
-          pi_normalize_installed_helper "$runtime_dir/$helper_name"
-          if ! pi_preserve_existing_app_script "$scripts_dir/$helper_name" "$helpers_dir/$helper_name"; then
-            pi_write_helper_wrapper "$scripts_dir/$helper_name" "$helper_name"
-          fi
-        else
-          if ! pi_preserve_existing_app_script "$scripts_dir/$helper_name" "$helpers_dir/$helper_name"; then
-            pi_write_helper_wrapper "$scripts_dir/$helper_name" "$helper_name"
-          else
-            mkdir -p "$scripts_dir/repo-harness"
-            pi_write_helper_wrapper "$scripts_dir/repo-harness/$helper_name" "$helper_name"
-          fi
         fi
       fi
     done
-    pi_ensure_executable_if_apply "$mode" "$runtime_dir"/*.sh "$runtime_dir"/*.ts "$scripts_dir"/*.sh "$scripts_dir"/*.ts "$scripts_dir/repo-harness"/*.sh "$scripts_dir/repo-harness"/*.ts
+    pi_ensure_executable_if_apply "$mode" "$scripts_dir"/*.sh "$scripts_dir"/*.ts
     return 0
   fi
 
-  for helper_name in $helper_names; do
-    pi_write_helper_wrapper "$scripts_dir/$helper_name" "$helper_name"
-  done
-  pi_ensure_executable_if_apply "$mode" "$scripts_dir"/*.sh "$scripts_dir"/*.ts
-}
-
-pi_preserve_existing_app_script() {
-  local output_file="$1"
-  local source_file="$2"
-
-  [[ -f "$output_file" ]] || return 1
-
-  if cmp -s "$output_file" "$source_file"; then
-    return 1
-  fi
-
-  if grep -Eiq '(repo-harness|claude-runtime-temp|Task Contract|Task Review|Deferred Goal Ledger|Workflow Contract|ContractWorktree|SprintBacklog|ArchitectureSync|ArchitectureDrift|BrainSync|CurrentStatus|\.ai/harness|\.claude/templates|tasks/contracts|tasks/reviews)' "$output_file"; then
-    return 1
-  fi
-
   return 0
-}
-
-pi_write_helper_wrapper() {
-  local output_file="$1"
-  local helper_name="$2"
-
-  case "$helper_name" in
-    *.ts)
-      cat > "$output_file" <<EOF_WRAPPER_TS
-#!/usr/bin/env bun
-import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
-import { join } from "node:path";
-
-const sourceRoot =
-  process.env.REPO_HARNESS_SOURCE_ROOT ||
-  process.env.AGENTIC_DEV_ROOT ||
-  process.env.AGENTIC_DEV_SKILL_ROOT;
-const command = sourceRoot && existsSync(join(sourceRoot, "src", "cli", "index.ts"))
-  ? ["bun", join(sourceRoot, "src", "cli", "index.ts"), "run", "$(basename "$helper_name" .ts)"]
-  : ["repo-harness", "run", "$(basename "$helper_name" .ts)"];
-
-const result = spawnSync(command[0], [...command.slice(1), ...process.argv.slice(2)], {
-  cwd: process.cwd(),
-  env: process.env,
-  stdio: "inherit",
-});
-
-if (result.error) {
-  console.error(\`Missing repo-harness CLI for helper $(basename "$helper_name" .ts): \${result.error.message}\`);
-  process.exit(1);
-}
-
-process.exit(result.status ?? 1);
-EOF_WRAPPER_TS
-      ;;
-    *)
-      local helper_id="${helper_name%.*}"
-      cat > "$output_file" <<EOF_WRAPPER_SH
-#!/bin/bash
-set -euo pipefail
-
-SOURCE_ROOT="\${REPO_HARNESS_SOURCE_ROOT:-\${AGENTIC_DEV_ROOT:-\${AGENTIC_DEV_SKILL_ROOT:-}}}"
-
-if [[ -n "\$SOURCE_ROOT" && -f "\$SOURCE_ROOT/src/cli/index.ts" ]]; then
-  if command -v bun >/dev/null 2>&1; then
-    exec bun "\$SOURCE_ROOT/src/cli/index.ts" run $helper_id "\$@"
-  fi
-fi
-
-if command -v repo-harness >/dev/null 2>&1; then
-  exec repo-harness run $helper_id "\$@"
-fi
-
-echo "Missing repo-harness CLI for helper $helper_id" >&2
-exit 1
-EOF_WRAPPER_SH
-      ;;
-  esac
-}
-
-pi_normalize_installed_helper() {
-  local helper_file="$1"
-  [[ -f "$helper_file" ]] || return 0
-
-  if [[ "$helper_file" == *.sh ]]; then
-    perl -0pi -e '
-      s#([A-Z_][A-Z0-9_]*)="\$\(cd "\$SCRIPT_DIR/\.\." && pwd\)"#${1}="\$(cd "\$SCRIPT_DIR/../../.." && pwd)"#g;
-      s#if ([A-Z_][A-Z0-9_]*)="\$\(git -C "\$SCRIPT_DIR/\.\." rev-parse --show-toplevel 2>/dev/null\)"; then#if ${1}="\$(git -C "\$SCRIPT_DIR/../../.." rev-parse --show-toplevel 2>/dev/null)"; then#g;
-      s#cd "\$SCRIPT_DIR/\.\."#if [[ "\$SCRIPT_DIR" == */.ai/harness/scripts ]]; then\n  cd "\$SCRIPT_DIR/../../.."\nelse\n  cd "\$SCRIPT_DIR/.."\nfi#g;
-      s#git -C "\$SCRIPT_DIR/\.\."#git -C "\$SCRIPT_DIR/../../.."#g;
-      s#\./scripts/#.ai/harness/scripts/#g;
-      s#(\$[A-Za-z_][A-Za-z0-9_]*|\$\{[A-Za-z_][A-Za-z0-9_]*\})/scripts/#$1/.ai/harness/scripts/#g;
-      s#(?<![A-Za-z0-9_./-])scripts/#.ai/harness/scripts/#g;
-    ' "$helper_file"
-  elif [[ "$helper_file" == *.ts ]]; then
-    perl -0pi -e '
-      s#join\(SCRIPT_DIR, "\.\."\)#join(SCRIPT_DIR, "..", "..", "..")#g;
-      s#join\(__dirname, "\.\."\)#join(__dirname, "..", "..", "..")#g;
-      s#\./scripts/#.ai/harness/scripts/#g;
-      s#(\$[A-Za-z_][A-Za-z0-9_]*|\$\{[A-Za-z_][A-Za-z0-9_]*\})/scripts/#$1/.ai/harness/scripts/#g;
-      s#(?<![A-Za-z0-9_./-])scripts/#.ai/harness/scripts/#g;
-    ' "$helper_file"
-  fi
 }
 
 pi_env_value() {
@@ -1326,19 +1118,14 @@ pi_external_tooling_hosts_json() {
   pi_env_value "REPO_HARNESS_EXTERNAL_TOOLING_HOSTS_JSON" "$PI_EXTERNAL_TOOLING_HOSTS_DEFAULT"
 }
 
-pi_external_tooling_gbrain_mcp() {
-  pi_env_value "REPO_HARNESS_EXTERNAL_TOOLING_GBRAIN_MCP" "candidate-disabled"
-}
-
 pi_external_tooling_defaults_summary() {
   cat <<'EOF_EXTERNAL_TOOLING_DEFAULTS'
-- Policy defaults: routing complex->gstack, simple->waza, knowledge->gbrain
+- Policy defaults: parent-agent + geju owns product/complex/design planning; external routing keeps simple->waza
 - Hosts: claude-code, codex
 - Mode: agent-readiness-required
 - Detection: init-migrate
 - Waza: Codex-first, managed skills think/hunt/check/health, stage upstream in ~/.agents/skills, sync verified copies into ~/.codex/skills
 - Codex automation profile: required health/check/mermaid from ~/.codex/skills; do not vendor skill bodies
-- gbrain MCP: candidate-disabled
 - CodeGraph: required agent code-navigation readiness tool, target-aware MCP configure by explicit user command or authorized agent action, per-repo ignored .codegraph/ index; generated repos do not add it as a package dependency unless local policy opts in
 - Auto-actions: never install, upgrade, serve, sync, or enable MCP automatically
 EOF_EXTERNAL_TOOLING_DEFAULTS
@@ -1347,21 +1134,9 @@ EOF_EXTERNAL_TOOLING_DEFAULTS
 pi_resolve_external_tooling_detector() {
   local repo_dir="$1"
   local fallback_script="${2:-}"
-  local repo_detector="$repo_dir/.ai/harness/scripts/check-agent-tooling.sh"
-  local legacy_repo_detector="$repo_dir/scripts/check-agent-tooling.sh"
 
   if [[ -n "$fallback_script" && -f "$fallback_script" ]]; then
     printf '%s' "$fallback_script"
-    return 0
-  fi
-
-  if [[ -f "$repo_detector" ]]; then
-    printf '%s' "$repo_detector"
-    return 0
-  fi
-
-  if [[ -f "$legacy_repo_detector" ]]; then
-    printf '%s' "$legacy_repo_detector"
     return 0
   fi
 
@@ -1402,6 +1177,48 @@ pi_print_external_tooling_report() {
 
   echo "- Advisory report: detector failed (non-fatal)"
   printf '%s\n' "$output" | sed 's/^/  /'
+}
+
+pi_maybe_install_agent_fleet() {
+  local repo_dir="$1"
+  local mode="${2:-apply}"
+  local fallback_script="${3:-}"
+  local policy_file="$repo_dir/.ai/harness/policy.json"
+  local raw_install_mode
+  local installer
+  local install_output
+
+  if [[ ! -f "$policy_file" ]]; then
+    echo "- Agent fleet: no .ai/harness/policy.json found; run 'repo-harness run install-agent-fleet' to install the managed agent fleet manually."
+    return 0
+  fi
+
+  raw_install_mode="$(pi_workflow_contract_query_lines "$policy_file" "external_tooling.agent_fleet.install_mode" 2>/dev/null || true)"
+
+  if [[ "$raw_install_mode" != "auto-install-on-init" ]]; then
+    echo "- Agent fleet: install_mode=${raw_install_mode:-advisory}; run 'repo-harness run install-agent-fleet' to install the managed agent fleet."
+    return 0
+  fi
+
+  if [[ "$mode" != "apply" ]]; then
+    echo "- Agent fleet: install_mode=auto-install-on-init, but dry-run never writes to the global agent fleet directories; run 'repo-harness run install-agent-fleet' after applying."
+    return 0
+  fi
+
+  installer="$(pi_resolve_external_tooling_detector "$repo_dir" "$fallback_script" || true)"
+  if [[ -z "$installer" ]]; then
+    echo "- Agent fleet: install_mode=auto-install-on-init, but the installer script could not be resolved; run 'repo-harness run install-agent-fleet' manually."
+    return 0
+  fi
+
+  echo "- Agent fleet: install_mode=auto-install-on-init; installing managed agents via $installer"
+  if install_output="$(bash "$installer" 2>&1)"; then
+    printf '%s\n' "$install_output" | sed 's/^/  /'
+    return 0
+  fi
+
+  echo "[warn] Agent fleet install failed (non-fatal); run 'repo-harness run install-agent-fleet' manually." >&2
+  printf '%s\n' "$install_output" | sed 's/^/  /'
 }
 
 pi_reference_config_names() {
@@ -1631,11 +1448,6 @@ pi_context_block_candidates() {
 
   registry_file="$(pi_capability_registry_file "$target_dir")"
   if [[ -f "$registry_file" ]]; then
-    if command -v bun >/dev/null 2>&1 && [[ -f "$target_dir/.ai/harness/scripts/capability-resolver.ts" ]]; then
-      (cd "$target_dir" && bun .ai/harness/scripts/capability-resolver.ts list --format prefixes 2>/dev/null || true)
-      return 0
-    fi
-
     if command -v node >/dev/null 2>&1; then
       node - "$registry_file" <<'JS_EOF'
 const fs = require("fs");
@@ -1896,12 +1708,18 @@ pi_write_harness_policy() {
   "version": 1,
   "active_plan": {
     "marker_file": ".ai/harness/active-plan",
-    "legacy_marker_file": ".claude/.active-plan",
     "directory": "plans",
     "archive_directory": "plans/archive",
     "glob": "plan-*.md",
     "active_worktree_marker_file": ".ai/harness/active-worktree",
-    "source_of_truth": "per-worktree explicit marker with active-worktree owner; legacy Claude marker fallback only"
+    "source_of_truth": "per-worktree explicit marker with active-worktree owner",
+    "lifecycle": {
+      "annotation_end": "Annotating",
+      "approved": "Approved",
+      "executing": "Executing",
+      "terminal_start": "Complete"
+    },
+    "statuses": ["Draft", "Annotating", "Approved", "Executing", "Blocked", "Review", "Complete", "Completed", "Done", "Fulfilled", "Archived", "Abandoned", "Superseded"]
   },
   "tasks": {
     "todo_file": "tasks/todos.md",
@@ -1923,7 +1741,7 @@ pi_write_harness_policy() {
     "dir": "plans/sprints",
     "active_marker_file": ".ai/harness/sprint/active-sprint",
     "template_file": ".claude/templates/sprint.template.md",
-    "helper_script": "scripts/sprint-backlog.sh",
+    "helper_script": "repo-harness run sprint-backlog",
     "statuses": ["Draft", "Approved", "Executing", "Done", "Archived"],
     "rule": "PRDs live in plans/prds as the upper planning layer. Sprints live in plans/sprints as long-task execution backlogs; each sprint row is expanded with Waza \$think into a detailed plans/plan-*.md before the plan -> contract -> worktree flow; tasks/todos.md stays the deferred-goal ledger"
   },
@@ -1938,17 +1756,19 @@ pi_write_harness_policy() {
     "private_dir": "_ops",
     "tracked": ["deploy/README.md", "deploy/scripts/", "deploy/submissions/", "deploy/runbooks/", "deploy/release-checklists/", "deploy/sql/", "deploy/*.md", "deploy/env/.env.example"],
     "ignored": ["_ops/"],
-    "rule": "commit deployment runbooks, submission materials, release checklists, helper scripts, ordered SQL files, and env examples under deploy/; keep deploy SQL in deploy/sql/ with 4-digit ascending prefixes; keep keys, tokens, real env values, provider state, artifacts, logs, and scratch files in ignored _ops/ only"
+    "rule": "commit deployment runbooks, submission materials, release checklists, helper scripts, ordered SQL files, and env examples under deploy/; when operations.deploy_sql is absent, keep deploy SQL directly under deploy/sql/ with ordered4 names (4-digit ascending prefixes); when operations.deploy_sql is present, its roots, naming modes, and invariant_file are the sole alternate SQL-layout authority; keep keys, tokens, real env values, provider state, artifacts, logs, and scratch files in ignored _ops/ only"
   },
   "context": {
     "profile": "$(pi_context_profile)",
     "map_file": ".ai/context/context-map.json",
     "capability_registry_file": ".ai/context/capabilities.json",
-    "capability_resolver": "scripts/capability-resolver.ts",
-    "capability_config": "scripts/capability-config.ts",
+    "capability_resolver": "repo-harness run capability-resolver",
+    "capability_config": "repo-harness run capability-config",
     "capability_match_rule": "longest-prefix; same-length ambiguity fails",
+    "capability_source": "registry",
+    "capability_source_rule": "single authority selected by capability_source; registry reads .ai/context/capabilities.json, archcontext reads .archcontext/model/nodes/*.yaml; no dual-read and no fallback",
     "functional_block_selector": {
-      "script": "scripts/select-agent-context-blocks.sh",
+      "script": "repo-harness run select-agent-context-blocks",
       "config_file": ".ai/context/agent-context-blocks.txt",
       "env": "REPO_HARNESS_CONTEXT_BLOCKS",
       "rule": "compatibility selector; capability registry is the source of truth"
@@ -1962,10 +1782,8 @@ pi_write_harness_policy() {
     "events_file": ".ai/harness/events.jsonl",
     "architecture_events_file": ".ai/harness/architecture/events.jsonl",
     "runs_dir": ".ai/harness/runs",
-    "helper_runtime_dir": ".ai/harness/scripts",
-    "helper_compat_dir": "scripts",
-    "helper_source": "package",
-    "helper_package_dir": "assets/templates/helpers"
+    "helper_runtime_dir": "package:assets/templates/helpers",
+    "helper_source": "package"
   },
   "architecture": {
     "index_file": "docs/architecture/index.md",
@@ -1977,12 +1795,17 @@ pi_write_harness_policy() {
     "diagram_skill": "mermaid",
     "diagram_skill_source": "~/.codex/skills/mermaid",
     "vendoring_policy": "do-not-vendor-diagram-skill-assets",
+    "projection_provider": "disabled",
+    "projection_apply": "disabled",
+    "projection_failure_gate": "advisory",
+    "projection_version": "0.4.3",
+    "projection_timeout_ms": 120000,
     "freshness_gate": "advisory",
     "gate_min_severity": "medium",
     "pending_card_scope": "capability",
     "pending_block_begin": "<!-- BEGIN ARCHITECTURE PENDING REQUESTS -->",
     "pending_block_end": "<!-- END ARCHITECTURE PENDING REQUESTS -->",
-    "queue_script": ".ai/harness/scripts/architecture-queue.sh",
+    "queue_script": "repo-harness run architecture-queue",
     "contract_block_begin": "<!-- BEGIN ARCHITECTURE CONTRACT -->",
     "contract_block_end": "<!-- END ARCHITECTURE CONTRACT -->",
     "rule": "hooks record architecture queue cards and sync controlled local context blocks; agents author semantic snapshots and diagrams"
@@ -2007,22 +1830,21 @@ pi_write_harness_policy() {
       "purpose": "raw verification records used to audit notes, reviews, and future promotion; checks latest reports and run snapshots are ignored runtime cache unless distilled into reviews, contracts, notes, or research"
     },
     "assets": {
-      "sources": [".ai/harness/policy.json", ".ai/harness/workflow-contract.json", ".ai/hooks/", "scripts/", "docs/reference-configs/"],
+      "sources": [".ai/harness/policy.json", ".ai/harness/workflow-contract.json", ".ai/hooks/", "package:assets/templates/helpers", "docs/reference-configs/"],
       "promotion_rule": "only promote patterns after verified reuse across tasks or fixtures"
     },
     "memory": {
-      "sources": ["docs/researches/", "tasks/lessons.md", "gbrain"],
+      "sources": ["docs/researches/", "tasks/lessons.md"],
       "rule": "memory is advisory; current repo state and evidence override summaries"
     },
     "external_knowledge": {
+      "mode": "manual-opt-in",
       "default_brain_path": "brain/<project>/*",
       "project_path": "brain/<project>/*",
       "manifest_file": ".ai/harness/brain-manifest.json",
-      "drift_check": "scripts/check-brain-manifest.sh",
-      "sync_script": "scripts/sync-brain-docs.sh",
-      "hook_trigger": "PostToolUse Edit|Write for manifest entries with sync.direction=repo-to-brain",
+      "sync_script": "repo-harness run sync-brain-docs",
       "rule": "external knowledge stores long-lived explanations, runbooks, and patterns only; repo-local contracts, hooks, scripts, checks, and evidence remain authoritative",
-      "sync_rule": "only explicitly opted-in repo-to-brain manifest entries may be written to the default brain vault; pointer-only externalized stubs remain check-only"
+      "sync_rule": "external sync and drift checks are operator-invoked only; hooks and workflow verification never read, write, or gate on external vault state"
     }
   },
   "handoff_resume": {
@@ -2031,9 +1853,9 @@ pi_write_harness_policy() {
     "auto_start_new_session": false
   },
   "plan_capture": {
-    "script": "scripts/capture-plan.sh",
+    "script": "repo-harness run capture-plan",
     "sources": ["codex-plan-mode", "waza-think", "repo-harness-plan", "repo-harness-sprint"],
-    "rule": "Codex Plan mode and Waza think planning should capture decision-complete work-package plans into plans/plan-*.md only when Artifact Level is work-package and the Promotion Gate is concrete; implementation approval then projects the active approved work-package plan through scripts/plan-to-todo.sh; checklist-row and inline sprint work stay in the sprint backlog or active plan Task Breakdown, while contract rows may expand with \$think before capture/execution"
+    "rule": "Codex Plan mode and Waza think planning should capture decision-complete work-package plans into plans/plan-*.md only when Artifact Level is work-package and the Promotion Gate is concrete; implementation approval then projects the active approved work-package plan through repo-harness run plan-to-todo; checklist-row and inline sprint work stay in the sprint backlog or active plan Task Breakdown, while contract rows may expand with \$think before capture/execution"
   },
   "planning": {
     "pending_orchestration_file": ".ai/harness/planning/pending.json",
@@ -2042,16 +1864,26 @@ pi_write_harness_policy() {
   "guards": {
     "edit_plan_gate": "enforce",
     "edit_plan_gate_modes": ["enforce", "advice", "off"],
-    "rule": "pre-edit-guard blocks implementation edits (non-workflow paths) unless an active plan is Approved/Executing; prompt-layer plan gates are advisory routing only"
+    "rule": "the mutation-guard handler blocks implementation edits (non-workflow paths) unless an active plan is Approved/Executing; prompt-layer plan gates are advisory routing only"
+  },
+  "circuit_breakers": {
+    "guard_repeat": 2,
+    "review": { "lite": 1, "standard": 1, "strict": 2 },
+    "subagents": { "default": 2, "strict_explicit_contract": 3 },
+    "repair_loops": 2,
+    "cross_model_consults_default": 0
   },
   "delegation": {
     "mode": "explicit",
-    "max_agents": 3,
+    "max_agents": 2,
+    "strict_max_agents": 3,
     "max_depth": 1,
     "allow_parallel_writers": false,
-    "stop_fallback": true,
     "state_file": ".ai/harness/delegation/latest.json",
-    "rule": "UserPromptSubmit.delegation only injects bounded subagent context after explicit user authorization such as /delegate, /parallel, spawn subagents, or parallel investigation"
+    "preferred_runners": ["subagent"],
+    "brief_source": "tasks/contracts/<stem>.contract.md",
+    "runner_rule": "the active task contract is the authoritative execution brief. Claude uses its native subagent surface. Codex uses native spawn_agent with the exact installed agent_type and fork_turns=none; official SubagentStart agent_type/model fields are the runtime observation. Missing, default, mismatched, invalid, or unverified native routing fails closed without an alternate fleet runner. Reasoning effort remains configured_unverified until Codex exposes an official runtime field.",
+    "rule": "UserPromptSubmit.delegation injects bounded delegation context only for the typed /delegate or /parallel command. Natural-language inference and SessionStart standing authorization are not delegation authorities."
   },
   "sidecar_research": {
     "default": true,
@@ -2081,10 +1913,11 @@ pi_write_harness_policy() {
     "auto_for_contract_tasks": true,
     "branch_prefix": "codex/",
     "base_branch": "main",
+    "review_base": "main",
     "worktree_dir_template": "../{{repo}}-wt-{{slug}}",
-    "start_script": "scripts/contract-worktree.sh start --plan <plan-file>",
-    "finish_script": "scripts/contract-worktree.sh finish",
-    "cleanup_script": "scripts/contract-worktree.sh cleanup --slug <slug>",
+    "start_script": "repo-harness run contract-worktree start --plan <plan-file>",
+    "finish_script": "repo-harness run contract-worktree finish",
+    "cleanup_script": "repo-harness run contract-worktree cleanup --slug <slug>",
     "conflict_signals": [
       "dirty_worktree_overlaps_task_files",
       "current_branch_not_suitable_for_task",
@@ -2130,9 +1963,7 @@ pi_write_harness_policy() {
   },
   "external_tooling": {
     "routing": {
-      "complex": "gstack",
-      "simple": "waza",
-      "knowledge": "gbrain"
+      "simple": "waza"
     },
     "hosts": $(pi_external_tooling_hosts_json),
     "mode": "agent-readiness-required",
@@ -2147,6 +1978,27 @@ pi_write_harness_policy() {
       "staging_cache_path": "~/.agents/skills",
       "sync_mode": "stage-upstream-then-copy-to-codex",
       "host_drift_policy": "report-per-host-version-staging-and-upstream-drift"
+    },
+    "hai_stack": {
+      "source_repo": "hylarucoder/hai-stack",
+      "source_url": "https://github.com/hylarucoder/hai-stack.git",
+      "managed_skills": ["geju"],
+      "primary_host": "codex",
+      "codex_primary_path": "~/.codex/skills",
+      "staging_cache_path": "~/.agents/skills",
+      "sync_mode": "stage-upstream-then-copy-to-codex",
+      "host_drift_policy": "report-per-host-version-staging-and-upstream-drift"
+    },
+    "agent_fleet": {
+      "source": "package:agents/fleet",
+      "managed_agents": ["explorer", "deep-reasoner", "fast-worker", "gatekeeper", "root-cause-prover", "harness-evaluator"],
+      "claude_target": "~/.claude/agents",
+      "codex_target": "~/.codex/agents",
+      "codex_generation": "derive-toml-from-md",
+      "install_mode": "advisory",
+      "conflict_policy": "never-clobber-without-force",
+      "install_command": "repo-harness run install-agent-fleet",
+      "source_policy": "repo-owned-single-authority"
     },
     "codex_automation_profile": {
       "required_skills": ["health", "check", "mermaid"],
@@ -2167,9 +2019,6 @@ pi_write_harness_policy() {
       "sync_mode": "external-installed-skill",
       "vendoring_policy": "do-not-vendor"
     },
-    "gbrain": {
-      "mcp": "$(pi_external_tooling_gbrain_mcp)"
-    },
     "codegraph": {
       "package": "@colbymchenry/codegraph",
       "primary_host": "both",
@@ -2183,20 +2032,33 @@ pi_write_harness_policy() {
       "project_init_command": "codegraph init -i .",
       "sync_command": "codegraph sync .",
       "vendoring_policy": "do-not-add-package-dependency"
+    },
+    "archctx": {
+      "cli_package": "archctx",
+      "contracts_package": "archctx-contracts",
+      "contracts_scope": "release-gated-packed-schema-authority",
+      "install_mode": "release-gated-runtime-dependency-when-projection-enabled",
+      "readiness": "advisory",
+      "hook_policy": "do-not-block-hooks",
+      "vendoring_policy": "do-not-vendor",
+      "model_dir": ".archcontext/model",
+      "nodes_dir": ".archcontext/model/nodes",
+      "capability_source_key": ".ai/harness/policy.json#context.capability_source"
     }
   },
   "agentic_development": {
     "routing": {
-      "product_discovery": "gstack:office-hours",
-      "complex_engineering_plan": "gstack:plan-eng-review",
-      "design_plan": "gstack:plan-design-review",
+      "product_discovery": "parent-agent:geju",
+      "complex_engineering_plan": "parent-agent:geju",
+      "design_plan": "parent-agent:geju",
+      "design_options_choice": "convention:design-options",
       "small_or_medium_plan": "waza:think",
       "bug_or_regression": "waza:hunt",
       "post_implementation_review": "waza:check"
     },
     "due_diligence": {
       "levels": ["P1_GLOBAL_ARCHITECTURE", "P2_DATA_FLOW_TRACE", "P3_DESIGN_DECISION"],
-      "explicit_report_required_for": ["plan-eng-review", "hunt", "risky_refactor", "deployment", "auth_payment_data", "shared_contract"]
+      "explicit_report_required_for": ["complex_engineering_plan", "hunt", "risky_refactor", "deployment", "auth_payment_data", "shared_contract"]
     }
   },
   "minimal_change": {
@@ -2263,7 +2125,7 @@ pi_write_brain_manifest() {
   "rules": [
     "repo-local contracts, hooks, scripts, checks, and evidence remain authoritative",
     "default brain stores long-lived explanations, runbooks, decisions, references, and patterns",
-    "hook runtime may sync explicitly opted-in repo-to-brain entries only; it must not query gbrain, MCP, or unregistered default brain paths"
+    "external brain sync is manual opt-in; hooks and workflow checks do not read, write, or validate external vault state"
   ],
   "entries": []
 }
@@ -2289,7 +2151,7 @@ pi_write_context_map() {
   "version": 1,
   "profile": "$(pi_context_profile)",
   "functional_block_selector": {
-      "script": "scripts/select-agent-context-blocks.sh",
+    "script": "repo-harness run select-agent-context-blocks",
     "config_file": ".ai/context/agent-context-blocks.txt",
     "env": "REPO_HARNESS_CONTEXT_BLOCKS",
     "rule": "compatibility selector; capability registry is the source of truth"
@@ -2323,19 +2185,55 @@ pi_root_context_content() {
   cat <<'EOF_ROOT_CONTEXT'
 # Repo Agent Context
 
-This is the root routing contract for Claude Code and Codex.
+This is the root routing contract for Claude Code and Codex. Keep it short:
+load this first, then follow the repo-owned artifacts it names.
+
+## General Working Rules
+
+Rule 0: You may spend as much time as needed thinking. Do not send optional commentary progress messages. Use tools only when they are required. For tasks that do not require tools, complete the reasoning first, then answer in final.
+
+Reasoning: Prefer first principles over pattern matching. Before solving, first identify the observable and controllable conditions. For quantitative logic problems, before the final answer, you must prove the strategy is sufficient in the worst case. Numeric answers must have their arithmetic rechecked.
+
+Generality: These are general working rules. Do not tailor behavior to any specific evaluation or expected answer.
 
 ## Root Workflow Contract
 
 - Keep sibling `CLAUDE.md` and `AGENTS.md` files aligned. Claude Code consumes `CLAUDE.md`; Codex consumes `AGENTS.md`.
+- Prefer repo-local workflow artifacts over tool-specific chat memory.
 - Treat `docs/spec.md` as stable product truth, `tasks/current.md` as a derived status snapshot, and `tasks/todos.md` as the deferred-goal ledger; current execution stays in the active plan's `## Task Breakdown`.
-- Treat `docs/researches/`, `tasks/lessons.md`, and `.ai/harness/policy.json` as durable workflow context.
-- Use `.ai/context/context-map.json` and `.ai/context/capabilities.json` to discover functional-block contracts.
+- Treat `docs/researches/`, `tasks/lessons.md`, `tasks/notes/`, `.ai/harness/policy.json`, and `.ai/harness/handoff/current.md` as durable workflow context.
+- Use `.ai/context/context-map.json` and `.ai/context/capabilities.json` to discover functional-block contracts before adding local agent files.
 - Do not infer local `CLAUDE.md` or `AGENTS.md` files from broad physical layouts such as `apps/*`, `packages/*`, or `services/*`.
 - Put capability-specific ownership, entrypoints, and verification commands in explicitly selected functional-block contracts.
 - Keep root context concise; route deep implementation detail into plans, task notes, research, workstreams, or architecture docs.
 - Treat `_ref/` as ignored external reference material and `_ops/` as ignored local operations state.
-- Prefer repo-local workflow artifacts over tool-specific chat memory.
+
+## Agent Context Scaffolding
+
+- Before creating or changing agent context files, inspect existing high-context files, repo manifests, CI workflows, Makefiles, generated outputs, generators, and high-risk directories.
+- Treat scanners as leads, not authority. Verify commands, ownership, and generated-file boundaries against actual repo files before writing instructions.
+- Choose the smallest instruction stack that changes behavior: root context for repo-wide routing, scoped context only where local rules differ, and no nested file for ordinary implementation directories.
+- Preserve existing high-context files unless the user explicitly approved a rewrite; add pointers or scoped complements instead of normalizing names.
+- Pair every prohibition with the concrete alternative: source of truth, helper, generator, command, or verification surface.
+
+## Decision Protocol
+
+- For non-trivial engineering work, complete P1/P2/P3 before design decisions or code edits: P1 map the real system boundary, P2 trace one concrete data/control path, and P3 state the design rationale and invariant being preserved.
+- Keep one source of truth for each datum. Make other representations deterministic projections with drift checks, and remove the old authoring path in the same approved work-package when authority changes.
+- Do not add steady-state compatibility paths such as dual reads or writes, aliases, shape translators, shadow parsers, or semantic fallbacks. A one-shot migration must be operator-invoked, fail closed, covered by tests, and remove the old path in the same work-package.
+- Add an abstraction only when it removes observed duplicate authority or complexity, serves at least two real consumers, or protects a cross-module invariant. Prefer an existing monorepo workspace for a genuinely shared package; do not create a monorepo without a second independently released or deployed consumer.
+- For planning requests, produce one decision-complete recommendation with scope, non-scope, tradeoffs, tests, rollback/failure handling, and the most fragile assumption; do not implement until the user approves.
+- If the user says `implement this plan`, first check for obvious repo drift, then execute the approved plan without re-litigating the direction.
+- For bug hunts, trace the failing path and name the root cause before changing code.
+- For bundles of requests, classify items before accepting scope; do not treat every item as automatic implementation work.
+- Do not add fallback, compatibility, or "best effort" product code that re-derives an authority's semantics (LLM/provider/external/user-input) with local rules, regexes, or shadow parsers; fail closed with a clear error. Runtime runner degradation may select another runner only on the same task contract, must remain observable, and cannot change product semantics.
+
+## Execution And Verification
+
+- Prefer platform or standard-library features, then existing dependencies and repo patterns, before adding dependencies, files, or abstractions.
+- Preserve user-authored files; do not overwrite existing `CLAUDE.md` or `AGENTS.md` except when explicitly applying an approved scaffold or syncing the controlled architecture block.
+- After substantive changes, run focused checks for the touched area plus `bash scripts/check-task-sync.sh` and `bash scripts/check-task-workflow.sh --strict` when those scripts exist.
+- Report what changed, why it was the smallest coherent change, verification evidence, and any concrete residual risk.
 EOF_ROOT_CONTEXT
 }
 
@@ -2448,7 +2346,6 @@ pi_ensure_harness_state_surface() {
     "$target_dir/.ai/context" \
     "$target_dir/.ai/harness/checks" \
     "$target_dir/.ai/harness/handoff" \
-    "$target_dir/.ai/harness/scripts" \
     "$target_dir/.ai/harness/failures" \
     "$target_dir/.ai/harness/security" \
     "$target_dir/.ai/harness/planning" \
@@ -2473,7 +2370,6 @@ pi_ensure_harness_state_surface() {
   [[ -f "$target_dir/.ai/harness/architecture/.gitkeep" ]] || : > "$target_dir/.ai/harness/architecture/.gitkeep"
   [[ -f "$target_dir/.ai/harness/failures/latest.jsonl" ]] || : > "$target_dir/.ai/harness/failures/latest.jsonl"
   [[ -f "$target_dir/.ai/harness/security/.gitkeep" ]] || : > "$target_dir/.ai/harness/security/.gitkeep"
-  [[ -f "$target_dir/.ai/harness/scripts/.gitkeep" ]] || : > "$target_dir/.ai/harness/scripts/.gitkeep"
   [[ -f "$target_dir/.ai/harness/planning/.gitkeep" ]] || : > "$target_dir/.ai/harness/planning/.gitkeep"
   [[ -f "$target_dir/.ai/harness/worktrees/.gitkeep" ]] || : > "$target_dir/.ai/harness/worktrees/.gitkeep"
   [[ -f "$target_dir/.ai/harness/runs/.gitkeep" ]] || : > "$target_dir/.ai/harness/runs/.gitkeep"
@@ -2525,16 +2421,15 @@ CURRENT_STATUS_EOF
 
 - Latest snapshot: (none yet)
 - Semantic diagram source: (none yet)
-- Latest human diagram: (none yet)
 
 ## Architecture Drift Flow
 
-- `.ai/harness/scripts/architecture-queue.sh` records architecture-sensitive edits as requests.
-- `.ai/harness/scripts/archive-architecture-request.sh` archives handled requests after an agent records the resolution status and linked artifacts.
-- `.ai/harness/scripts/context-contract-sync.sh` keeps only the controlled architecture block in functional-block `AGENTS.md` and `CLAUDE.md` files aligned.
-- `.ai/harness/scripts/workstream-sync.sh` keeps durable multi-session progress under `tasks/workstreams/<domain>/<capability>/` and projects only pointers into local contracts.
+- `repo-harness run architecture-queue` records architecture-sensitive edits as requests.
+- `repo-harness run archive-architecture-request` archives handled requests after an agent records the resolution status and linked artifacts; `Resolved` requires the request's declared architecture module as an existing durable artifact.
+- `repo-harness run context-contract-sync` keeps only the controlled architecture block in functional-block `AGENTS.md` and `CLAUDE.md` files aligned.
+- `repo-harness run workstream-sync` keeps durable multi-session progress under `tasks/workstreams/<domain>/<capability>/` and projects only pointers into local contracts.
 - Semantic architecture diagrams live as Mermaid fenced blocks in the relevant module or snapshot Markdown.
-- Human-readable architecture diagrams are optional `mermaid` HTML files in `docs/architecture/diagrams/` and should link back to the Markdown semantic source.
+- Markdown Mermaid fenced blocks are the only architecture diagram artifacts; do not generate standalone HTML.
 
 ## Pending Requests
 
@@ -2627,6 +2522,39 @@ try {
 }
 
 const merged = mergeDefaults(defaultsJson, currentJson);
+const externalTooling = isPlainObject(merged.external_tooling) ? merged.external_tooling : {};
+const externalRouting = isPlainObject(externalTooling.routing) ? externalTooling.routing : {};
+const retiredComplexProvider = typeof externalRouting.complex === "string" ? externalRouting.complex : null;
+delete externalRouting.complex;
+if (externalRouting.knowledge === "gbrain") delete externalRouting.knowledge;
+delete externalTooling.gbrain;
+externalTooling.routing = externalRouting;
+merged.external_tooling = externalTooling;
+
+const agenticDevelopment = isPlainObject(merged.agentic_development) ? merged.agentic_development : {};
+const planningRouting = isPlainObject(agenticDevelopment.routing) ? agenticDevelopment.routing : {};
+const retiredReportLabels = new Map();
+if (retiredComplexProvider) {
+  const retiredPrefix = `${retiredComplexProvider}:`;
+  for (const key of ["product_discovery", "complex_engineering_plan", "design_plan"]) {
+    const route = planningRouting[key];
+    if (typeof route === "string" && route.startsWith(retiredPrefix)) {
+      retiredReportLabels.set(route.slice(retiredPrefix.length), key);
+      planningRouting[key] = "parent-agent:geju";
+    }
+  }
+}
+agenticDevelopment.routing = planningRouting;
+const dueDiligence = isPlainObject(agenticDevelopment.due_diligence) ? agenticDevelopment.due_diligence : {};
+if (retiredReportLabels.size > 0 && Array.isArray(dueDiligence.explicit_report_required_for)) {
+  dueDiligence.explicit_report_required_for = [
+    ...new Set(dueDiligence.explicit_report_required_for.map((entry) => (
+      typeof entry === "string" ? (retiredReportLabels.get(entry) ?? entry) : entry
+    ))),
+  ];
+}
+agenticDevelopment.due_diligence = dueDiligence;
+merged.agentic_development = agenticDevelopment;
 fs.writeFileSync(outputPath, JSON.stringify(merged, null, 2) + "\n");
 ' "$defaults_file" "$current_file" "$output_file"
     return $?
@@ -2668,6 +2596,37 @@ except Exception:
     current_json = {}
 
 merged = merge_defaults(defaults_json, current_json)
+external_tooling = merged.get("external_tooling") if isinstance(merged.get("external_tooling"), dict) else {}
+external_routing = external_tooling.get("routing") if isinstance(external_tooling.get("routing"), dict) else {}
+retired_complex_provider = external_routing.get("complex") if isinstance(external_routing.get("complex"), str) else None
+external_routing.pop("complex", None)
+if external_routing.get("knowledge") == "gbrain":
+    external_routing.pop("knowledge", None)
+external_tooling.pop("gbrain", None)
+external_tooling["routing"] = external_routing
+merged["external_tooling"] = external_tooling
+
+agentic_development = merged.get("agentic_development") if isinstance(merged.get("agentic_development"), dict) else {}
+planning_routing = agentic_development.get("routing") if isinstance(agentic_development.get("routing"), dict) else {}
+retired_report_labels = {}
+if retired_complex_provider:
+    retired_prefix = f"{retired_complex_provider}:"
+    for key in ("product_discovery", "complex_engineering_plan", "design_plan"):
+        route = planning_routing.get(key)
+        if isinstance(route, str) and route.startswith(retired_prefix):
+            retired_report_labels[route[len(retired_prefix):]] = key
+            planning_routing[key] = "parent-agent:geju"
+agentic_development["routing"] = planning_routing
+due_diligence = agentic_development.get("due_diligence") if isinstance(agentic_development.get("due_diligence"), dict) else {}
+if retired_report_labels and isinstance(due_diligence.get("explicit_report_required_for"), list):
+    migrated_due_diligence = []
+    for entry in due_diligence["explicit_report_required_for"]:
+        migrated_entry = retired_report_labels.get(entry, entry) if isinstance(entry, str) else entry
+        if migrated_entry not in migrated_due_diligence:
+            migrated_due_diligence.append(migrated_entry)
+    due_diligence["explicit_report_required_for"] = migrated_due_diligence
+agentic_development["due_diligence"] = due_diligence
+merged["agentic_development"] = agentic_development
 with open(output_path, "w", encoding="utf-8") as handle:
     json.dump(merged, handle, indent=2)
     handle.write("\n")
@@ -2761,9 +2720,8 @@ pi_should_enable_factor_factory() {
 pi_install_factor_factory() {
   local target_dir="$1"
   local factor_assets_dir="$2"
-  local scripts_source_dir="$3"
+  local _scripts_source_dir="$3"
   local mode="${4:-apply}"
-  local scripts_dir="$target_dir/.ai/harness/scripts"
   local factors_dir="$target_dir/tasks/factors"
   local cache_dir="$target_dir/.claude/.factor-cache/candidates"
   local registry_template="$factor_assets_dir/factor-registry.template.json"
@@ -2775,7 +2733,7 @@ pi_install_factor_factory() {
     return 0
   fi
 
-  mkdir -p "$factors_dir/promoted" "$cache_dir" "$scripts_dir"
+  mkdir -p "$factors_dir/promoted" "$cache_dir"
 
   if [[ -f "$registry_template" ]]; then
     cp "$registry_template" "$factors_dir/registry.json"
@@ -2791,13 +2749,5 @@ pi_install_factor_factory() {
     cp "$report_template" "$target_dir/.claude/factor-factory/backtest-report.template.md"
   fi
 
-  local factor_script
-  for factor_script in factor-lab-new.sh factor-lab-promote.sh factor-lab-reject.sh factor-lab-check.sh; do
-    if [[ -f "$scripts_source_dir/$factor_script" ]]; then
-      cp "$scripts_source_dir/$factor_script" "$scripts_dir/$factor_script"
-      pi_normalize_installed_helper "$scripts_dir/$factor_script"
-    fi
-  done
-
-  pi_ensure_executable_if_apply "$mode" "$scripts_dir"/factor-lab-*.sh
+  return 0
 }

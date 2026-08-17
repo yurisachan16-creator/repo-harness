@@ -22,7 +22,6 @@ async function withRepo<T>(fn: (repoRoot: string, ctx: McpToolContext) => Promis
     const policy = getMcpPolicy('planner', {
       enableReader: true,
       allowedRoots: [repoRoot],
-      generalRepo: { general_repo_read: true, fs_fallback: true },
     });
     return await fn(repoRoot, {
       repoRoot,
@@ -126,8 +125,6 @@ describe('mcp tools', () => {
       const read = await jsonTool(ctx, 'read_workflow_file', { path: 'tasks/current.md' });
       expect(read.path).toBe('tasks/current.md');
       expect(read.content).toContain('status=Active');
-      expect(read.source).toBe('general_repo_read_file');
-      expect(read.correlation_id).toMatch(/^mcpcorr_/);
 
       const denied = await jsonTool(ctx, 'read_workflow_file', { path: '.env' });
       expect(denied.error.code).toBe('POLICY_DENIED');
@@ -139,7 +136,7 @@ describe('mcp tools', () => {
     });
   });
 
-  test('planner connector opens allowed repo workspaces and reads text through tree search and line ranges', async () => {
+  test('planner connector opens allowed repo workspaces and reads text through tree and line ranges', async () => {
     const repoRoot = mkdtempSync(join(tmpdir(), 'repo-harness-mcp-reader-'));
     const outside = mkdtempSync(join(tmpdir(), 'repo-harness-mcp-reader-outside-'));
     try {
@@ -180,10 +177,9 @@ describe('mcp tools', () => {
       expect(typeof status.schema_hash).toBe('string');
 
       const roots = await jsonTool(ctx, 'list_allowed_roots');
-      const root = roots.roots.find(
-        (entry: { repo_id: string; path?: string }) => entry.repo_id === repoHarnessRepoIdFor(realpathSync(repoRoot)),
-      );
+      const root = roots.roots.find((entry: { root_id: string; path?: string }) => entry.root_id.startsWith('root_'));
       expect(root?.path).toBeUndefined();
+      expect(root?.repo_id).toBeUndefined();
       const rootId = root?.root_id;
       expect(rootId).toMatch(/^root_/);
 
@@ -199,15 +195,6 @@ describe('mcp tools', () => {
       expect(tree.entries.some((entry: { path: string }) => entry.path === 'ignored.md')).toBe(false);
       expect(tree.entries.some((entry: { path: string }) => entry.path === 'ignored-dir')).toBe(false);
       expect(tree.blocked_entries).toBeGreaterThanOrEqual(1);
-
-      const search = await jsonTool(ctx, 'search_text', {
-        workspace_id: opened.workspace_id,
-        query: 'authentication',
-        glob: '**/*.md',
-      });
-      expect(search.matches).toEqual([
-        expect.objectContaining({ path: 'docs/design.md', line: 2, snippet: 'authentication route' }),
-      ]);
 
       const read = await jsonTool(ctx, 'read_text', {
         workspace_id: opened.workspace_id,
@@ -247,7 +234,7 @@ describe('mcp tools', () => {
         writeFileSync(join(repoRoot, '.ai/harness/policy.json'), '{}\n');
         writeFileSync(join(repoRoot, '.ai/harness/handoff/resume.md'), '# Resume\n\nready\n');
         writeFileSync(join(repoRoot, 'tasks/current.md'), 'status=Active\n');
-        registerRepoHarnessRepo(repoRoot, 'adopt');
+        registerRepoHarnessRepo(repoRoot, 'init');
         const canonicalRepoRoot = realpathSync(repoRoot);
 
         const policy = getMcpPolicy('planner', { enableReader: true });
@@ -371,6 +358,25 @@ describe('mcp tools', () => {
       const invalid = await jsonTool(ctx, 'write_codex_goal', { body: '# Codex Goal\nshort' });
       expect(invalid.error.code).toBe('INVALID_GOAL');
 
+      const missingExecutionBoundary = [
+        '# Codex Goal',
+        '## Source of truth',
+        'plans/prds/example.prd.md',
+        '## Role',
+        'Codex executor.',
+        '## Scope',
+        'Only workflow artifacts.',
+        '## Required workflow',
+        'Read PRD and sprint.',
+        '## Required checks',
+        'bun test tests/cli/mcp.test.ts',
+        '## Done when',
+        'Checks pass and handoff is updated.',
+      ].join('\n\n');
+      const missingBoundary = await jsonTool(ctx, 'write_codex_goal', { body: missingExecutionBoundary });
+      expect(missingBoundary.error.code).toBe('INVALID_GOAL');
+      expect(missingBoundary.error.details.missing).toContain('## Execution boundary');
+
       const validBody = [
         '# Codex Goal',
         '## Source of truth',
@@ -379,6 +385,8 @@ describe('mcp tools', () => {
         'Codex executor.',
         '## Scope',
         'Only workflow artifacts.',
+        '## Execution boundary',
+        'Implement exactly the listed scope; do not add unrequested extras.',
         '## Required workflow',
         'Read PRD and sprint.',
         '## Required checks',
@@ -443,6 +451,10 @@ describe('mcp tools', () => {
       const goalContent = readFileSync(join(repoRoot, '.ai/harness/handoff/codex-goal.md'), 'utf-8');
       expect(goalContent).toContain('## Host-native /goal prompt');
       expect(goalContent).toContain('No commit is created unless the user explicitly asks for commit.');
+      expect(goalContent).toContain('## Execution boundary');
+      expect(goalContent).toContain(
+        'Execution boundary: implement exactly the Goal, In scope items, Allowed Paths, and Exit Criteria in this brief.',
+      );
     });
   });
 
@@ -456,6 +468,8 @@ describe('mcp tools', () => {
         'Codex executor.',
         '## Scope',
         'Only workflow artifacts.',
+        '## Execution boundary',
+        'Implement exactly the listed scope; do not add unrequested extras.',
         '## Required workflow',
         'Read PRD and sprint.',
         '## Required checks',

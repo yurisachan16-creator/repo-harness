@@ -1,10 +1,9 @@
 /**
- * Route registry — single source of truth for hook events × routes × scripts.
+ * Route registry — single source of truth for hook events × routes × handlers.
  *
  * The (event, route-id, matcher) tuple is the **public contract** that host
- * adapters (`~/.codex/hooks.json`, `~/.claude/settings.json`) bind to. Script
- * names are an internal implementation detail — Phase 2 sealed hooks will
- * replace them with bundled implementations without changing the tuple.
+ * adapters (`~/.codex/hooks.json`, `~/.claude/settings.json`) bind to. Handler
+ * identities are stable internal authority names and do not alter the tuple.
  *
  * Derived from `.codex/hooks.json` reality verified Phase 0 canary
  * 2026-05-28 (see docs/architecture/global-hook-runtime.md and Codex consult
@@ -39,6 +38,17 @@ export type RouteId =
   | 'context'
   | 'quality';
 
+/** The in-process authority bound to a public route. */
+export type HookHandlerId =
+  | 'session-context'
+  | 'mutation-guard'
+  | 'subagent'
+  | 'mutation-observed'
+  | 'command-observed'
+  | 'trace-observer'
+  | 'prompt'
+  | 'stop';
+
 export interface Route {
   readonly event: HookEvent;
   readonly routeId: RouteId;
@@ -49,76 +59,77 @@ export interface Route {
   readonly matcher?: string;
   /** Host adapters this route is installed into. Undefined means all supported hosts. */
   readonly hosts?: readonly RouteHost[];
-  /** Repo-local `.ai/hooks/<script>` names, in execution order. */
-  readonly scripts: readonly string[];
+  /** Exactly one typed in-process handler owns this route. */
+  readonly handler: HookHandlerId;
 }
 
 export const ROUTES: readonly Route[] = Object.freeze([
   Object.freeze({
     event: 'SessionStart' as const,
     routeId: 'default' as const,
-    scripts: Object.freeze([
-      'session-start-context.sh',
-      'minimal-change-context.sh',
-      'security-sentinel.sh',
-    ]),
+    // HRD-04: context assembly is owned by the in-process session-context
+    // handler and is invoked directly by the runtime.
+    handler: 'session-context',
   }),
   Object.freeze({
     event: 'PreToolUse' as const,
     routeId: 'edit' as const,
     matcher: 'Edit|Write',
-    scripts: Object.freeze(['worktree-guard.sh', 'pre-edit-guard.sh']),
+    // HRD-03: mutation decisions are owned by the in-process guard handler.
+    handler: 'mutation-guard',
   }),
   Object.freeze({
     event: 'PreToolUse' as const,
     routeId: 'subagent' as const,
     matcher: 'Task|Agent|SendUserMessage',
-    scripts: Object.freeze(['subagent-return-channel-guard.sh']),
+    handler: 'subagent',
   }),
   Object.freeze({
     event: 'PostToolUse' as const,
     routeId: 'edit' as const,
     matcher: 'Edit|Write',
-    scripts: Object.freeze(['post-edit-guard.sh', 'minimal-change-observer.sh']),
+    // HRD-05: the post-edit journal is owned by the in-process observer.
+    handler: 'mutation-observed',
   }),
   Object.freeze({
     event: 'PostToolUse' as const,
     routeId: 'bash' as const,
     matcher: 'Bash',
-    scripts: Object.freeze(['post-bash.sh']),
+    handler: 'command-observed',
   }),
   Object.freeze({
     event: 'PostToolUse' as const,
     routeId: 'always' as const,
-    scripts: Object.freeze(['post-tool-observer.sh']),
+    handler: 'trace-observer',
   }),
   Object.freeze({
     event: 'UserPromptSubmit' as const,
     routeId: 'default' as const,
-    scripts: Object.freeze(['prompt-guard.sh']),
+    handler: 'prompt',
   }),
   Object.freeze({
     event: 'UserPromptSubmit' as const,
     routeId: 'delegation' as const,
     hosts: Object.freeze(['codex'] as const),
-    scripts: Object.freeze(['codex-delegation-advisor.sh']),
+    handler: 'subagent',
   }),
   Object.freeze({
     event: 'SubagentStart' as const,
     routeId: 'context' as const,
     hosts: Object.freeze(['codex'] as const),
-    scripts: Object.freeze(['subagent-start-context.sh']),
+    handler: 'subagent',
   }),
   Object.freeze({
     event: 'SubagentStop' as const,
     routeId: 'quality' as const,
     hosts: Object.freeze(['codex'] as const),
-    scripts: Object.freeze(['subagent-stop-quality.sh']),
+    handler: 'subagent',
   }),
   Object.freeze({
     event: 'Stop' as const,
     routeId: 'default' as const,
-    scripts: Object.freeze(['stop-orchestrator.sh']),
+    // HRD-06: Stop orchestration is owned by the in-process stop-handler.
+    handler: 'stop',
   }),
 ]);
 

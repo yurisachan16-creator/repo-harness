@@ -2,13 +2,19 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null)"; then
+if [[ -n "${REPO_HARNESS_TARGET_REPO_ROOT:-}" ]]; then
+  cd "$REPO_HARNESS_TARGET_REPO_ROOT"
+elif REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null)"; then
   cd "$REPO_ROOT"
-elif [[ "$SCRIPT_DIR" == */.ai/harness/scripts ]]; then
-  cd "$SCRIPT_DIR/../../.."
 else
   cd "$SCRIPT_DIR/.."
 fi
+helper_source="$0"
+if [[ -n "${REPO_HARNESS_HELPER_SOURCE_PATH:-}" && -f "$REPO_HARNESS_HELPER_SOURCE_PATH" \
+      && "$(basename "$REPO_HARNESS_HELPER_SOURCE_PATH")" == "$(basename "$0")" ]]; then
+  helper_source="$REPO_HARNESS_HELPER_SOURCE_PATH"
+fi
+helper_dir="$(cd "$(dirname "$helper_source")" && pwd)"
 
 usage() {
   cat <<'USAGE_EOF'
@@ -21,7 +27,54 @@ normalize_slug() {
 }
 
 ACTIVE_PLAN_MARKER=".ai/harness/active-plan"
-LEGACY_ACTIVE_PLAN_MARKER=".claude/.active-plan"
+
+# .ai/harness/policy.json#context.capability_source selects the single
+# capability authority: "registry" owns .ai/context/capabilities.json,
+# "archcontext" owns .archcontext/model/nodes. Without a JSON runtime this
+# reports the registry default, which only ever suppresses a seed.
+capability_source() {
+  local policy_file=".ai/harness/policy.json"
+  local runtime=""
+
+  [[ -f "$policy_file" ]] || { printf 'registry'; return 0; }
+  for candidate in node bun python3; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      runtime="$candidate"
+      break
+    fi
+  done
+  if [[ -z "$runtime" ]]; then
+    printf 'registry'
+    return 0
+  fi
+
+  case "$runtime" in
+    python3)
+      "$runtime" - "$policy_file" <<'PY_EOF'
+import json
+import sys
+
+try:
+    policy = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+    value = policy.get("context", {}).get("capability_source")
+except Exception:
+    value = None
+print(value if isinstance(value, str) and value else "registry", end="")
+PY_EOF
+      ;;
+    *)
+      "$runtime" -e '
+const fs = require("fs");
+let value;
+try {
+  const policy = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  value = policy && policy.context ? policy.context.capability_source : undefined;
+} catch {}
+process.stdout.write(typeof value === "string" && value ? value : "registry");
+' "$policy_file"
+      ;;
+  esac
+}
 
 read_active_plan_marker() {
   local marker_file="$1"
@@ -39,8 +92,7 @@ read_active_plan_marker() {
 }
 
 get_active_plan() {
-  read_active_plan_marker "$ACTIVE_PLAN_MARKER" \
-    || read_active_plan_marker "$LEGACY_ACTIVE_PLAN_MARKER"
+  read_active_plan_marker "$ACTIVE_PLAN_MARKER"
 }
 
 ensure_templates() {
@@ -191,6 +243,13 @@ PRD tier contract:
 - Then:
 - Machine-checkable evidence:
 
+### Scenario 3 (negative)
+
+- Given:
+- When:
+- Then (must NOT):
+- Machine-checkable evidence:
+
 ## Non-goals
 
 -
@@ -262,7 +321,7 @@ You are implementing this PRD.
 
 ## Adjacent Patterns
 
-Use this section only in standard tier or when explicitly requested. Prefer adjacent product patterns and common workflow debt. Do not name a competitor, API, platform limit, or package size unless the fact is sourced; otherwise mark it `[UNVERIFIED]`.
+Required when the PRD prior-art trigger rule (`repo-harness-product` prd mode) hits (UI/taste, market-convention pattern, library/framework selection, architecture precedent, or an `[UNVERIFIED]` external assumption). Otherwise optional: use in standard tier or when explicitly requested. Prefer adjacent product patterns and common workflow debt. Do not name a competitor, API, platform limit, or package size unless the fact is sourced; otherwise mark it `[UNVERIFIED]`.
 
 ## Commercialization Notes
 
@@ -314,8 +373,8 @@ Complete this inventory before implementation. If any line is unknown, keep the 
 - Current checks: `.ai/harness/checks/latest.json`
 - Run snapshots: `.ai/harness/runs/`
 - Scope authority: `tasks/contracts/{{ARTIFACT_STEM}}.contract.md` `allowed_paths`
-- Concurrency rule: `.ai/harness/active-plan` selects the active plan for this worktree when present; `.ai/harness/active-worktree` records the owning worktree; `.claude/.active-plan` is a legacy fallback during transition. If another worktree already owns active work, open or switch to the matching worktree instead of serializing unrelated plans.
-- Execution isolation: approved contract-level work projects through `scripts/plan-to-todo.sh --plan {{PLAN_FILE}}` and may start `scripts/contract-worktree.sh start --plan {{PLAN_FILE}}`.
+- Concurrency rule: `.ai/harness/active-plan` selects the active plan for this worktree when present; `.ai/harness/active-worktree` records the owning worktree. If another worktree already owns active work, open or switch to the matching worktree instead of serializing unrelated plans.
+- Execution isolation: approved contract-level work projects through `repo-harness run plan-to-todo --plan {{PLAN_FILE}}` and may start `repo-harness run contract-worktree start --plan {{PLAN_FILE}}`.
 
 ## Approach
 ### Strategy
@@ -340,8 +399,8 @@ Complete this inventory before implementation. If any line is unknown, keep the 
 - Review file: `tasks/reviews/{{ARTIFACT_STEM}}.review.md`
 - Implementation notes file: `tasks/notes/{{ARTIFACT_STEM}}.notes.md`
 - Template: `.claude/templates/contract.template.md`
-- Verification command: `bash scripts/verify-contract.sh --contract tasks/contracts/{{ARTIFACT_STEM}}.contract.md --strict`
-- Active plan rule: `.ai/harness/active-plan` is authoritative for this worktree when present; `.ai/harness/active-worktree` records the owning worktree; `.claude/.active-plan` is a legacy fallback during transition. Do not infer active execution from the latest non-archived plan.
+- Verification command: `repo-harness run verify-contract --contract tasks/contracts/{{ARTIFACT_STEM}}.contract.md --strict`
+- Active plan rule: `.ai/harness/active-plan` is authoritative for this worktree when present; `.ai/harness/active-worktree` records the owning worktree. Do not infer active execution from the latest non-archived plan.
 
 ## Handoff
 
@@ -377,14 +436,20 @@ PLAN_TEMPLATE_EOF
     cat > .claude/templates/contract.template.md <<'CONTRACT_TEMPLATE_EOF'
 # Task Contract: {{TASK_SLUG}}
 
-> **Status**: Pending
+> **Status**: Active
 > **Plan**: {{PLAN_FILE}}
 > **Task Profile**: {{TASK_PROFILE}}
+> <!-- legal values: code-change | docs-only | ledger-closeout | migration | eval-only | delegated-run | bugfix (omit for legacy passthrough); see docs/reference-configs/sprint-contracts.md -->
 > **Owner**: {{OWNER}}
 > **Capability ID**: {{CAPABILITY_ID}}
 > **Last Updated**: {{TIMESTAMP}}
 > **Review File**: `{{REVIEW_FILE}}`
 > **Notes File**: `{{NOTES_FILE}}`
+> **Exemplar**: `docs/reference-configs/contract-brief-example.md`
+
+## Why
+
+Why this task matters and what breaks downstream if it ships wrong or is skipped.
 
 ## Goal
 
@@ -394,6 +459,26 @@ Describe the exact outcome this task must deliver.
 
 - In scope:
 - Out of scope:
+- Taste constraints: <!-- advisory only, no run gate; default style/taste lives in AGENTS.md and the minimal-change policy, use this to record a per-task override -->
+
+## Stop Conditions
+
+- Stop and hand back to the parent if the change would require editing a path outside Allowed Paths.
+- Stop if an Exit Criteria command cannot be run in this environment.
+- Stop if Goal, Scope, or Exit Criteria are internally contradictory.
+
+## Falsifier
+
+What observable evidence would prove this task's direction wrong, and the cheapest proof point to check first. Leave as-is if not applicable.
+
+## Root Cause Evidence
+
+Required when Task Profile is `bugfix`; leave as-is otherwise.
+
+- root_cause: one sentence naming file:line/condition (testable, not "a state issue").
+- repro: the command or UI path that reproduces the symptom.
+- regression_guard: path to a test that fails on the unfixed code and passes after the fix (must also appear under exit_criteria.tests_pass).
+- pre_fix_failure_artifact: path to a captured run of regression_guard on the UNFIXED code. Capture with `bun test <regression_guard> > <artifact> 2>&1; echo "PRE_FIX_EXIT=$?" >> <artifact>` (no pipes — pipes swallow the exit status). The gate requires a non-zero `PRE_FIX_EXIT=` line plus the regression_guard path string in the artifact (see the Root Cause Evidence Gate section in docs/reference-configs/sprint-contracts.md).
 
 ## Workflow Inventory
 
@@ -404,20 +489,42 @@ Describe the exact outcome this task must deliver.
 - Checks file: `.ai/harness/checks/latest.json`
 - Run snapshots: `.ai/harness/runs/`
 - Scope gate: edit only paths listed under `allowed_paths`; update this contract before widening scope.
-- Completion gate: `scripts/verify-sprint.sh` must see this contract pass, the review recommend pass, and `## External Acceptance Advice` pass or record a manual override.
+- Completion gate: run `verify-sprint --prepare-acceptance`, record one typed AcceptanceReceipt under the frozen policy below, then run `verify-sprint`; review Markdown is projection only.
+
+## Change Assessment
+
+```json
+{"protocol":1,"oracles":[]}
+```
+
+## Acceptance Policy
+
+```json
+{"protocol":1,"reviewer":"Claude","user_waiver":"allowed"}
+```
 
 ## Allowed Paths
 
 ```yaml
 allowed_paths:
+  - docs/spec.md
   - plans/
   - tasks/todos.md
   - {{CONTRACT_FILE}}
   - {{REVIEW_FILE}}
   - {{NOTES_FILE}}
   - .ai/context/capabilities.json
+  - .claude/templates/
   - src/
   - tests/
+```
+
+## Evidence Requirements
+
+```yaml
+evidence_requirements:
+  # Set benchmark to required when this contract consumes the harness profile benchmark matrix.
+  benchmark: not_applicable
 ```
 
 ## Delegation Contract
@@ -426,7 +533,7 @@ allowed_paths:
 delegation:
   budget:
     tokens: null
-    tool_calls: null
+    runner_invocations: null
     wall_time_minutes: null
   permission_scope:
     mode: inherit_allowed_paths
@@ -445,6 +552,11 @@ delegation:
     verifier:
       mode: read_only
       purpose: exit_criteria_review
+  runner:
+    preferred:
+      - subagent
+    fallback: null
+    brief_is_authoritative: true
 ```
 
 ## Exit Criteria (Machine Verifiable)
@@ -452,15 +564,14 @@ delegation:
 ```yaml
 exit_criteria:
   files_exist:
-    - src/modules/{{TASK_SLUG}}/index.ts
+    - docs/spec.md
+  artifacts_exist:
+    - .ai/harness/checks/latest.json
     - {{NOTES_FILE}}
   tests_pass:
     - path: tests/unit/{{TASK_SLUG}}.test.ts
   commands_succeed:
-    - bun run typecheck
-  files_contain:
-    - path: src/modules/{{TASK_SLUG}}/index.ts
-      pattern: "export"
+    - bun run check:type
 ```
 
 ## Acceptance Notes (Human Review)
@@ -487,18 +598,18 @@ CONTRACT_TEMPLATE_EOF
 > **Checks File**: {{CHECKS_FILE}}
 > **Last Updated**: {{TIMESTAMP}}
 > **Recommendation**: fail
-> **Review Rubric Version**: 1
-> **Reviewed Diff Fingerprint**: pending
-> **Reviewed Scope**: branch+staged+unstaged+untracked
+> **Review Rubric Version**: 2
+> **Reviewed Subject SHA256**: pending
+> **Reviewed Subject Scope**: normalized-final-content
+> **Reviewed Target Revision**: pending
 
 ## Human Review Card
 
 - Verdict: pending
-- Change type: code-change | docs-only | ledger-closeout | migration | eval-only | delegated-run
+- Change type: code-change | docs-only | ledger-closeout | migration | eval-only | delegated-run | frontend
 - Intended files changed:
 - Actual files changed:
 - Commands passed:
-- External acceptance: unavailable
 - Residual risks:
 - Reviewer action required: inspect diff and card
 - Rollback:
@@ -510,17 +621,29 @@ CONTRACT_TEMPLATE_EOF
 - Manual checks:
 - Supporting artifacts:
 
-## External Acceptance Advice
+## Manual Check Evidence
 
-> **External Acceptance**: unavailable
-> **External Reviewer**:
-> **External Source**:
-> **External Started**:
-> **External Completed**:
+Copy each non-built-in contract `manual_checks` requirement exactly. Check it only after
+the observation is complete and replace the placeholder with concrete command output,
+screenshot/artifact path, or reviewer observation.
 
-- P1 blockers:
-- P2 advisories:
-- Acceptance checklist:
+- [ ] Exact manual_checks requirement
+  - Evidence: concrete observation, command output, screenshot path, or reviewer note
+
+## Acceptance Receipt Projection
+
+> **Disposition**: unavailable
+> **Reviewer**: unavailable
+> **Source**: unavailable
+> **Actor**: not-applicable
+> **Reviewed Subject SHA256**: pending
+> **Reviewed Subject Scope**: normalized-final-content
+> **Reviewed Target Revision**: pending
+> **Verification Evidence SHA256**: pending
+> **Issued At**: pending
+
+- Summary: No AcceptanceReceipt has been recorded.
+- Findings: none
 
 ## Scorecard
 
@@ -580,12 +703,155 @@ REVIEW_TEMPLATE_EOF
 - Checks: `.ai/harness/checks/latest.json`
 - Run snapshots: `.ai/harness/runs/`
 
+## Promotion Filter
+
+Promote a candidate to `tasks/lessons.md`, `docs/researches/`, or harness asset files only when all three hold: hard to reverse, surprising without local context, and a real trade-off existed. If any one is missing, keep it in this notes file instead.
+
 ## Promotion Candidates
 
 - Promote to `tasks/lessons.md` only after a repeated correction or failure pattern.
 - Promote to `docs/researches/` only when it is durable repo knowledge with evidence.
 - Promote to harness asset files only after verification across more than one task or fixture.
 NOTES_TEMPLATE_EOF
+  fi
+
+  if [[ ! -f ".claude/templates/design-brief.template.md" ]]; then
+    cat > .claude/templates/design-brief.template.md <<'DESIGN_BRIEF_TEMPLATE_EOF'
+# Design Brief: {{TITLE}}
+
+> **Status**: Draft
+> **Slug**: {{SLUG}}
+> **Owner**: {{OWNER}}
+> **Date**: {{TIMESTAMP}}
+
+<!--
+Design brief usage: produce this file as docs/design/DESIGN-{{SLUG}}.md before any
+frontend task_profile sprint or contract executes. Every item in the
+Confirmation Checklist needs an explicit human check before execution proceeds;
+this gate carries the same weight as plan approval. imagegen-type skills (for
+example `imagegen-frontend-web`, `design-taste-frontend`) may produce the
+Preview Attachment below, but they are optional enhancers, never a substitute
+for the checklist.
+
+Before filling this template, read `repo-harness docs show ux-feature-guard`.
+The UX Feature Guard section below is the behavior/authority hand-off to BDD;
+do not create a parallel guard artifact.
+-->
+
+## Purpose & Audience (頁面目的與受眾)
+
+- Page/surface:
+- Primary audience:
+- Job to be done:
+
+## UX Feature Guard (行為前圍欄)
+
+- Requested outcome (使用者可見結果):
+- Frozen behavior / rules that must not change (不可改變的玩法與語義):
+- Requested action (指令):
+- Exact payload acted on (資料內容; if none, write `N/A`):
+- Forbidden extras / non-goals (禁止新增):
+
+### Role-aware User-visible Concept Boundary (角色可見概念邊界)
+
+- Audience / role for this surface (可見角色):
+- Allowed visible concepts (允許可見的概念範圍):
+- Required outcome/recovery concepts that must stay visible (必須保留的結果與復原概念):
+- Backstage-only concepts that must never appear as user-visible (僅限後台，不得對使用者可見):
+- Role-gated exceptions, or `none` (角色限定例外，無則填 `none`):
+- Authority for each exception, or `N/A` (每個例外的核准依據，無則填 `N/A`):
+
+`UX-{{SLUG}}-N1` (the negative/non-goal scenario below) derives from the
+backstage-only and non-goal fields above: it asserts that a backstage-only
+concept or forbidden extra must NOT surface, not merely that some unrelated
+input is invalid.
+
+### Authority & Reuse Map (權威與復用)
+
+Name exact repo paths. A new surface needs a concrete mismatch or cross-module
+invariant; “cleaner” and “easier” are not justification.
+
+| Responsibility / datum | Existing authority or reuse target | Decision (reuse / extend / new) | New-surface justification |
+|------------------------|------------------------------------|---------------------------------|---------------------------|
+|                        |                                    |                                 |                           |
+
+### Observable & Copy Contract (可觀測狀態與文案)
+
+- Happy/loading/empty states that can actually occur:
+- Invalid/unavailable state: (what happened, where, next action)
+- Machine-readable output contract, if any: (required presence and absence)
+- Canonical copy source / sync sites:
+- Fail-loud rule: (name the authoritative failure; no synthesized fallback)
+
+### BDD Acceptance Scenarios
+
+Write concrete Given/When/Then scenarios. These implement the frozen decisions;
+they do not invent missing product rules.
+
+- Positive scenario ID + Given/When/Then: (`UX-{{SLUG}}-P1`)
+- Negative / non-goal scenario ID + Given/When/Then: (`UX-{{SLUG}}-N1`)
+- Authority-failure scenario ID + Given/When/Then: (`UX-{{SLUG}}-F1`)
+
+Carry these IDs unchanged into the task contract, test names/tags, and review
+evidence. Those surfaces prove the scenarios; they do not redefine them.
+
+## Reference Sources (參考來源:學什麼/避什麼)
+
+Name concrete products, sites, or design systems — not vague adjectives. Mark unverifiable claims `[UNVERIFIED]`.
+
+| Source | Learn (學什麼) | Avoid (避什麼) |
+|--------|----------------|-----------------|
+|        |                |                 |
+
+## Color (色彩)
+
+- Palette:
+- Usage rules: (which color for which state/action; contrast/accessibility floor)
+
+## Typography (字型排印)
+
+- Typeface(s):
+- Scale / weights:
+- Language-specific notes: (for example CJK pairing, line-height)
+
+## Layout (佈局)
+
+- Grid / breakpoints:
+- Spacing scale:
+- Key components and hierarchy:
+
+## Motion (動效)
+
+- Trigger -> effect pairs:
+- Duration / easing:
+- What must stay static:
+
+## Anti-patterns (明確禁止清單)
+
+List concrete things this design must NOT do. Vague taste complaints ("不好看") are not acceptable entries; name the specific pattern.
+
+-
+
+## Confirmation Checklist (確認標準)
+
+Every item must be checked before this brief unblocks sprint/contract execution.
+
+- [ ] Value proposition is clear (價值主張清晰)
+- [ ] Primary reference is decided (主參考已定)
+- [ ] Color is accurate to the reference (色彩準確)
+- [ ] Anti-pattern / don't list is explicit (明確的 don't 清單)
+- [ ] Motion spec is explicit (動效規格明確)
+- [ ] Product rules/non-goals are frozen; instruction and payload are separate (玩法不變，指令與內容分離)
+- [ ] Existing component/domain authorities have exact reuse paths; every new surface is justified (優先復用現有權威)
+- [ ] Positive, negative, and authority-failure Given/When/Then scenarios are explicit and fail loudly (BDD 場景完整且錯誤可見)
+- [ ] Role-aware visible/backstage-only concept boundary is explicit; `UX-{{SLUG}}-N1` matches a backstage-only or non-goal concept (角色可見/僅限後台概念邊界明確，N1 對應非目標或僅限後台概念)
+
+## Preview Attachment (可選)
+
+Optional. Reference an imagegen-generated preview or screenshot here; imagegen-type skills are enhancers for this brief, never a substitute for the checklist above. `design-proposal` can run the peer-research -> boundary-freeze -> STIMULUS-preview -> taste-refinement pipeline ahead of this section; it is an optional enhancer too, never a substitute for this brief or the Confirmation Checklist.
+
+- Preview path/link:
+DESIGN_BRIEF_TEMPLATE_EOF
   fi
 }
 
@@ -613,8 +879,8 @@ TODO_EOF
 
 ensure_current_status_snapshot() {
   mkdir -p tasks
-  if [[ -x "scripts/refresh-current-status.sh" ]]; then
-    bash "scripts/refresh-current-status.sh" --clear --write --reason "ensure-task-workflow" >/dev/null 2>&1 || true
+  if [[ -f "$helper_dir/refresh-current-status.sh" ]]; then
+    bash "$helper_dir/refresh-current-status.sh" --clear --write --reason "ensure-task-workflow" >/dev/null 2>&1 || true
     return 0
   fi
 
@@ -640,8 +906,25 @@ CURRENT_STATUS_EOF
   fi
 }
 
+# The resume packet must be the last handoff artifact bootstrap writes:
+# check-task-workflow.sh treats a resume packet older than either
+# .ai/harness/handoff/current.md or tasks/current.md as stale. Both of those
+# are written earlier in the bootstrap sequence, so creating the resume packet
+# here keeps that invariant true by construction instead of by whole-second
+# mtime luck.
+ensure_resume_packet() {
+  mkdir -p .ai/harness/handoff
+  if [[ ! -f ".ai/harness/handoff/resume.md" ]]; then
+    cat > ".ai/harness/handoff/resume.md" <<'RESUME_EOF'
+# Codex Resume Packet
+
+> **Reason**: bootstrap
+RESUME_EOF
+  fi
+}
+
 ensure_auxiliary_files() {
-  mkdir -p plans plans/archive plans/prds plans/sprints tasks/archive tasks/contracts tasks/reviews tasks/notes tasks/workstreams docs/architecture/domains docs/architecture/modules docs/architecture/requests docs/architecture/snapshots docs/architecture/diagrams scripts .ai/context .ai/harness/checks .ai/harness/handoff .ai/harness/scripts .ai/harness/failures .ai/harness/security .ai/harness/planning .ai/harness/delegation .ai/harness/architecture .ai/harness/worktrees .ai/harness/runs
+  mkdir -p plans plans/archive plans/prds plans/sprints tasks/archive tasks/contracts tasks/reviews tasks/notes tasks/workstreams docs/architecture/domains docs/architecture/modules docs/architecture/requests docs/architecture/snapshots docs/architecture/diagrams .ai/context .ai/harness/checks .ai/harness/handoff .ai/harness/failures .ai/harness/security .ai/harness/planning .ai/harness/delegation .ai/harness/architecture .ai/harness/worktrees .ai/harness/runs
 
   if [[ ! -f "docs/spec.md" ]]; then
     cat > docs/spec.md <<'SPEC_EOF'
@@ -691,14 +974,6 @@ RESEARCH_README_EOF
 
 > **Reason**: bootstrap
 HANDOFF_EOF
-  fi
-
-  if [[ ! -f ".ai/harness/handoff/resume.md" ]]; then
-    cat > ".ai/harness/handoff/resume.md" <<'RESUME_EOF'
-# Codex Resume Packet
-
-> **Reason**: bootstrap
-RESUME_EOF
   fi
 
   if [[ ! -f ".ai/harness/events.jsonl" ]]; then
@@ -752,7 +1027,10 @@ RESUME_EOF
     : > "tasks/workstreams/.gitkeep"
   fi
 
-  if [[ ! -f ".ai/context/capabilities.json" ]]; then
+  # Seeding the JSON registry into an archcontext-authority repo would
+  # reinstate the retired second authority, so the capability_source selector
+  # gates the seed. Registry-mode repos (the default) are unchanged.
+  if [[ "$(capability_source)" == "registry" && ! -f ".ai/context/capabilities.json" ]]; then
     cat > ".ai/context/capabilities.json" <<'CAPABILITIES_EOF'
 {
   "version": 1,
@@ -771,16 +1049,15 @@ CAPABILITIES_EOF
 
 - Latest snapshot: (none yet)
 - Semantic diagram source: (none yet)
-- Latest human diagram: (none yet)
 
 ## Architecture Drift Flow
 
-- `scripts/architecture-queue.sh` records architecture-sensitive edits as requests.
-- `scripts/archive-architecture-request.sh` archives handled requests after an agent records the resolution status and linked artifacts.
-- `scripts/context-contract-sync.sh` keeps only the controlled architecture block in functional-block `AGENTS.md` and `CLAUDE.md` files aligned.
-- `scripts/workstream-sync.sh` keeps durable multi-session progress under `tasks/workstreams/<domain>/<capability>/` and projects only pointers into local contracts.
+- `repo-harness run architecture-queue` records architecture-sensitive edits as requests.
+- `repo-harness run archive-architecture-request` archives handled requests after an agent records the resolution status and linked artifacts.
+- `repo-harness run context-contract-sync` keeps only the controlled architecture block in functional-block `AGENTS.md` and `CLAUDE.md` files aligned.
+- `repo-harness run workstream-sync` keeps durable multi-session progress under `tasks/workstreams/<domain>/<capability>/` and projects only pointers into local contracts.
 - Semantic architecture diagrams live as Mermaid fenced blocks in the relevant module or snapshot Markdown.
-- Human-readable architecture diagrams are optional `mermaid` HTML files in `docs/architecture/diagrams/` and should link back to the Markdown semantic source.
+- Markdown Mermaid fenced blocks are the only architecture diagram artifacts; do not generate standalone HTML.
 
 ## Pending Requests
 
@@ -797,12 +1074,18 @@ ARCHITECTURE_INDEX_EOF
   "version": 1,
   "active_plan": {
     "marker_file": ".ai/harness/active-plan",
-    "legacy_marker_file": ".claude/.active-plan",
     "directory": "plans",
     "archive_directory": "plans/archive",
     "glob": "plan-*.md",
     "active_worktree_marker_file": ".ai/harness/active-worktree",
-    "source_of_truth": "per-worktree explicit marker with active-worktree owner; legacy Claude marker fallback only"
+    "source_of_truth": "per-worktree explicit marker with active-worktree owner",
+    "lifecycle": {
+      "annotation_end": "Annotating",
+      "approved": "Approved",
+      "executing": "Executing",
+      "terminal_start": "Complete"
+    },
+    "statuses": ["Draft", "Annotating", "Approved", "Executing", "Blocked", "Review", "Complete", "Completed", "Done", "Fulfilled", "Archived", "Abandoned", "Superseded"]
   },
   "tasks": {
     "todo_file": "tasks/todos.md",
@@ -825,16 +1108,19 @@ ARCHITECTURE_INDEX_EOF
     "private_dir": "_ops",
     "tracked": ["deploy/README.md", "deploy/scripts/", "deploy/submissions/", "deploy/runbooks/", "deploy/release-checklists/", "deploy/sql/", "deploy/*.md", "deploy/env/.env.example"],
     "ignored": ["_ops/"],
-    "rule": "commit deployment runbooks, submission materials, release checklists, helper scripts, ordered SQL files, and env examples under deploy/; keep deploy SQL in deploy/sql/ with 4-digit ascending prefixes; keep keys, tokens, real env values, provider state, artifacts, logs, and scratch files in ignored _ops/ only"
+    "rule": "commit deployment runbooks, submission materials, release checklists, helper scripts, ordered SQL files, and env examples under deploy/; when operations.deploy_sql is absent, keep deploy SQL directly under deploy/sql/ with ordered4 names (4-digit ascending prefixes); when operations.deploy_sql is present, its roots, naming modes, and invariant_file are the sole alternate SQL-layout authority; keep keys, tokens, real env values, provider state, artifacts, logs, and scratch files in ignored _ops/ only"
   },
   "context": {
     "profile": "stable-root-progressive-subdir",
     "map_file": ".ai/context/context-map.json",
     "capability_registry_file": ".ai/context/capabilities.json",
-    "capability_resolver": "scripts/capability-resolver.ts",
+    "capability_resolver": "repo-harness run capability-resolver",
+    "capability_config": "repo-harness run capability-config",
     "capability_match_rule": "longest-prefix; same-length ambiguity fails",
+    "capability_source": "registry",
+    "capability_source_rule": "single authority selected by capability_source; registry reads .ai/context/capabilities.json, archcontext reads .archcontext/model/nodes/*.yaml; no dual-read and no fallback",
     "functional_block_selector": {
-      "script": "scripts/select-agent-context-blocks.sh",
+      "script": "repo-harness run select-agent-context-blocks",
       "config_file": ".ai/context/agent-context-blocks.txt",
       "env": "REPO_HARNESS_CONTEXT_BLOCKS",
       "rule": "compatibility selector; capability registry is the source of truth"
@@ -848,9 +1134,8 @@ ARCHITECTURE_INDEX_EOF
     "events_file": ".ai/harness/events.jsonl",
     "architecture_events_file": ".ai/harness/architecture/events.jsonl",
     "runs_dir": ".ai/harness/runs",
-    "helper_runtime_dir": "scripts",
-    "helper_compat_dir": "scripts",
-    "helper_source": "compat-bootstrap"
+    "helper_runtime_dir": "package:assets/templates/helpers",
+    "helper_source": "package"
   },
   "architecture": {
     "index_file": "docs/architecture/index.md",
@@ -862,12 +1147,17 @@ ARCHITECTURE_INDEX_EOF
     "diagram_skill": "mermaid",
     "diagram_skill_source": "~/.codex/skills/mermaid",
     "vendoring_policy": "do-not-vendor-diagram-skill-assets",
+    "projection_provider": "disabled",
+    "projection_apply": "disabled",
+    "projection_failure_gate": "advisory",
+    "projection_version": "0.4.3",
+    "projection_timeout_ms": 120000,
     "freshness_gate": "advisory",
     "gate_min_severity": "medium",
     "pending_card_scope": "capability",
     "pending_block_begin": "<!-- BEGIN ARCHITECTURE PENDING REQUESTS -->",
     "pending_block_end": "<!-- END ARCHITECTURE PENDING REQUESTS -->",
-    "queue_script": "scripts/architecture-queue.sh",
+    "queue_script": "repo-harness run architecture-queue",
     "contract_block_begin": "<!-- BEGIN ARCHITECTURE CONTRACT -->",
     "contract_block_end": "<!-- END ARCHITECTURE CONTRACT -->",
     "rule": "hooks record architecture queue cards and sync controlled local context blocks; agents author semantic snapshots and diagrams"
@@ -892,22 +1182,21 @@ ARCHITECTURE_INDEX_EOF
       "purpose": "raw verification records used to audit notes, reviews, and future promotion; checks latest reports and run snapshots are ignored runtime cache unless distilled into reviews, contracts, notes, or research"
     },
     "assets": {
-      "sources": [".ai/harness/policy.json", ".ai/harness/workflow-contract.json", ".ai/hooks/", "scripts/", "docs/reference-configs/"],
+      "sources": [".ai/harness/policy.json", ".ai/harness/workflow-contract.json", ".ai/hooks/", "package:assets/templates/helpers", "docs/reference-configs/"],
       "promotion_rule": "only promote patterns after verified reuse across tasks or fixtures"
     },
     "memory": {
-      "sources": ["docs/researches/", "tasks/lessons.md", "gbrain"],
+      "sources": ["docs/researches/", "tasks/lessons.md"],
       "rule": "memory is advisory; current repo state and evidence override summaries"
     },
     "external_knowledge": {
+      "mode": "manual-opt-in",
       "default_brain_path": "brain/<project>/*",
       "project_path": "brain/<project>/*",
       "manifest_file": ".ai/harness/brain-manifest.json",
-      "drift_check": "scripts/check-brain-manifest.sh",
-      "sync_script": "scripts/sync-brain-docs.sh",
-      "hook_trigger": "PostToolUse Edit|Write for manifest entries with sync.direction=repo-to-brain",
+      "sync_script": "repo-harness run sync-brain-docs",
       "rule": "external knowledge stores long-lived explanations, runbooks, and patterns only; repo-local contracts, hooks, scripts, checks, and evidence remain authoritative",
-      "sync_rule": "only explicitly opted-in repo-to-brain manifest entries may be written to the default brain vault; pointer-only externalized stubs remain check-only"
+      "sync_rule": "external sync and drift checks are operator-invoked only; hooks and workflow verification never read, write, or gate on external vault state"
     }
   },
   "handoff_resume": {
@@ -916,9 +1205,9 @@ ARCHITECTURE_INDEX_EOF
     "auto_start_new_session": false
   },
   "plan_capture": {
-    "script": "scripts/capture-plan.sh",
+    "script": "repo-harness run capture-plan",
     "sources": ["codex-plan-mode", "waza-think", "repo-harness-plan"],
-    "rule": "Codex Plan mode and Waza think planning should capture decision-complete work-package plans into plans/plan-*.md only when Artifact Level is work-package and the Promotion Gate is concrete; implementation approval then projects the active approved work-package plan through scripts/plan-to-todo.sh; checklist-row and inline sprint work stay in the sprint backlog or active plan Task Breakdown"
+    "rule": "Codex Plan mode and Waza think planning should capture decision-complete work-package plans into plans/plan-*.md only when Artifact Level is work-package and the Promotion Gate is concrete; implementation approval then projects the active approved work-package plan through repo-harness run plan-to-todo; checklist-row and inline sprint work stay in the sprint backlog or active plan Task Breakdown"
   },
   "planning": {
     "pending_orchestration_file": ".ai/harness/planning/pending.json",
@@ -927,16 +1216,26 @@ ARCHITECTURE_INDEX_EOF
   "guards": {
     "edit_plan_gate": "enforce",
     "edit_plan_gate_modes": ["enforce", "advice", "off"],
-    "rule": "pre-edit-guard blocks implementation edits (non-workflow paths) unless an active plan is Approved/Executing; prompt-layer plan gates are advisory routing only"
+    "rule": "the mutation-guard handler blocks implementation edits (non-workflow paths) unless an active plan is Approved/Executing; prompt-layer plan gates are advisory routing only"
+  },
+  "circuit_breakers": {
+    "guard_repeat": 2,
+    "review": { "lite": 1, "standard": 1, "strict": 2 },
+    "subagents": { "default": 2, "strict_explicit_contract": 3 },
+    "repair_loops": 2,
+    "cross_model_consults_default": 0
   },
   "delegation": {
     "mode": "explicit",
-    "max_agents": 3,
+    "max_agents": 2,
+    "strict_max_agents": 3,
     "max_depth": 1,
     "allow_parallel_writers": false,
-    "stop_fallback": true,
     "state_file": ".ai/harness/delegation/latest.json",
-    "rule": "UserPromptSubmit.delegation only injects bounded subagent context after explicit user authorization such as /delegate, /parallel, spawn subagents, or parallel investigation"
+    "preferred_runners": ["subagent"],
+    "brief_source": "tasks/contracts/<stem>.contract.md",
+    "runner_rule": "the active task contract is the authoritative execution brief. Claude uses its native subagent surface. Codex uses native spawn_agent with the exact installed agent_type and fork_turns=none; official SubagentStart agent_type/model fields are the runtime observation. Missing, default, mismatched, invalid, or unverified native routing fails closed without an alternate fleet runner. Reasoning effort remains configured_unverified until Codex exposes an official runtime field.",
+    "rule": "UserPromptSubmit.delegation injects bounded delegation context only for the typed /delegate or /parallel command. Natural-language inference and SessionStart standing authorization are not delegation authorities."
   },
   "sidecar_research": {
     "default": true,
@@ -967,9 +1266,9 @@ ARCHITECTURE_INDEX_EOF
     "branch_prefix": "codex/",
     "base_branch": "main",
     "worktree_dir_template": "../{{repo}}-wt-{{slug}}",
-    "start_script": "scripts/contract-worktree.sh start --plan <plan-file>",
-    "finish_script": "scripts/contract-worktree.sh finish",
-    "cleanup_script": "scripts/contract-worktree.sh cleanup --slug <slug>",
+    "start_script": "repo-harness run contract-worktree start --plan <plan-file>",
+    "finish_script": "repo-harness run contract-worktree finish",
+    "cleanup_script": "repo-harness run contract-worktree cleanup --slug <slug>",
     "conflict_signals": [
       "dirty_worktree_overlaps_task_files",
       "current_branch_not_suitable_for_task",
@@ -1015,9 +1314,7 @@ ARCHITECTURE_INDEX_EOF
   },
   "external_tooling": {
     "routing": {
-      "complex": "gstack",
-      "simple": "waza",
-      "knowledge": "gbrain"
+      "simple": "waza"
     },
     "hosts": [
       "claude-code",
@@ -1025,7 +1322,7 @@ ARCHITECTURE_INDEX_EOF
     ],
     "mode": "agent-readiness-required",
     "detection": "init-migrate",
-    "readiness_gate": "scripts/check-agent-tooling.sh --host codex --strict-readiness",
+    "readiness_gate": "repo-harness run check-agent-tooling --host codex --strict-readiness",
     "waza": {
       "source_repo": "tw93/Waza",
       "source_url": "https://github.com/tw93/Waza.git",
@@ -1035,6 +1332,27 @@ ARCHITECTURE_INDEX_EOF
       "staging_cache_path": "~/.agents/skills",
       "sync_mode": "stage-upstream-then-copy-to-codex",
       "host_drift_policy": "report-per-host-version-staging-and-upstream-drift"
+    },
+    "hai_stack": {
+      "source_repo": "hylarucoder/hai-stack",
+      "source_url": "https://github.com/hylarucoder/hai-stack.git",
+      "managed_skills": ["geju"],
+      "primary_host": "codex",
+      "codex_primary_path": "~/.codex/skills",
+      "staging_cache_path": "~/.agents/skills",
+      "sync_mode": "stage-upstream-then-copy-to-codex",
+      "host_drift_policy": "report-per-host-version-staging-and-upstream-drift"
+    },
+    "agent_fleet": {
+      "source": "package:agents/fleet",
+      "managed_agents": ["explorer", "deep-reasoner", "fast-worker", "gatekeeper", "root-cause-prover", "harness-evaluator"],
+      "claude_target": "~/.claude/agents",
+      "codex_target": "~/.codex/agents",
+      "codex_generation": "derive-toml-from-md",
+      "install_mode": "advisory",
+      "conflict_policy": "never-clobber-without-force",
+      "install_command": "repo-harness run install-agent-fleet",
+      "source_policy": "repo-owned-single-authority"
     },
     "codex_automation_profile": {
       "required_skills": ["health", "check", "mermaid"],
@@ -1055,9 +1373,6 @@ ARCHITECTURE_INDEX_EOF
       "sync_mode": "external-installed-skill",
       "vendoring_policy": "do-not-vendor"
     },
-    "gbrain": {
-      "mcp": "candidate-disabled"
-    },
     "codegraph": {
       "package": "@colbymchenry/codegraph",
       "primary_host": "both",
@@ -1071,20 +1386,33 @@ ARCHITECTURE_INDEX_EOF
       "project_init_command": "codegraph init -i .",
       "sync_command": "codegraph sync .",
       "vendoring_policy": "do-not-add-package-dependency"
+    },
+    "archctx": {
+      "cli_package": "archctx",
+      "contracts_package": "archctx-contracts",
+      "contracts_scope": "release-gated-packed-schema-authority",
+      "install_mode": "release-gated-runtime-dependency-when-projection-enabled",
+      "readiness": "advisory",
+      "hook_policy": "do-not-block-hooks",
+      "vendoring_policy": "do-not-vendor",
+      "model_dir": ".archcontext/model",
+      "nodes_dir": ".archcontext/model/nodes",
+      "capability_source_key": ".ai/harness/policy.json#context.capability_source"
     }
   },
   "agentic_development": {
     "routing": {
-      "product_discovery": "gstack:office-hours",
-      "complex_engineering_plan": "gstack:plan-eng-review",
-      "design_plan": "gstack:plan-design-review",
+      "product_discovery": "parent-agent:geju",
+      "complex_engineering_plan": "parent-agent:geju",
+      "design_plan": "parent-agent:geju",
+      "design_options_choice": "convention:design-options",
       "small_or_medium_plan": "waza:think",
       "bug_or_regression": "waza:hunt",
       "post_implementation_review": "waza:check"
     },
     "due_diligence": {
       "levels": ["P1_GLOBAL_ARCHITECTURE", "P2_DATA_FLOW_TRACE", "P3_DESIGN_DECISION"],
-      "explicit_report_required_for": ["plan-eng-review", "hunt", "risky_refactor", "deployment", "auth_payment_data", "shared_contract"]
+      "explicit_report_required_for": ["complex_engineering_plan", "hunt", "risky_refactor", "deployment", "auth_payment_data", "shared_contract"]
     }
   },
   "enforcement": {
@@ -1106,7 +1434,7 @@ POLICY_EOF
   "rules": [
     "repo-local contracts, hooks, scripts, checks, and evidence remain authoritative",
     "default brain stores long-lived explanations, runbooks, decisions, references, and patterns",
-    "hook runtime may sync explicitly opted-in repo-to-brain entries only; it must not query gbrain, MCP, or unregistered default brain paths"
+    "external brain sync is manual opt-in; hooks and workflow checks do not read, write, or validate external vault state"
   ],
   "entries": []
 }
@@ -1119,7 +1447,7 @@ BRAIN_MANIFEST_EOF
   "version": 1,
   "profile": "stable-root-progressive-subdir",
   "functional_block_selector": {
-    "script": "scripts/select-agent-context-blocks.sh",
+    "script": "repo-harness run select-agent-context-blocks",
     "config_file": ".ai/context/agent-context-blocks.txt",
     "env": "REPO_HARNESS_CONTEXT_BLOCKS",
     "rule": "compatibility selector; capability registry is the source of truth"
@@ -1197,6 +1525,7 @@ ensure_templates
 ensure_auxiliary_files
 ensure_idle_todo
 ensure_current_status_snapshot
+ensure_resume_packet
 
 active_plan="$(get_active_plan || true)"
 if [[ -n "$active_plan" && "$new_plan" -eq 0 ]]; then
@@ -1205,8 +1534,8 @@ if [[ -n "$active_plan" && "$new_plan" -eq 0 ]]; then
 fi
 
 if [[ ! -f "docs/spec.md" ]]; then
-  if [[ -x "scripts/new-spec.sh" ]]; then
-    bash "scripts/new-spec.sh"
+  if [[ -f "$helper_dir/new-spec.sh" ]]; then
+    bash "$helper_dir/new-spec.sh"
   fi
 fi
 
@@ -1216,7 +1545,7 @@ if [[ -z "$slug" ]]; then
     exit 1
   fi
   echo "Workflow ready. No active plan present."
-  echo "Create one with: bash scripts/ensure-task-workflow.sh --slug <slug> --title <title>"
+  echo "Create one with: repo-harness run ensure-task-workflow --slug <slug> --title <title>"
   exit 0
 fi
 
@@ -1230,9 +1559,9 @@ if [[ -z "$title" ]]; then
   title="$slug"
 fi
 
-if [[ -x "scripts/new-plan.sh" ]]; then
-  bash "scripts/new-plan.sh" --slug "$slug" --title "$title"
+if [[ -f "$helper_dir/new-plan.sh" ]]; then
+  bash "$helper_dir/new-plan.sh" --slug "$slug" --title "$title"
 else
-  echo "Missing scripts/new-plan.sh" >&2
+  echo "Missing packaged new-plan helper" >&2
   exit 1
 fi

@@ -1,15 +1,24 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { randomUUID } from 'crypto';
 import { realpathSync, statSync } from 'fs';
 import { resolve } from 'path';
-import { registeredRepoHarnessRoots } from '../../effects/repo-registry';
-import { loadMcpLocalConfig } from './auth';
+import {
+  readRegisteredRepoHarnessRepos,
+  registeredRepoHarnessRoots,
+  repoHarnessAuthorizationRevision,
+} from '../../effects/repo-registry';
+import { assertNoLegacyRepoScopeMcpConfig, loadMcpLocalConfig } from './auth';
+import { recordCodingProcessCompletion } from './coding-tools';
+import { createCodeGraphCliAdapter } from './codegraph-adapter';
+import { CodingWorkspaceManager } from './coding-workspaces';
 import { buildMcpServerInstructions } from './instructions';
 import { getMcpPolicy, parseMcpProfile, sensitiveAllowedRootReason } from './policy';
 import { isRepoHarnessAdopted, resolveMcpRepoRoot } from './repo';
 import { buildMcpToolDefinitions, callMcpTool, type McpToolContext } from './tools';
 import type { McpAgentRunnerName, McpPolicy } from './types';
 import { repoHarnessPackageVersion } from './version';
+import { buildMcpProcessEnvironment, McpProcessSessionManager } from './process-sessions';
 import { WorkspaceManager } from './workspaces';
 
 export interface McpServerOptions {
@@ -21,6 +30,32 @@ export interface McpServerOptions {
   enableDevRunner?: boolean;
   devRunnerAgents?: string;
   devRunnerTimeoutMs?: number;
+  codingRuntime?: McpCodingRuntime | null;
+}
+
+export interface McpCodingRuntime {
+  readonly repoRoot: string;
+  readonly ownerId: string;
+  readonly workspaceManager: CodingWorkspaceManager;
+  readonly processManager: McpProcessSessionManager;
+  readonly codeGraphAdapter: ReturnType<typeof createCodeGraphCliAdapter>;
+}
+
+const activeCodingRuntimes = new Set<McpCodingRuntime>();
+const closedCodingRuntimes = new WeakSet<McpCodingRuntime>();
+const codingRuntimeForContext = new WeakMap<McpToolContext, McpCodingRuntime>();
+
+export async function shutdownMcpCodingRuntime(runtime: McpCodingRuntime): Promise<void> {
+  if (closedCodingRuntimes.has(runtime)) return;
+  closedCodingRuntimes.add(runtime);
+  activeCodingRuntimes.delete(runtime);
+  runtime.processManager.terminateOwner(runtime.ownerId);
+  await runtime.processManager.shutdown();
+  runtime.workspaceManager.closeSession();
+}
+
+export async function shutdownAllMcpCodingRuntimes(): Promise<void> {
+  await Promise.all(Array.from(activeCodingRuntimes, (runtime) => shutdownMcpCodingRuntime(runtime)));
 }
 
 function parseBooleanSetting(value: string | undefined): boolean | undefined {
@@ -46,24 +81,7 @@ function parseTimeoutMs(value: unknown): number | undefined {
   return integer;
 }
 
-function parseStringList(value: unknown): string[] {
-  const raw = Array.isArray(value) ? value : typeof value === 'string' ? value.split(',') : [];
-  return Array.from(new Set(raw.map((entry) => String(entry).trim()).filter(Boolean)));
-}
-
-function configuredGeneralRepoFlags(config: ReturnType<typeof loadMcpLocalConfig>): Partial<McpPolicy['generalRepo']> {
-  const configured = config?.rollout?.generalRepo ?? {};
-  return {
-    general_repo_read: parseBooleanSetting(process.env.REPO_HARNESS_MCP_GENERAL_REPO_READ) ?? configured.general_repo_read,
-    repo_write: parseBooleanSetting(process.env.REPO_HARNESS_MCP_REPO_WRITE) ?? configured.repo_write,
-    fs_fallback: parseBooleanSetting(process.env.REPO_HARNESS_MCP_FS_FALLBACK) ?? configured.fs_fallback,
-    shadow_compare: parseBooleanSetting(process.env.REPO_HARNESS_MCP_SHADOW_COMPARE) ?? configured.shadow_compare,
-    rollback_to_legacy_tools: parseBooleanSetting(process.env.REPO_HARNESS_MCP_ROLLBACK_LEGACY_TOOLS) ?? configured.rollback_to_legacy_tools,
-    canary_repos: parseStringList(process.env.REPO_HARNESS_MCP_CANARY_REPOS ?? configured.canary_repos),
-  };
-}
-
-function normalizeAllowedRoots(rawRoots: string[]): string[] {
+function normalizeAllowedRoots(rawRoots: string[], opts: { skipDenied?: boolean } = {}): string[] {
   const roots: string[] = [];
   const seen = new Set<string>();
   for (const rawRoot of rawRoots) {
@@ -77,6 +95,7 @@ function normalizeAllowedRoots(rawRoots: string[]): string[] {
     }
     const sensitiveReason = sensitiveAllowedRootReason(normalized, undefined, rawRoot);
     if (sensitiveReason) {
+      if (opts.skipDenied === true) continue;
       throw new Error(`MCP allowed root is denied by policy: ${rawRoot} (${sensitiveReason})`);
     }
     if (seen.has(normalized)) continue;
@@ -86,11 +105,94 @@ function normalizeAllowedRoots(rawRoots: string[]): string[] {
   return roots;
 }
 
+function uniqueRoots(rawRoots: string[]): string[] {
+  const roots: string[] = [];
+  const seen = new Set<string>();
+  for (const root of rawRoots) {
+    if (seen.has(root)) continue;
+    seen.add(root);
+    roots.push(root);
+  }
+  return roots;
+}
+
+function buildCodingRuntime(
+  repoRoot: string,
+  policy: McpPolicy,
+  config: ReturnType<typeof loadMcpLocalConfig>,
+  ownerId: string,
+): McpCodingRuntime {
+  const codingEnv: NodeJS.ProcessEnv = { ...process.env };
+  if (config?.coding?.worktreeRoot) codingEnv.REPO_HARNESS_MCP_WORKTREE_ROOT = config.coding.worktreeRoot;
+  const workspaceManager = new CodingWorkspaceManager(codingEnv);
+  const configuredEnv = Object.fromEntries((config?.coding?.environmentAllowlist ?? [])
+    .map((key) => key.trim())
+    .filter((key) => key && process.env[key] !== undefined)
+    .map((key) => [key, process.env[key] as string]));
+  const codingProcessEnv = buildMcpProcessEnvironment({ baseEnv: codingEnv, configuredEnv });
+  const codeGraphAdapter = createCodeGraphCliAdapter({
+    env: codingProcessEnv,
+    allowRepoLocalBin: false,
+  });
+  let processManager!: McpProcessSessionManager;
+  processManager = new McpProcessSessionManager({
+    configuredEnv,
+    onComplete: (event) => recordCodingProcessCompletion({
+      repoRoot,
+      policy,
+      ownerId,
+      workspaceManager,
+      processManager,
+    }, event),
+  });
+  const runtime: McpCodingRuntime = {
+    repoRoot,
+    ownerId,
+    workspaceManager,
+    processManager,
+    codeGraphAdapter,
+  };
+  return runtime;
+}
+
+function attachCodingRuntime(ctx: McpToolContext, runtime: McpCodingRuntime): void {
+  if (runtime.repoRoot !== ctx.repoRoot) {
+    throw new Error('coding MCP runtime repo does not match the server repo');
+  }
+  ctx.sessionOwnerId = runtime.ownerId;
+  ctx.codingWorkspaceManager = runtime.workspaceManager;
+  ctx.processManager = runtime.processManager;
+  ctx.codeGraphAdapter = runtime.codeGraphAdapter;
+  codingRuntimeForContext.set(ctx, runtime);
+}
+
+export function createMcpCodingRuntime(opts: McpServerOptions, ownerId: string): McpCodingRuntime {
+  if (!ownerId.trim()) throw new Error('coding MCP runtime owner is required');
+  const ctx = createMcpToolContext({ ...opts, codingRuntime: null });
+  if (ctx.policy.profile !== 'coding') throw new Error('coding MCP runtime requires the coding profile');
+  const config = loadMcpLocalConfig();
+  const runtime = buildCodingRuntime(ctx.repoRoot, ctx.policy, config, ownerId);
+  activeCodingRuntimes.add(runtime);
+  return runtime;
+}
+
 export function createMcpToolContext(opts: McpServerOptions): McpToolContext {
   const repoRoot = resolveMcpRepoRoot(opts.repo ?? '.');
-  const config = loadMcpLocalConfig(repoRoot);
+  assertNoLegacyRepoScopeMcpConfig(repoRoot);
+  const config = loadMcpLocalConfig();
   const requestedProfile = opts.profile ?? config?.profile ?? 'planner';
   const profile = parseMcpProfile(requestedProfile === 'reader' ? 'planner' : requestedProfile);
+  if (profile === 'coding') {
+    if (config?.version !== 3 || config.profile !== 'coding' || config.coding?.enabled !== true) {
+      throw new Error('coding MCP is disabled; run setup with profile coding and an explicit read-write grant');
+    }
+    if (!readRegisteredRepoHarnessRepos({ adoptedOnly: true }).some((repo) => repo.accessMode === 'read_write')) {
+      throw new Error('coding MCP requires at least one adopted repo with an explicit read_write grant');
+    }
+    if (config.authorizationRevision !== repoHarnessAuthorizationRevision()) {
+      throw new Error('coding MCP authorization revision is stale; rerun coding setup');
+    }
+  }
   const envDevRunner = parseBooleanSetting(process.env.REPO_HARNESS_MCP_DEV_RUNNER);
   const configuredDevRunner = envDevRunner ?? config?.devMode?.agentRunner === true;
   const devAgentRunner = opts.enableDevRunner === true || configuredDevRunner;
@@ -108,7 +210,6 @@ export function createMcpToolContext(opts: McpServerOptions): McpToolContext {
   const registeredRepoRoots = registeredRepoHarnessRoots({ adoptedOnly: true });
   const currentRepoRoot = isRepoHarnessAdopted(repoRoot) ? [repoRoot] : [];
   const configuredDiscoveryRoots = Array.from(new Set([
-    ...currentRepoRoot,
     ...(config?.permissions?.discoveryRoots ?? []),
     ...(config?.permissions?.allowedRoots ?? []),
     ...(opts.allowedRoots ?? []),
@@ -125,14 +226,15 @@ export function createMcpToolContext(opts: McpServerOptions): McpToolContext {
   const readerEnabled = explicitReaderEnable ||
     configuredReaderEnable ||
     defaultRepoReader;
-  const policyAllowedRoots = normalizeAllowedRoots([
-    ...configuredAllowedRoots,
-    ...(readerEnabled ? registeredRepoRoots : []),
-    ...(readerEnabled ? currentRepoRoot : []),
+  const policyAllowedRoots = uniqueRoots([
+    ...normalizeAllowedRoots(configuredAllowedRoots),
+    ...(readerEnabled ? normalizeAllowedRoots(registeredRepoRoots, { skipDenied: true }) : []),
+    ...(readerEnabled ? normalizeAllowedRoots(currentRepoRoot, { skipDenied: true }) : []),
   ]);
-  const discoveryRoots = normalizeAllowedRoots([
-    ...configuredDiscoveryRoots,
-    ...registeredRepoRoots,
+  const discoveryRoots = uniqueRoots([
+    ...normalizeAllowedRoots(configuredDiscoveryRoots),
+    ...normalizeAllowedRoots(currentRepoRoot, { skipDenied: true }),
+    ...normalizeAllowedRoots(registeredRepoRoots, { skipDenied: true }),
   ]);
   const policy = getMcpPolicy(profile, {
     devAgentRunner,
@@ -142,23 +244,35 @@ export function createMcpToolContext(opts: McpServerOptions): McpToolContext {
     enableReader: readerEnabled,
     allowedRoots: policyAllowedRoots,
     discoveryRoots,
-    generalRepo: configuredGeneralRepoFlags(config),
   });
-  return {
+  const ctx: McpToolContext = {
     repoRoot,
     policy,
     workspaceManager: readerEnabled ? new WorkspaceManager({ allowedRoots: policyAllowedRoots, policy }) : undefined,
     enableChatgptBrowser: opts.enableChatgptBrowser === true,
   };
+  if (profile === 'coding') {
+    if (opts.codingRuntime !== null) {
+      const runtime = opts.codingRuntime ?? buildCodingRuntime(repoRoot, policy, config, `mcp_${randomUUID()}`);
+      attachCodingRuntime(ctx, runtime);
+    }
+  }
+  return ctx;
 }
 
 export function createRepoHarnessMcpServer(opts: McpServerOptions): Server {
   const ctx = createMcpToolContext(opts);
+  const codingRuntime = codingRuntimeForContext.get(ctx);
+  const ownsCodingRuntime = codingRuntime !== undefined && opts.codingRuntime === undefined;
+  if (codingRuntime) activeCodingRuntimes.add(codingRuntime);
   const server = new Server(
     { name: 'repo-harness-mcp', version: repoHarnessPackageVersion() },
     {
       capabilities: { tools: {} },
-      instructions: buildMcpServerInstructions({ readerEnabled: ctx.policy.capabilities.workspaceReader }),
+      instructions: buildMcpServerInstructions({
+        readerEnabled: ctx.policy.capabilities.workspaceReader,
+        codingEnabled: ctx.policy.capabilities.workspaceCoder,
+      }),
     },
   );
 
@@ -169,8 +283,12 @@ export function createRepoHarnessMcpServer(opts: McpServerOptions): Server {
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const name = request.params.name;
     const args = (request.params.arguments ?? {}) as Record<string, unknown>;
-    return callMcpTool(ctx, name, args);
+    return callMcpTool(ctx, name, args) as any;
   });
+
+  server.onclose = () => {
+    if (ownsCodingRuntime && codingRuntime) void shutdownMcpCodingRuntime(codingRuntime);
+  };
 
   return server;
 }

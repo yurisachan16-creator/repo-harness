@@ -5,10 +5,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null)"; then
+if [[ -n "${REPO_HARNESS_TARGET_REPO_ROOT:-}" ]]; then
+  cd "$REPO_HARNESS_TARGET_REPO_ROOT"
+elif REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null)"; then
   cd "$REPO_ROOT"
-elif [[ "$SCRIPT_DIR" == */.ai/harness/scripts ]]; then
-  cd "$SCRIPT_DIR/../../.."
 else
   cd "$SCRIPT_DIR/.."
 fi
@@ -30,7 +30,6 @@ extract_status() {
 }
 
 ACTIVE_PLAN_MARKER=".ai/harness/active-plan"
-LEGACY_ACTIVE_PLAN_MARKER=".claude/.active-plan"
 ACTIVE_WORKTREE_MARKER=".ai/harness/active-worktree"
 
 read_active_plan_marker() {
@@ -49,15 +48,13 @@ read_active_plan_marker() {
 }
 
 get_active_plan() {
-  read_active_plan_marker "$ACTIVE_PLAN_MARKER" \
-    || read_active_plan_marker "$LEGACY_ACTIVE_PLAN_MARKER"
+  read_active_plan_marker "$ACTIVE_PLAN_MARKER"
 }
 
 write_active_plan_marker() {
   local plan_file="$1"
-  mkdir -p "$(dirname "$ACTIVE_PLAN_MARKER")" "$(dirname "$LEGACY_ACTIVE_PLAN_MARKER")" "$(dirname "$ACTIVE_WORKTREE_MARKER")"
+  mkdir -p "$(dirname "$ACTIVE_PLAN_MARKER")" "$(dirname "$ACTIVE_WORKTREE_MARKER")"
   printf '%s' "$plan_file" > "$ACTIVE_PLAN_MARKER"
-  printf '%s' "$plan_file" > "$LEGACY_ACTIVE_PLAN_MARKER"
   pwd -P > "$ACTIVE_WORKTREE_MARKER"
 }
 

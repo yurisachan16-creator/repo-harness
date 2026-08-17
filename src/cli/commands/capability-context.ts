@@ -2,28 +2,17 @@ import { Command } from 'commander';
 import * as fs from 'fs';
 import * as path from 'path';
 import { execFileSync } from 'child_process';
+import {
+  CapabilitySourceError,
+  capabilitySourceMode,
+  findMatch,
+  readRegistry as readCapabilityRegistry,
+  type Capability,
+  type CapabilityRegistry,
+  type ContractFiles,
+} from '../../../scripts/capability-resolver';
 
-type ContractFiles = {
-  agents: string;
-  claude: string;
-};
-
-export type Capability = {
-  id: string;
-  domain: string;
-  name: string;
-  prefixes: string[];
-  contract_files: ContractFiles;
-  architecture_module: string;
-  workstream_dir: string;
-  lsp_profile: string;
-  verification_hints: string[];
-};
-
-type CapabilityRegistry = {
-  version: number;
-  capabilities: Capability[];
-};
+export type { Capability, ContractFiles };
 
 type SourceMapEntry = {
   label: string;
@@ -100,6 +89,7 @@ export type SyncResult = {
 };
 
 const REGISTRY_PATH = '.ai/context/capabilities.json';
+const NODES_DIR = '.archcontext/model/nodes';
 const DEFAULT_MANIFEST_PATH = '.ai/context/capability-source-map.json';
 const QUEUE_PATH = '.ai/harness/capability-context/requests.jsonl';
 const ARCH_EVENTS_PATH = '.ai/harness/architecture/events.jsonl';
@@ -157,10 +147,12 @@ function writeJsonFile(file: string, value: unknown): void {
 }
 
 function readRegistry(repo: string): CapabilityRegistry {
-  return readJsonFile<CapabilityRegistry>(path.join(repo, REGISTRY_PATH), {
-    version: 1,
-    capabilities: [],
-  });
+  return readCapabilityRegistry(repo);
+}
+
+/** The file or directory that owns capabilities under the active source mode. */
+function capabilityAuthorityPath(repo: string): string {
+  return capabilitySourceMode(repo) === 'archcontext' ? NODES_DIR : REGISTRY_PATH;
 }
 
 function writeRegistry(repo: string, registry: CapabilityRegistry): void {
@@ -235,34 +227,18 @@ function targetContractFiles(repo: string, capability: Capability): ContractFile
   };
 }
 
-function matchesPrefix(relPath: string, prefix: string): boolean {
-  return relPath === prefix || relPath.startsWith(`${prefix}/`);
-}
-
+// Delegates the longest-prefix decision to capability-resolver's canonical findMatch
+// (see .ai/harness/policy.json capability_match_rule) instead of re-implementing the
+// sort/tie-break here.
 function findCapabilityByPath(registry: CapabilityRegistry, repo: string, inputPath: string): {
   capability: Capability;
   matchedPrefix: string;
 } {
-  const relPath = normalizeRepoPath(inputPath, repo);
-  const matches: Array<{ capability: Capability; prefix: string }> = [];
-  for (const capability of registry.capabilities) {
-    for (const rawPrefix of capability.prefixes || []) {
-      const prefix = normalizeRepoPath(rawPrefix, repo, true);
-      if (prefix === '.') continue;
-      if (matchesPrefix(relPath, prefix)) matches.push({ capability, prefix });
-    }
+  const match = findMatch(registry, repo, inputPath);
+  if (match.matched) {
+    return { capability: findCapabilityById(registry, match.capability_id), matchedPrefix: match.matched_prefix };
   }
-  matches.sort((a, b) => b.prefix.length - a.prefix.length);
-  if (matches[0]) return { capability: matches[0].capability, matchedPrefix: matches[0].prefix };
-
-  const root = registry.capabilities.find((capability) =>
-    (capability.prefixes || []).some((prefix) => {
-      const normalized = normalizeRepoPath(prefix, repo, true);
-      return normalized === '.' || isLikelyFile(repo, normalized);
-    }),
-  );
-  if (!root) throw new Error(`no capability matches path: ${inputPath}`);
-  return { capability: root, matchedPrefix: normalizeRepoPath(root.prefixes[0] || '.', repo, true) };
+  throw new Error(`no capability matches path: ${inputPath}`);
 }
 
 function findCapabilityById(registry: CapabilityRegistry, id: string): Capability {
@@ -352,7 +328,7 @@ export function runCapabilityContextStatus(repoInput = '.', manifestPath = DEFAU
   const pending = pendingRequests(repo);
   return {
     repo,
-    registry_file: REGISTRY_PATH,
+    registry_file: capabilityAuthorityPath(repo),
     source_map_manifest: manifestPath,
     queue_file: QUEUE_PATH,
     pending_requests: pending,
@@ -374,9 +350,9 @@ export function runCapabilityContextStatus(repoInput = '.', manifestPath = DEFAU
   };
 }
 
-function defaultManifestEntry(capability: Capability): ManifestCapability {
+function defaultManifestEntry(capability: Capability, authorityPath: string): ManifestCapability {
   return {
-    positioning: `Owns the ${capability.id} capability boundary declared in .ai/context/capabilities.json.`,
+    positioning: `Owns the ${capability.id} capability boundary declared in ${authorityPath}.`,
     source_map: [
       { label: 'Primary prefix', path: capability.prefixes[0] || '.', role: 'entrypoint' },
       { label: 'Architecture module', path: capability.architecture_module, role: 'design-source' },
@@ -392,10 +368,11 @@ function manifestEntryFor(
   capability: Capability,
   manifest: SourceMapManifest,
   autoFill: boolean,
+  authorityPath: string,
 ): { entry: ManifestCapability; changed: boolean } {
   const existing = manifest.capabilities[capability.id];
   if (existing) return { entry: existing, changed: false };
-  const generated = defaultManifestEntry(capability);
+  const generated = defaultManifestEntry(capability, authorityPath);
   if (autoFill) {
     manifest.capabilities[capability.id] = generated;
     return { entry: generated, changed: true };
@@ -461,6 +438,7 @@ export function runCapabilityContextSync(opts: SyncOptions): SyncResult {
   const repo = repoRoot(opts.repo);
   const apply = opts.apply === true;
   const manifestPath = opts.sourceMapManifest || DEFAULT_MANIFEST_PATH;
+  const authorityPath = capabilityAuthorityPath(repo);
   const registry = readRegistry(repo);
   const manifest = readManifest(repo, manifestPath);
   const capabilities = selectCapabilities(registry, repo, opts);
@@ -474,7 +452,7 @@ export function runCapabilityContextSync(opts: SyncOptions): SyncResult {
     const registryNormalized =
       capability.contract_files?.agents === target.agents &&
       capability.contract_files?.claude === target.claude;
-    const { entry, changed } = manifestEntryFor(capability, manifest, opts.autoFillPositioning === true);
+    const { entry, changed } = manifestEntryFor(capability, manifest, opts.autoFillPositioning === true, authorityPath);
     if (changed) changedManifestIds.add(capability.id);
     const block = renderCapabilityBlock(capability, entry);
     const basePath = fs.existsSync(path.join(repo, target.agents))
@@ -510,7 +488,20 @@ export function runCapabilityContextSync(opts: SyncOptions): SyncResult {
 
   let clearedRequests = 0;
   if (apply) {
-    writeRegistry(repo, registry);
+    // Under archcontext the JSON registry is retired, so contract_files drift
+    // has to be fixed in the node that declares it. Writing the registry here
+    // would recreate a second authority.
+    if (authorityPath === NODES_DIR) {
+      const drifted = changes.filter((change) => !change.registry_normalized).map((change) => change.capability_id);
+      if (drifted.length > 0) {
+        throw new CapabilitySourceError(
+          `capability source is "archcontext"; ${REGISTRY_PATH} is not writable. `
+            + `Update extensions.contractFiles in ${NODES_DIR} for: ${drifted.join(', ')}`,
+        );
+      }
+    } else {
+      writeRegistry(repo, registry);
+    }
     if (changedManifestIds.size > 0) writeManifest(repo, manifestPath, manifest);
     if (opts.pending) {
       const queueFile = path.join(repo, QUEUE_PATH);

@@ -107,11 +107,6 @@ describe('mcp policy and paths', () => {
       expect(policy.capabilities.workspaceReader).toBe(true);
       expect(policy.capabilities.workflowPlanner).toBe(true);
       expect(policy.capabilities.agentRunner).toBe(false);
-      expect(policy.generalRepo).toMatchObject({
-        general_repo_read: false,
-        repo_write: false,
-        fs_fallback: false,
-      });
       expect(policy.writeGlobs).toContain('plans/prds/**');
       expect(policy.allowAbsoluteRead).toBe(false);
       expect(resolveMcpPath(tmp, '.env', policy, 'read')).toMatchObject({ ok: false });
@@ -124,6 +119,8 @@ describe('mcp policy and paths', () => {
       expect(tools).toContain('tree');
       expect(tools).toContain('search_text');
       expect(tools).toContain('read_text');
+      expect(tools).toContain('repo_manifest');
+      expect(tools).toContain('write_file');
       expect(tools).not.toContain('run_agent_goal');
     } finally {
       rmSync(tmp, { recursive: true, force: true });
@@ -228,6 +225,33 @@ describe('mcp policy and paths', () => {
       expect(resolveMcpPath(tmp, 'plans/prds/existing.prd.md', orchestratorDev, 'read')).toMatchObject({ ok: false });
     } finally {
       rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('coding retains nineteen workflow tools and adds exactly five direct coding tools', () => {
+    const coding = getMcpPolicy('coding');
+    const definitions = buildMcpToolDefinitions(coding);
+    const codingNames = ['open_workspace', 'read', 'apply_patch', 'exec_command', 'write_stdin'];
+    expect(coding.capabilities).toMatchObject({
+      workflowPlanner: true,
+      workspaceReader: false,
+      workspaceCoder: true,
+    });
+    expect(coding.execution).toMatchObject({ codingShell: true, agentRunner: false, codexRunner: false });
+    expect(definitions).toHaveLength(24);
+    expect(definitions.filter((tool) => codingNames.includes(tool.name)).map((tool) => tool.name)).toEqual(codingNames);
+    expect(definitions.map((tool) => tool.name)).toContain('write_prd');
+    expect(definitions.map((tool) => tool.name)).toContain('prepare_codex_goal_from_sprint');
+    expect(new Set(definitions.map((tool) => tool.name)).size).toBe(definitions.length);
+    expect(definitions.find((tool) => tool.name === 'exec_command')?.annotations).toMatchObject({
+      destructiveHint: true,
+      openWorldHint: true,
+    });
+
+    for (const profile of ['planner', 'executor', 'orchestrator'] as const) {
+      const legacyNames = buildMcpToolDefinitions(getMcpPolicy(profile)).map((tool) => tool.name);
+      expect(legacyNames).not.toContain('exec_command');
+      expect(legacyNames).not.toContain('write_stdin');
     }
   });
 });

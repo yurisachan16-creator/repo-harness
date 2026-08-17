@@ -2,12 +2,32 @@
   "version": 1,
   "active_plan": {
     "marker_file": ".ai/harness/active-plan",
-    "legacy_marker_file": ".claude/.active-plan",
     "directory": "plans",
     "archive_directory": "plans/archive",
     "glob": "plan-*.md",
     "active_worktree_marker_file": ".ai/harness/active-worktree",
-    "source_of_truth": "per-worktree explicit marker with active-worktree owner; legacy Claude marker fallback only"
+    "source_of_truth": "per-worktree explicit marker with active-worktree owner",
+    "lifecycle": {
+      "annotation_end": "Annotating",
+      "approved": "Approved",
+      "executing": "Executing",
+      "terminal_start": "Complete"
+    },
+    "statuses": [
+      "Draft",
+      "Annotating",
+      "Approved",
+      "Executing",
+      "Blocked",
+      "Review",
+      "Complete",
+      "Completed",
+      "Done",
+      "Fulfilled",
+      "Archived",
+      "Abandoned",
+      "Superseded"
+    ]
   },
   "tasks": {
     "todo_file": "tasks/todos.md",
@@ -33,7 +53,7 @@
     "dir": "plans/sprints",
     "active_marker_file": ".ai/harness/sprint/active-sprint",
     "template_file": ".claude/templates/sprint.template.md",
-    "helper_script": ".ai/harness/scripts/sprint-backlog.sh",
+    "helper_script": "repo-harness run sprint-backlog",
     "statuses": [
       "Draft",
       "Approved",
@@ -65,17 +85,19 @@
     "ignored": [
       "_ops/"
     ],
-    "rule": "commit deployment runbooks, submission materials, release checklists, helper scripts, ordered SQL files, and env examples under deploy/; keep deploy SQL in deploy/sql/ with 4-digit ascending prefixes; keep keys, tokens, real env values, provider state, artifacts, logs, and scratch files in ignored _ops/ only"
+    "rule": "commit deployment runbooks, submission materials, release checklists, helper scripts, ordered SQL files, and env examples under deploy/; when operations.deploy_sql is absent, keep deploy SQL directly under deploy/sql/ with ordered4 names (4-digit ascending prefixes); when operations.deploy_sql is present, its roots, naming modes, and invariant_file are the sole alternate SQL-layout authority; keep keys, tokens, real env values, provider state, artifacts, logs, and scratch files in ignored _ops/ only"
   },
   "context": {
     "profile": "stable-root-progressive-subdir",
     "map_file": ".ai/context/context-map.json",
     "capability_registry_file": ".ai/context/capabilities.json",
-    "capability_resolver": ".ai/harness/scripts/capability-resolver.ts",
-    "capability_config": ".ai/harness/scripts/capability-config.ts",
+    "capability_resolver": "repo-harness run capability-resolver",
+    "capability_config": "repo-harness run capability-config",
     "capability_match_rule": "longest-prefix; same-length ambiguity fails",
+    "capability_source": "archcontext",
+    "capability_source_rule": "single authority selected by capability_source; registry reads .ai/context/capabilities.json, archcontext reads .archcontext/model/nodes/*.yaml; no dual-read and no fallback",
     "functional_block_selector": {
-      "script": ".ai/harness/scripts/select-agent-context-blocks.sh",
+      "script": "repo-harness run select-agent-context-blocks",
       "config_file": ".ai/context/agent-context-blocks.txt",
       "env": "REPO_HARNESS_CONTEXT_BLOCKS",
       "rule": "compatibility selector; capability registry is the source of truth"
@@ -89,10 +111,8 @@
     "events_file": ".ai/harness/events.jsonl",
     "architecture_events_file": ".ai/harness/architecture/events.jsonl",
     "runs_dir": ".ai/harness/runs",
-    "helper_runtime_dir": ".ai/harness/scripts",
-    "helper_compat_dir": "scripts",
-    "helper_source": "package",
-    "helper_package_dir": "assets/templates/helpers"
+    "helper_runtime_dir": "package:assets/templates/helpers",
+    "helper_source": "package"
   },
   "architecture": {
     "index_file": "docs/architecture/index.md",
@@ -104,12 +124,17 @@
     "diagram_skill": "mermaid",
     "diagram_skill_source": "~/.codex/skills/mermaid",
     "vendoring_policy": "do-not-vendor-diagram-skill-assets",
-    "freshness_gate": "advisory",
+    "projection_provider": "archctx",
+    "projection_apply": "automatic",
+    "projection_failure_gate": "strict",
+    "projection_version": "0.4.3",
+    "projection_timeout_ms": 120000,
+    "freshness_gate": "strict",
     "gate_min_severity": "medium",
     "pending_card_scope": "capability",
     "pending_block_begin": "<!-- BEGIN ARCHITECTURE PENDING REQUESTS -->",
     "pending_block_end": "<!-- END ARCHITECTURE PENDING REQUESTS -->",
-    "queue_script": ".ai/harness/scripts/architecture-queue.sh",
+    "queue_script": "repo-harness run architecture-queue",
     "contract_block_begin": "<!-- BEGIN ARCHITECTURE CONTRACT -->",
     "contract_block_end": "<!-- END ARCHITECTURE CONTRACT -->",
     "rule": "hooks record architecture queue cards and sync controlled local context blocks; agents author semantic snapshots and diagrams"
@@ -141,7 +166,7 @@
         ".ai/harness/policy.json",
         ".ai/harness/workflow-contract.json",
         ".ai/hooks/",
-        ".ai/harness/scripts/",
+        "package:assets/templates/helpers",
         "docs/reference-configs/"
       ],
       "promotion_rule": "only promote patterns after verified reuse across tasks or fixtures"
@@ -149,20 +174,18 @@
     "memory": {
       "sources": [
         "docs/researches/",
-        "tasks/lessons.md",
-        "gbrain"
+        "tasks/lessons.md"
       ],
       "rule": "memory is advisory; current repo state and evidence override summaries"
     },
     "external_knowledge": {
+      "mode": "manual-opt-in",
       "default_brain_path": "brain/<project>/*",
       "project_path": "brain/repo-harness/*",
       "manifest_file": ".ai/harness/brain-manifest.json",
-      "drift_check": ".ai/harness/scripts/check-brain-manifest.sh",
-      "sync_script": ".ai/harness/scripts/sync-brain-docs.sh",
-      "hook_trigger": "PostToolUse Edit|Write for manifest entries with sync.direction=repo-to-brain",
+      "sync_script": "repo-harness run sync-brain-docs",
       "rule": "external knowledge stores long-lived explanations, runbooks, and patterns only; repo-local contracts, hooks, scripts, checks, and evidence remain authoritative",
-      "sync_rule": "only explicitly opted-in repo-to-brain manifest entries may be written to the default brain vault; pointer-only externalized stubs remain check-only"
+      "sync_rule": "external sync and drift checks are operator-invoked only; hooks and workflow verification never read, write, or gate on external vault state"
     }
   },
   "handoff_resume": {
@@ -171,14 +194,14 @@
     "auto_start_new_session": false
   },
   "plan_capture": {
-    "script": ".ai/harness/scripts/capture-plan.sh",
+    "script": "repo-harness run capture-plan",
     "sources": [
       "codex-plan-mode",
       "waza-think",
       "repo-harness-plan",
       "repo-harness-sprint"
     ],
-    "rule": "Codex Plan mode and Waza think planning should capture decision-complete work-package plans into plans/plan-*.md only when Artifact Level is work-package and the Promotion Gate is concrete; implementation approval then projects the active approved work-package plan through .ai/harness/scripts/plan-to-todo.sh; checklist-row and inline sprint work stay in the sprint backlog or active plan Task Breakdown, while contract rows may expand with $think before capture/execution"
+    "rule": "Codex Plan mode and Waza think planning should capture decision-complete work-package plans into plans/plan-*.md only when Artifact Level is work-package and the Promotion Gate is concrete; implementation approval then projects the active approved work-package plan through repo-harness run plan-to-todo; checklist-row and inline sprint work stay in the sprint backlog or active plan Task Breakdown, while contract rows may expand with $think before capture/execution"
   },
   "planning": {
     "pending_orchestration_file": ".ai/harness/planning/pending.json",
@@ -195,12 +218,15 @@
   },
   "delegation": {
     "mode": "explicit",
-    "max_agents": 3,
+    "max_agents": 2,
+    "strict_max_agents": 3,
     "max_depth": 1,
     "allow_parallel_writers": false,
-    "stop_fallback": true,
     "state_file": ".ai/harness/delegation/latest.json",
-    "rule": "UserPromptSubmit.delegation only injects bounded subagent context after explicit user authorization such as /delegate, /parallel, spawn subagents, or parallel investigation"
+    "preferred_runners": ["subagent"],
+    "brief_source": "tasks/contracts/<stem>.contract.md",
+    "runner_rule": "the active task contract is the authoritative execution brief. Claude uses its native subagent surface. Codex uses native spawn_agent with the exact installed agent_type and fork_turns=none; official SubagentStart agent_type/model fields are the runtime observation. Missing, default, mismatched, invalid, or unverified native routing fails closed without an alternate fleet runner. Reasoning effort remains configured_unverified until Codex exposes an official runtime field.",
+    "rule": "UserPromptSubmit.delegation injects bounded delegation context only for the typed /delegate or /parallel command. Natural-language inference and SessionStart standing authorization are not delegation authorities."
   },
   "sidecar_research": {
     "default": true,
@@ -253,10 +279,11 @@
     "auto_for_contract_tasks": true,
     "branch_prefix": "codex/",
     "base_branch": "main",
+    "review_base": "origin/main",
     "worktree_dir_template": "../{{repo}}-wt-{{slug}}",
-    "start_script": ".ai/harness/scripts/contract-worktree.sh start --plan <plan-file>",
-    "finish_script": ".ai/harness/scripts/contract-worktree.sh finish",
-    "cleanup_script": ".ai/harness/scripts/contract-worktree.sh cleanup --slug <slug>",
+    "start_script": "repo-harness run contract-worktree start --plan <plan-file>",
+    "finish_script": "repo-harness run contract-worktree finish",
+    "cleanup_script": "repo-harness run contract-worktree cleanup --slug <slug>",
     "conflict_signals": [
       "dirty_worktree_overlaps_task_files",
       "current_branch_not_suitable_for_task",
@@ -269,6 +296,10 @@
       "requires_clean_check": true,
       "preserve_unrelated_changes": true
     }
+  },
+  "merge_gate": {
+    "enabled": true,
+    "rule": "the protected installed helper ignores caller source, helper, HOME, PATH, interpreter, and workflow-library overrides; it reads enablement from the exact target base commit, verifies the single host-owned AcceptanceReceipt, and writes a provider-free local seal bound to repository root, exact target base SHA, candidate head SHA, full-diff fingerprint, AcceptanceReceipt fingerprint, and helper fingerprint; semantic changes or overlapping target movement invalidate acceptance, while declared lifecycle-only changes and non-overlapping target movement require only a new local seal; missing, malformed, rejected, or stale receipts and seals fail closed"
   },
   "upgrade": {
     "strategy_version": 1,
@@ -306,9 +337,7 @@
   },
   "external_tooling": {
     "routing": {
-      "complex": "gstack",
-      "simple": "waza",
-      "knowledge": "gbrain"
+      "simple": "waza"
     },
     "hosts": [
       "claude-code",
@@ -316,7 +345,7 @@
     ],
     "mode": "agent-readiness-required",
     "detection": "init-migrate",
-    "readiness_gate": ".ai/harness/scripts/check-agent-tooling.sh --host codex --strict-readiness",
+    "readiness_gate": "repo-harness run check-agent-tooling --host codex --strict-readiness",
     "waza": {
       "source_repo": "tw93/Waza",
       "source_url": "https://github.com/tw93/Waza.git",
@@ -331,6 +360,37 @@
       "staging_cache_path": "~/.agents/skills",
       "sync_mode": "stage-upstream-then-copy-to-codex",
       "host_drift_policy": "report-per-host-version-staging-and-upstream-drift"
+    },
+    "hai_stack": {
+      "source_repo": "hylarucoder/hai-stack",
+      "source_url": "https://github.com/hylarucoder/hai-stack.git",
+      "managed_skills": [
+        "geju"
+      ],
+      "primary_host": "codex",
+      "codex_primary_path": "~/.codex/skills",
+      "staging_cache_path": "~/.agents/skills",
+      "sync_mode": "stage-upstream-then-copy-to-codex",
+      "host_drift_policy": "report-per-host-version-staging-and-upstream-drift"
+    },
+    "agent_fleet": {
+      "source": "package:agents/fleet",
+      "managed_agents": [
+        "explorer",
+        "deep-reasoner",
+        "fast-worker",
+        "deep-worker",
+        "gatekeeper",
+        "root-cause-prover",
+        "harness-evaluator"
+      ],
+      "claude_target": "~/.claude/agents",
+      "codex_target": "~/.codex/agents",
+      "codex_generation": "derive-toml-from-md",
+      "install_mode": "auto-install-on-init",
+      "conflict_policy": "never-clobber-without-force",
+      "install_command": "repo-harness run install-agent-fleet",
+      "source_policy": "repo-owned-single-authority"
     },
     "codex_automation_profile": {
       "required_skills": [
@@ -355,9 +415,6 @@
       "sync_mode": "external-installed-skill",
       "vendoring_policy": "do-not-vendor"
     },
-    "gbrain": {
-      "mcp": "candidate-disabled"
-    },
     "codegraph": {
       "package": "@colbymchenry/codegraph",
       "primary_host": "codex",
@@ -372,13 +429,26 @@
       "sync_command": "codegraph sync .",
       "vendoring_policy": "self-host-dev-dependency; downstream-generated-default-remains-do-not-add-package-dependency",
       "mcp_install_command": "npm install -g @colbymchenry/codegraph && mkdir -p ~/.local/bin && ln -sfn \"$(npm config get prefix)/bin/codegraph\" ~/.local/bin/codegraph && PATH=\"$HOME/.local/bin:$PATH\" codegraph install --target codex --location global --yes"
+    },
+    "archctx": {
+      "cli_package": "archctx",
+      "contracts_package": "archctx-contracts",
+      "contracts_scope": "release-gated-packed-schema-authority",
+      "install_mode": "release-gated-runtime-dependency-when-projection-enabled",
+      "readiness": "advisory",
+      "hook_policy": "do-not-block-hooks",
+      "vendoring_policy": "do-not-vendor",
+      "model_dir": ".archcontext/model",
+      "nodes_dir": ".archcontext/model/nodes",
+      "capability_source_key": ".ai/harness/policy.json#context.capability_source"
     }
   },
   "agentic_development": {
     "routing": {
-      "product_discovery": "gstack:office-hours",
-      "complex_engineering_plan": "gstack:plan-eng-review",
-      "design_plan": "gstack:plan-design-review",
+      "product_discovery": "parent-agent:geju",
+      "complex_engineering_plan": "parent-agent:geju",
+      "design_plan": "parent-agent:geju",
+      "design_options_choice": "convention:design-options",
       "small_or_medium_plan": "waza:think",
       "bug_or_regression": "waza:hunt",
       "post_implementation_review": "waza:check"
@@ -390,7 +460,7 @@
         "P3_DESIGN_DECISION"
       ],
       "explicit_report_required_for": [
-        "plan-eng-review",
+        "complex_engineering_plan",
         "hunt",
         "risky_refactor",
         "deployment",
@@ -423,10 +493,16 @@
     "report_path": ".ai/harness/checks/minimal-change.latest.json",
     "event_dedupe": true
   },
+  "circuit_breakers": {
+    "guard_repeat": 2,
+    "review": { "lite": 1, "standard": 1, "strict": 2 },
+    "subagents": { "default": 2, "strict_explicit_contract": 3 },
+    "repair_loops": 2,
+    "cross_model_consults_default": 0
+  },
   "enforcement": {
     "worktree_guard": "warn-by-default",
     "verification_gate": "contract-and-review",
     "completion_requires_checks": true
-  },
-  "hook_source": "repo"
+  }
 }

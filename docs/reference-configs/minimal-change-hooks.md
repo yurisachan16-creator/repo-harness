@@ -7,19 +7,21 @@ fail-open.
 
 ## Runtime Path
 
-- `SessionStart.default` runs `minimal-change-context.sh` after the normal
-  session context. It prints a short reminder of the active policy, protected
-  concerns, and report path.
-- `UserPromptSubmit.default` still routes only through `prompt-guard.sh`. When
-  the prompt is allowed and looks execution-oriented, prompt guard appends the
-  same advisory context.
-- `PostToolUse.edit` keeps `post-edit-guard.sh` first and then runs
-  `minimal-change-observer.sh`. The observer is silent unless policy explicitly
-  sets `post_edit_observer: true`; when enabled it writes a deterministic report
-  to `.ai/harness/checks/minimal-change.latest.json`.
-- `Stop.default` still routes through `stop-orchestrator.sh`. Stop review reads
-  the latest report and records summary evidence in the handoff. It does not
-  block the session by itself.
+- `SessionStart.default`'s in-process session-context builder
+  (`src/cli/hook/session-context.ts`, HRD-04) emits the minimal-change section
+  after the normal session context. It prints a short reminder of the active
+  policy, protected concerns, and report path.
+- `UserPromptSubmit.default` invokes the typed `prompt` handler. When the prompt
+  is allowed and looks execution-oriented, that handler appends the same
+  advisory context.
+- `PostToolUse.edit` invokes the typed `mutation-observed` handler, which then
+  runs the minimal-change observer. The observer is silent unless policy
+  explicitly sets `post_edit_observer: true`; when enabled it writes a
+  deterministic report to `.ai/harness/checks/minimal-change.latest.json`.
+- `Stop.default` runs the in-process `src/cli/hook/stop-handler.ts`. Stop
+  review reads the canonical latest report for diagnostics and block-reason
+  suffixes without rewriting the recovery handoff. It does not block the
+  session by itself.
 
 ## Policy
 
@@ -55,8 +57,8 @@ The policy lives at `.ai/harness/policy.json` under `minimal_change`:
 Missing or malformed policy disables the layer. `mode: "off"` also disables it.
 `mode: "advice"` enables advisory context and Stop review; the post-edit
 observer stays opt-in through `post_edit_observer: true`. `mode: "enforce"` is
-accepted for compatibility but normalized to advisory behavior so
-minimal-change findings never become a host-level block.
+treated as advisory behavior in this layer, so minimal-change findings never
+become a host-level block.
 
 ## Report Contract
 
@@ -78,3 +80,22 @@ network calls, model calls, or external state.
 Minimal-change hooks are review evidence. They can tell the agent and reviewer
 where the edit may have grown beyond the smallest coherent change, but they do
 not replace the active plan, contract, tests, or human review card.
+
+## Change Assessment Boundary
+
+Hook reports and `.ai/harness/events.jsonl` remain advisory and fail-open: a
+missing observer, malformed journal, or a hook crash must not create or remove
+merge authority. At `verify-sprint --prepare-acceptance`, Change Assessment v1
+instead recomputes the normalized final subject from the sole policy-owned base
+`.ai/harness/policy.json#worktree_strategy.review_base`. Missing/malformed
+policy, an unobservable final subject, an invalid packet, or an unmet declared
+oracle fails that verification boundary closed.
+
+The assessment has no model or Hook-journal input. It emits only the closed
+reason vocabulary `authority_change`, `irreversible_effect`,
+`pattern_novelty`, `reviewer_disagreement`, and `oracle_gap`. A later reviewer
+may append `reviewer_disagreement` for paths already bound to the packet, but
+cannot remove a reason, lower a selection, or change the packet subject/target.
+The overlay is not authority until the next `verify-sprint --prepare-acceptance`
+recomputes and binds it into canonical evidence; finalization fails closed if
+the prepared checks still contain the prior packet.

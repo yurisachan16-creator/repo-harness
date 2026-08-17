@@ -1,18 +1,24 @@
 #!/usr/bin/env bun
 import {
-  chmodSync,
   existsSync,
   lstatSync,
-  mkdirSync,
-  readdirSync,
   readFileSync,
-  renameSync,
-  rmSync,
-  writeFileSync,
 } from "fs";
-import { createHash } from "crypto";
-import { dirname, join, relative, resolve, sep } from "path";
+import { dirname, join, relative, resolve } from "path";
 import { fileURLToPath } from "url";
+import {
+  assertSafeProjectionPath,
+  collectProjectionFiles,
+  digestProjectionFiles,
+  normalizedProjectionMode,
+  sameProjectionBytes,
+  writeProjectionFileAtomic,
+  type ProjectionFileRecord,
+} from "../src/core/source-projection";
+import {
+  WORKFLOW_SURFACE_DIR_PREFIXES,
+  WORKFLOW_SURFACE_EXTENSIONS,
+} from "../src/effects/review/diff-fingerprint";
 
 type Mode = "check" | "write";
 
@@ -22,14 +28,6 @@ type ProjectionManifest = {
   projection_target: string;
   package_only?: string[];
   repo_only?: string[];
-};
-
-type FileRecord = {
-  relPath: string;
-  absPath: string;
-  bytes: Buffer;
-  mode: "100644" | "100755";
-  sha256: string;
 };
 
 type ProjectionMarker = {
@@ -70,32 +68,6 @@ function parseMode(argv: string[]): Mode {
   return mode;
 }
 
-function toPosixPath(path: string): string {
-  return path.split(sep).join("/");
-}
-
-function assertSafeRelativePath(relPath: string, field: string): void {
-  if (!relPath || relPath.startsWith("/") || relPath.includes("\\")) {
-    throw new Error(`${field} contains invalid path: ${relPath}`);
-  }
-  const parts = relPath.split("/");
-  if (parts.some((part) => part === "" || part === "." || part === "..")) {
-    throw new Error(`${field} contains unsafe path segment: ${relPath}`);
-  }
-}
-
-function normalizedMode(absPath: string): "100644" | "100755" {
-  return (lstatSync(absPath).mode & 0o111) === 0 ? "100644" : "100755";
-}
-
-function modeToPerm(mode: "100644" | "100755"): number {
-  return mode === "100755" ? 0o755 : 0o644;
-}
-
-function sha256(bytes: Buffer): string {
-  return createHash("sha256").update(bytes).digest("hex");
-}
-
 function readManifest(): ProjectionManifest {
   if (!existsSync(MANIFEST_PATH)) {
     throw new Error(`missing projection manifest: ${relative(REPO_ROOT, MANIFEST_PATH)}`);
@@ -111,62 +83,18 @@ function readManifest(): ProjectionManifest {
     throw new Error(`projection_target must be .ai/hooks`);
   }
   for (const relPath of [...(manifest.package_only ?? []), ...(manifest.repo_only ?? [])]) {
-    assertSafeRelativePath(relPath, "projection manifest");
+    assertSafeProjectionPath(relPath, "projection manifest");
   }
   return manifest;
 }
 
-function collectFiles(root: string, current = root): FileRecord[] {
-  const entries = readdirSync(current, { withFileTypes: true }).sort((a, b) =>
-    a.name < b.name ? -1 : a.name > b.name ? 1 : 0,
-  );
-  const out: FileRecord[] = [];
-
-  for (const entry of entries) {
-    const absPath = join(current, entry.name);
-    const relPath = toPosixPath(relative(root, absPath));
-    if (entry.isSymbolicLink()) {
-      throw new Error(`symlink is not allowed in hook projection: ${relPath}`);
-    }
-    if (entry.isDirectory()) {
-      out.push(...collectFiles(root, absPath));
-      continue;
-    }
-    if (!entry.isFile()) continue;
-
-    const bytes = readFileSync(absPath);
-    out.push({
-      relPath,
-      absPath,
-      bytes,
-      mode: normalizedMode(absPath),
-      sha256: sha256(bytes),
-    });
-  }
-
-  return out;
-}
-
-function digestManagedFiles(files: readonly FileRecord[]): string {
-  const hash = createHash("sha256");
-  for (const file of files) {
-    hash.update(file.relPath);
-    hash.update("\0");
-    hash.update(file.mode);
-    hash.update("\0");
-    hash.update(file.bytes);
-    hash.update("\0");
-  }
-  return `sha256:${hash.digest("hex")}`;
-}
-
-function markerFor(files: readonly FileRecord[]): ProjectionMarker {
+function markerFor(files: readonly ProjectionFileRecord[]): ProjectionMarker {
   return {
     version: 1,
     canonical_root: "assets/hooks",
     projection_target: ".ai/hooks",
     manifest: "assets/hooks/projection.json",
-    digest: digestManagedFiles(files),
+    digest: digestProjectionFiles(files),
     file_count: files.length,
   };
 }
@@ -175,16 +103,55 @@ function markerText(marker: ProjectionMarker): string {
   return `${JSON.stringify(marker, null, 2)}\n`;
 }
 
-function sameBytes(a: Buffer, b: Buffer): boolean {
-  return a.length === b.length && a.equals(b);
-}
+// Phase C2 (retired by HRD-03): assets/hooks/pre-edit-guard.sh's
+// is_workflow_surface_path() case list used to be a hand-authored shell
+// projection of the canonical TS source (src/effects/review/diff-fingerprint.ts's
+// WORKFLOW_SURFACE_DIR_PREFIXES / WORKFLOW_SURFACE_EXTENSIONS), so this
+// checked the two representations stayed in sync. HRD-03 (PreToolUse.edit
+// in-process cutover) deleted pre-edit-guard.sh and retired the shell
+// predicate entirely: src/cli/hook/mutation-guard.ts imports and calls
+// `isWorkflowSurfacePath` from diff-fingerprint.ts directly instead of
+// hand-copying it into a bash case statement. There is now no second
+// representation of this predicate anywhere in assets/hooks/ to drift from
+// the TS source -- confirmed via `grep -rl is_workflow_surface_path
+// assets/hooks/ .ai/hooks/` returning nothing. `workflowSurfaceParityErrors`
+// stays exported as a general, already-tested pure function (a future
+// script that hand-copies a TS predicate into a bash case list the same way
+// pre-edit-guard.sh used to could reuse it), but nothing in this file calls
+// it anymore -- there is no live check to retarget at "the surviving
+// authority" because there is no surviving hand-copy for it to check.
+export function workflowSurfaceParityErrors(source: string): string[] {
+  const functionMatch = /is_workflow_surface_path\(\)\s*\{([\s\S]*?)\n\}/.exec(source);
+  if (!functionMatch) {
+    return ["assets/hooks/pre-edit-guard.sh: is_workflow_surface_path() function not found"];
+  }
+  const patternLines = [...functionMatch[1].matchAll(/^\s*([^\s)\n][^)\n]*)\)\s*return 0\s*;;\s*$/gm)]
+    .map((match) => match[1]);
 
-function writeAtomic(absPath: string, bytes: Buffer | string, mode: "100644" | "100755"): void {
-  mkdirSync(dirname(absPath), { recursive: true });
-  const tmp = join(dirname(absPath), `.${relative(REPO_ROOT, absPath).replaceAll("/", "-")}.${process.pid}.tmp`);
-  writeFileSync(tmp, bytes);
-  chmodSync(tmp, modeToPerm(mode));
-  renameSync(tmp, absPath);
+  const expectedDirPattern = WORKFLOW_SURFACE_DIR_PREFIXES.map((prefix) => `${prefix}*`).join("|");
+  const expectedExtPattern = WORKFLOW_SURFACE_EXTENSIONS.map((ext) => `*${ext}`).join("|");
+
+  const errors: string[] = [];
+  // Guards against a case list that grew (or shrank) a "return 0" pattern
+  // line without the TS canonical source changing to match -- comparing only
+  // patternLines[0]/[1] by index would silently accept an extra, undeclared
+  // pattern line appended after the two expected ones.
+  if (patternLines.length !== 2) {
+    errors.push(
+      `is_workflow_surface_path drift: expected exactly 2 "return 0" case pattern lines (directory prefixes, extensions), found ${patternLines.length}: ${JSON.stringify(patternLines)}`,
+    );
+  }
+  if (patternLines[0] !== expectedDirPattern) {
+    errors.push(
+      `is_workflow_surface_path drift: directory prefixes expected "${expectedDirPattern}" got "${patternLines[0] ?? "<missing>"}"`,
+    );
+  }
+  if (patternLines[1] !== expectedExtPattern) {
+    errors.push(
+      `is_workflow_surface_path drift: extensions expected "${expectedExtPattern}" got "${patternLines[1] ?? "<missing>"}"`,
+    );
+  }
+  return errors;
 }
 
 function main(): void {
@@ -194,7 +161,7 @@ function main(): void {
   const repoOnly = new Set(manifest.repo_only ?? []);
   const errors: string[] = [];
 
-  const canonicalFiles = collectFiles(CANONICAL_ROOT);
+  const canonicalFiles = collectProjectionFiles(CANONICAL_ROOT);
   const managedFiles = canonicalFiles.filter((file) => !packageOnly.has(file.relPath));
   const marker = markerFor(managedFiles);
   const expectedMarker = markerText(marker);
@@ -205,7 +172,7 @@ function main(): void {
     }
   }
 
-  const targetFiles = existsSync(TARGET_ROOT) ? collectFiles(TARGET_ROOT) : [];
+  const targetFiles = existsSync(TARGET_ROOT) ? collectProjectionFiles(TARGET_ROOT) : [];
   const allowedTargetFiles = new Set([
     ...managedFiles.map((file) => file.relPath),
     ...repoOnly,
@@ -224,52 +191,63 @@ function main(): void {
     process.exit(1);
   }
 
+  // HRD-03 retired the only bash consumer of is_workflow_surface_path()
+  // (pre-edit-guard.sh); see the comment on workflowSurfaceParityErrors
+  // above. No hand-copied shell predicate survives to check parity against.
   const drift: string[] = [];
+  const blockedDrift: string[] = [];
   for (const file of managedFiles) {
     const targetPath = join(TARGET_ROOT, file.relPath);
     if (!existsSync(targetPath)) {
       drift.push(`missing managed file: .ai/hooks/${file.relPath}`);
-      if (mode === "write") writeAtomic(targetPath, file.bytes, file.mode);
+      if (mode === "write") writeProjectionFileAtomic(REPO_ROOT, targetPath, file.bytes, file.mode);
       continue;
     }
 
     const targetStat = lstatSync(targetPath);
     if (targetStat.isSymbolicLink()) {
       drift.push(`target symlink is not allowed: .ai/hooks/${file.relPath}`);
+      blockedDrift.push(`target symlink is not allowed: .ai/hooks/${file.relPath}`);
       continue;
     }
     if (!targetStat.isFile()) {
       drift.push(`target is not a file: .ai/hooks/${file.relPath}`);
+      blockedDrift.push(`target is not a file: .ai/hooks/${file.relPath}`);
       continue;
     }
 
     const targetBytes = readFileSync(targetPath);
-    const targetMode = normalizedMode(targetPath);
-    if (!sameBytes(targetBytes, file.bytes)) {
+    const targetMode = normalizedProjectionMode(targetPath);
+    if (!sameProjectionBytes(targetBytes, file.bytes)) {
       drift.push(`content drift: .ai/hooks/${file.relPath}`);
     }
     if (targetMode !== file.mode) {
       drift.push(`mode drift: .ai/hooks/${file.relPath} expected ${file.mode} got ${targetMode}`);
     }
-    if (mode === "write" && (!sameBytes(targetBytes, file.bytes) || targetMode !== file.mode)) {
-      writeAtomic(targetPath, file.bytes, file.mode);
+    if (mode === "write" && (!sameProjectionBytes(targetBytes, file.bytes) || targetMode !== file.mode)) {
+      writeProjectionFileAtomic(REPO_ROOT, targetPath, file.bytes, file.mode);
     }
   }
 
   if (!existsSync(MARKER_PATH)) {
     drift.push(`missing generated marker: .ai/hooks/${MARKER_REL_PATH}`);
-    if (mode === "write") writeAtomic(MARKER_PATH, expectedMarker, "100644");
+    if (mode === "write") writeProjectionFileAtomic(REPO_ROOT, MARKER_PATH, expectedMarker, "100644");
   } else {
     const currentMarker = readFileSync(MARKER_PATH, "utf-8");
     if (currentMarker !== expectedMarker) {
       drift.push(`generated marker drift: .ai/hooks/${MARKER_REL_PATH}`);
-      if (mode === "write") writeAtomic(MARKER_PATH, expectedMarker, "100644");
+      if (mode === "write") writeProjectionFileAtomic(REPO_ROOT, MARKER_PATH, expectedMarker, "100644");
     }
   }
 
   if (mode === "check" && drift.length > 0) {
     for (const item of drift) process.stderr.write(`[hooks] ${item}\n`);
     process.stderr.write("[hooks] Edit assets/hooks/<path>, then run bun run sync:hooks.\n");
+    process.exit(1);
+  }
+
+  if (mode === "write" && blockedDrift.length > 0) {
+    for (const item of blockedDrift) process.stderr.write(`[hooks] ${item}\n`);
     process.exit(1);
   }
 
@@ -285,10 +263,15 @@ function main(): void {
   );
 }
 
-try {
-  main();
-} catch (error) {
-  const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`[hooks] ${message}\n`);
-  process.exit(1);
+// Guarded so importing this module (e.g. to unit test workflowSurfaceParityErrors)
+// never runs main()/process.exit() as an import side effect; only running the
+// script directly (`bun scripts/sync-hook-sources.ts`) triggers it.
+if (import.meta.main) {
+  try {
+    main();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`[hooks] ${message}\n`);
+    process.exit(1);
+  }
 }

@@ -1,6 +1,6 @@
 {
-  "version": "0.8.2",
-  "templateVersion": "0.8.2",
+  "version": "0.15.2",
+  "templateVersion": "0.15.2",
   "skillName": "repo-harness",
   "contractId": "tasks-first-harness-v1",
   "compatibility": {
@@ -114,7 +114,7 @@
     },
     {
       "version": "0.4.2",
-      "description": "Adds the PRD-to-Sprint planning hierarchy, isolates generated-project helper runtime under .ai/harness/scripts, and installs the subagent return-channel guard"
+      "description": "Adds the PRD-to-Sprint planning hierarchy, package-scoped helper runtime routing, and the subagent return-channel guard"
     },
     {
       "version": "0.4.3",
@@ -130,7 +130,7 @@
     },
     {
       "version": "0.5.2",
-      "description": "Adds weekly tooling-update advisory caching, reviewed security exceptions, gbrain fast-doctor warning handling, and Claude review transcript recovery"
+      "description": "Adds weekly tooling-update advisory caching, reviewed security exceptions, external-tool fast-doctor warning handling, and Claude review transcript recovery"
     },
     {
       "version": "0.5.3",
@@ -175,6 +175,78 @@
     {
       "version": "0.8.2",
       "description": "Hardens two-tier plan artifact gates, rejects transient and inline projection misuse, keeps CodeGraph tooling on latest, and reduces completed workflow artifact noise"
+    },
+    {
+      "version": "0.8.3",
+      "description": "Keeps adopt and migration helper runtime package-only, removes local compatibility wrapper generation, and refreshes dependency lines to latest"
+    },
+    {
+      "version": "0.8.4",
+      "description": "Lets package-dispatched workstream sync resolve bundled helper siblings when downstream repos do not vendor legacy scripts"
+    },
+    {
+      "version": "0.8.5",
+      "description": "Repairs workspace-source Bun global installs that hit DependencyLoop by reinstalling from a packed tarball and adds packaged sprint-backlog target-root smoke coverage"
+    },
+    {
+      "version": "0.9.0",
+      "description": "Adds a bugfix task profile with root-cause evidence gating, distills contract-brief prompts and templates, makes the agent fleet and geju first-class dependencies, adds a frontend task profile and archcontext boundary bridge, and lands the EXECUTION_BOUNDARY anti-extras clause across delegated runners"
+    },
+    {
+      "version": "0.9.1",
+      "description": "Hardens the Bun-first installer and setup-check path with bunx skills probes, PATH readback hints, and explicit Codex delegation-mode selection"
+    },
+    {
+      "version": "0.9.2",
+      "description": "Hardens CLI environment diagnostics and hook execution intent while aligning the generated GPT-5.6 agent fleet with current Codex runtime guidance"
+    },
+    {
+      "version": "0.10.0",
+      "description": "Adds the risk-aware lite/standard/strict harness kernel with the effective-state resolver, decouples benchmark evidence production from verification gates with content-bound acceptance freshness, replaces the remote agent-fleet dependency with npm-packaged sources, and removes the retired planning provider and the Human Review Card dual authority"
+    },
+    {
+      "version": "0.10.1",
+      "description": "Converges Effective State into one core/effects authority shared by CLI, hooks, and MCP, and generates the standalone capability helper from one canonical registry implementation"
+    },
+    {
+      "version": "0.11.0",
+      "description": "Converges evidence-ledger projections, recovery views, and SessionStart context composition on canonical materializers and runtime authorities, with deterministic skill-surface discovery and packet-budget verification"
+    },
+    {
+      "version": "0.11.1",
+      "description": "Replaces host install profiles with minimal and full, defaults fresh installs to full with 7 or 11 Codex hooks, requires explicit protocol-1 migration, fixes empty child-argument forwarding under macOS Bash 3.2, and keeps evidence-ledger writes outside the review subject"
+    },
+    {
+      "version": "0.11.2",
+      "description": "Removes per-command ChecksFile context noise, keeps out-of-repo paths outside capability jurisdiction without weakening path validation, and resolves SessionStart Effective State in process with bounded retries and redaction-safe unavailable diagnostics"
+    },
+    {
+      "version": "0.11.3",
+      "description": "Adds ChatGPT delegate mode with a repo-owned dual-agent GPT Pro protocol and Claude/Codex host transports, enforces a mandatory pre-spawn Gitleaks scan over the rendered PromptBundle, and adds explicit host skill projection commands for the repo-harness-chatgpt package"
+    },
+    {
+      "version": "0.12.0",
+      "description": "Removes repo-harness adopt in favor of init as the sole repo-local adoption command, adds the deep-worker fleet agent, converges docs/reference-configs on a generated assets projection, and fixes MCP allowed-root canonicalization, an acceptance-receipt fingerprint defect, and contract-worktree squash-merge cleanup"
+    },
+    {
+      "version": "0.12.1",
+      "description": "Threads a single SessionStart-minted run identity through hook telemetry and evidence correlation, restructures the five-language README into a get-started-first layout, and refreshes the CodeGraph dev dependency line to latest"
+    },
+    {
+      "version": "0.12.2",
+      "description": "Makes agent-fleet drift checks receipt-aware, hardens verifier environment and provenance boundaries, and routes Codex delegation through model-pinned App Threads with fail-closed fallbacks"
+    },
+    {
+      "version": "0.12.3",
+      "description": "Adds an opt-in Claude-host main-loop dispatch guard that denies orchestrator code edits with a dispatch-to-subagent instruction, and makes Claude-host hook fixtures hermetic against that guard's environment key"
+    },
+    {
+      "version": "0.13.0",
+      "description": "Adds the long-run continuation protocol with a read-only ContinuationEnvelopeV1 from state next, AttemptReceiptV1 liveness receipts, and a no-progress circuit breaker; makes contract-worktree and ship-worktrees closeout a crash-durable, exclusively owned CloseoutJournalV1 transaction with explicit recover inspect|abort|reconcile; and publishes the host conformance contract with a sprint-backlog grammar drift check"
+    },
+    {
+      "version": "0.15.2",
+      "description": "Syncs archctx 0.4.3 with docs-renderer v3 so canonical-body-digest restamp churn stops, adds the repo-owned obsidian-memory dual-host skill facade with a runtime-referenced official Obsidian skills declaration, strips machine node-runtime authority from faked CLI test environments, and resolves archctx from the target repo before the CLI root so architecture projection drain no longer blocks after a global refresh"
     }
   ],
   "generatedProjectStamp": {

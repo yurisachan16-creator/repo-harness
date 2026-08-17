@@ -17,12 +17,14 @@
 
 import type { Location } from '../installer/types';
 import { ALL_TARGETS, getTarget, listTargetIds } from '../installer/targets/registry';
+import type { InstallProfile } from '../installer/install-profile';
 
 export type InstallTargetSpec = 'codex' | 'claude' | 'both';
 
 export interface InstallCommandOptions {
   target: InstallTargetSpec;
   location: Location;
+  profile?: InstallProfile;
 }
 
 export interface InstallCommandResult {
@@ -60,7 +62,7 @@ function runAdapterAction(action: AdapterAction, opts: InstallCommandOptions): I
     }
     try {
       const result = action === 'install'
-        ? target.install(opts.location, {})
+        ? target.install(opts.location, { profile: opts.profile })
         : target.uninstall(opts.location);
       for (const file of result.files) {
         lines.push(`[${target.id}] ${file.action}: ${file.path}`);

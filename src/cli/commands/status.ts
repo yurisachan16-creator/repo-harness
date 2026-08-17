@@ -12,9 +12,23 @@ import { execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { ALL_TARGETS } from '../installer/targets/registry';
 import { ROUTES, routesForHost } from '../hook/route-registry';
-import { isManagedEntry, type HooksByEvent } from '../installer/managed-entries';
+import {
+  buildManagedHooks,
+  isManagedEntry,
+  type HookHost,
+  type HooksByEvent,
+} from '../installer/managed-entries';
 import { readJsonOrEmpty } from '../installer/shared';
 import type { Location } from '../installer/types';
+import {
+  installProfileStatePath,
+  readInstalledProfile,
+  type InstallComponent,
+  type InstallProfile,
+  readLegacyInstalledProfileForMigration,
+} from '../installer/install-profile';
+import { inspectArchitectureProjectionReadiness } from '../../effects/architecture/archctx-provider';
+import type { ArchitectureProjectionReadinessV1 } from '../../core/architecture/projection';
 
 function packageVersion(): string {
   const packagePath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'package.json');
@@ -50,6 +64,20 @@ export interface StatusReport {
     optInMarker: string;
   };
   routes: { total: number; byEvent: Record<string, number> };
+  installedProfile:
+    | { recorded: true; profile: InstallProfile; components: readonly InstallComponent[] }
+    | { recorded: false }
+    // install-state.json exists but normal protocol-2 validation rejected it.
+    // A valid protocol-1 file is explicitly migratable; malformed legacy or
+    // current state is not, and must not receive a migration command that is
+    // guaranteed to fail.
+    | {
+        recorded: 'invalid';
+        kind: 'legacy_protocol' | 'corrupt_current';
+        error: string;
+        path: string;
+      };
+  architectureProjection?: ArchitectureProjectionReadinessV1 | { error: string };
 }
 
 function resolveRepoRoot(cwd: string): string | null {
@@ -78,16 +106,53 @@ function countManagedEntries(filePath: string): number {
   }
 }
 
+function expectedManagedEntryCount(
+  host: HookHost,
+  installedProfile: StatusReport['installedProfile'],
+): number {
+  if (installedProfile.recorded !== true) return routesForHost(host).length;
+  return Object.values(buildManagedHooks(host, installedProfile.profile))
+    .reduce((count, entries) => count + entries.length, 0);
+}
+
+function readInstalledProfileForStatus(): StatusReport['installedProfile'] {
+  const statePath = installProfileStatePath();
+  try {
+    const state = readInstalledProfile();
+    if (!state) return { recorded: false };
+    if (!Array.isArray(state.components)) {
+      return {
+        recorded: 'invalid',
+        kind: 'corrupt_current',
+        error: `installed profile state has a malformed components field (expected an array): ${statePath}`,
+        path: statePath,
+      };
+    }
+    return { recorded: true, profile: state.profile, components: state.components };
+  } catch (error) {
+    let kind: 'legacy_protocol' | 'corrupt_current' = 'corrupt_current';
+    try {
+      readLegacyInstalledProfileForMigration();
+      kind = 'legacy_protocol';
+    } catch {
+      // Only a fully valid protocol-1 state is migratable. Malformed JSON,
+      // malformed legacy state, and invalid protocol-2 state stay diagnostic.
+    }
+    return { recorded: 'invalid', kind, error: (error as Error).message, path: statePath };
+  }
+}
+
 export function runStatus(cwd: string = process.cwd()): StatusReport {
   const byEvent: Record<string, number> = {};
   for (const r of ROUTES) {
     byEvent[r.event] = (byEvent[r.event] ?? 0) + 1;
   }
 
+  const installedProfile = readInstalledProfileForStatus();
   const targets: StatusReport['targets'] = [];
   for (const target of ALL_TARGETS) {
     if (!target.supportsLocation('global')) continue;
-    const expectedEntryCount = routesForHost(target.id).length;
+    const expectedEntryCount = expectedManagedEntryCount(target.id, installedProfile);
     const det = target.detect('global');
     const managedEntryCount = det.configPath ? countManagedEntries(det.configPath) : 0;
     targets.push({
@@ -113,7 +178,23 @@ export function runStatus(cwd: string = process.cwd()): StatusReport {
     repo.optIn = fs.existsSync(path.join(repoRoot, OPT_IN_MARKER));
   }
 
-  return { cli: { version: CLI_VERSION }, targets, repo, routes: { total: ROUTES.length, byEvent } };
+  let architectureProjection: StatusReport['architectureProjection'];
+  if (repoRoot && repo.optIn) {
+    try {
+      architectureProjection = inspectArchitectureProjectionReadiness(repoRoot);
+    } catch (error) {
+      architectureProjection = { error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  return {
+    cli: { version: CLI_VERSION },
+    targets,
+    repo,
+    routes: { total: ROUTES.length, byEvent },
+    installedProfile,
+    ...(architectureProjection ? { architectureProjection } : {}),
+  };
 }
 
 export function formatStatus(report: StatusReport, asJson = false): string {
@@ -137,12 +218,33 @@ export function formatStatus(report: StatusReport, asJson = false): string {
     lines.push(`    ${event}: ${count}`);
   }
   lines.push('');
+  lines.push('Installed profile:');
+  if (report.installedProfile.recorded === true) {
+    lines.push(`  profile: ${report.installedProfile.profile}`);
+    lines.push(`  components: ${report.installedProfile.components.join(', ') || '(none)'}`);
+  } else if (report.installedProfile.recorded === 'invalid') {
+    lines.push(`  (invalid): ${report.installedProfile.error}`);
+  } else {
+    lines.push('  (not recorded)');
+  }
+  lines.push('');
   lines.push('Current repo:');
   if (report.repo.inGitRepo) {
     lines.push(`  git root: ${report.repo.repoRoot}`);
     lines.push(`  opt-in (${report.repo.optInMarker}): ${report.repo.optIn ? 'yes' : 'no'}`);
   } else {
     lines.push('  not in a git repo');
+  }
+  if (report.architectureProjection) {
+    lines.push('');
+    lines.push('Architecture projection:');
+    if ('error' in report.architectureProjection) lines.push(`  error: ${report.architectureProjection.error}`);
+    else {
+      lines.push(`  model authority: ${report.architectureProjection.modelAuthority.source} (${report.architectureProjection.modelAuthority.ready ? 'ready' : 'blocked'})`);
+      lines.push(`  provider: ${report.architectureProjection.projectionProvider.provider} (${report.architectureProjection.projectionProvider.state})`);
+      lines.push(`  code facts: ${report.architectureProjection.codeFacts.state}`);
+      lines.push(`  apply: ${report.architectureProjection.apply.mode}`);
+    }
   }
   return lines.join('\n');
 }

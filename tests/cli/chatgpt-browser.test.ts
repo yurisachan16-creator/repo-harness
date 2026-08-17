@@ -1,12 +1,16 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, test, setDefaultTimeout } from 'bun:test';
 import { spawnSync } from 'child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'fs';
+import { createHash } from 'crypto';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs';
 import { homedir, tmpdir } from 'os';
 import { join } from 'path';
+import { runBrowserConsult, runBrowserFollowup } from '../../src/cli/chatgpt-browser/engine';
 import { assertChatGptMcpContract } from '../helpers/chatgpt-mcp-contract';
 
 const ROOT = join(import.meta.dir, '../..');
 const CLI = join(ROOT, 'src/cli/index.ts');
+
+setDefaultTimeout(180000);
 
 function runChatgpt(args: string[], cwd = ROOT, env: NodeJS.ProcessEnv = process.env) {
   return spawnSync('bun', [CLI, 'chatgpt', ...args], {
@@ -30,6 +34,35 @@ function withRepo<T>(fn: (repoRoot: string) => T): T {
   }
 }
 
+async function withAsyncRepo<T>(fn: (repoRoot: string) => Promise<T>): Promise<T> {
+  const repoRoot = mkdtempSync(join(tmpdir(), 'repo-harness-chatgpt-browser-'));
+  try {
+    mkdirSync(join(repoRoot, 'docs'), { recursive: true });
+    writeFileSync(join(repoRoot, 'docs/example.md'), '# Docs\n');
+    return await fn(repoRoot);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+}
+
+function writeFakeGitleaks(dir: string, version = '8.30.0'): string {
+  const path = join(dir, 'gitleaks');
+  writeFileSync(path, [
+    '#!/usr/bin/env bun',
+    `const VERSION = ${JSON.stringify(version)};`,
+    "if (process.argv.includes('version')) { console.log(VERSION); process.exit(0); }",
+    "const required = ['--redact=100', '--ignore-gitleaks-allow', 'stdin'];",
+    'if (required.some((flag) => !process.argv.includes(flag))) process.exit(3);',
+    'if (process.env.GITLEAKS_CONFIG || process.env.GITLEAKS_CONFIG_TOML) process.exit(4);',
+    'if (process.env.FAKE_GITLEAKS_REPO_ROOT && process.cwd() === process.env.FAKE_GITLEAKS_REPO_ROOT) process.exit(5);',
+    'const input = await Bun.stdin.text();',
+    'if (process.env.FAKE_GITLEAKS_MUTATE_PATH) await Bun.write(process.env.FAKE_GITLEAKS_MUTATE_PATH, process.env.FAKE_GITLEAKS_MUTATE_CONTENT || "");',
+    "process.exit(input.includes('SYNTHETIC_DELEGATE_SECRET') ? 1 : 0);",
+  ].join('\n') + '\n');
+  chmodSync(path, 0o755);
+  return path;
+}
+
 describe('chatgpt browser command', () => {
   test('prints help for browser command group', () => {
     const root = runChatgpt(['--help']);
@@ -38,6 +71,8 @@ describe('chatgpt browser command', () => {
     expect(root.stdout).toContain('browser-followup');
     expect(root.stdout).toContain('browser-session');
     expect(root.stdout).toContain('browser-doctor');
+    expect(root.stdout).toContain('install-skill');
+    expect(root.stdout).toContain('uninstall-skill');
     expect(root.stdout).not.toContain('browser-bind');
     expect(root.stdout).toContain('browser-open');
     expect(root.stdout).toContain('browser-cleanup');
@@ -62,7 +97,266 @@ describe('chatgpt browser command', () => {
     expect(consult.stdout).toContain('--allow-absolute-output');
     expect(consult.stdout).toContain('--heartbeat');
     expect(consult.stdout).toContain('--chatgpt-app');
+    expect(consult.stdout).toContain('--secret-scan');
+    expect(consult.stdout).toContain('--gitleaks-bin');
+  }, 30_000);
+
+  test('secret scan covers the exact prompt bundle and follow-ups fail closed before a new session', () => {
+    withRepo((repoRoot) => {
+      const binDir = mkdtempSync(join(tmpdir(), 'repo-harness-fake-gitleaks-'));
+      try {
+        const gitleaksPath = writeFakeGitleaks(binDir);
+        const env = {
+          ...process.env,
+          REPO_HARNESS_GITLEAKS_BIN: gitleaksPath,
+          GITLEAKS_CONFIG: join(repoRoot, '.gitleaks.toml'),
+          GITLEAKS_CONFIG_TOML: '[allowlist]\n',
+          FAKE_GITLEAKS_REPO_ROOT: repoRoot,
+        };
+        writeFileSync(join(repoRoot, '.gitleaks.toml'), '[allowlist]\n');
+        const clean = runChatgpt([
+          'browser-consult',
+          '--repo',
+          repoRoot,
+          '--dry-run',
+          '--secret-scan',
+          '--prompt',
+          'Review this clean bundle.',
+          '--file',
+          'docs/example.md',
+        ], ROOT, env);
+        expect(clean.status).toBe(0);
+        const payload = JSON.parse(clean.stdout);
+        expect(payload.dryRun.secretScan).toMatchObject({
+          scanner: 'gitleaks',
+          version: '8.30.0',
+          source: 'REPO_HARNESS_GITLEAKS_BIN',
+          status: 'passed',
+        });
+        const exactPrompt = readFileSync(payload.paths.prompt, 'utf-8');
+        expect(payload.dryRun.secretScan.payloads).toEqual([{
+          kind: 'prompt',
+          index: 0,
+          bytes: Buffer.byteLength(exactPrompt, 'utf-8'),
+          sha256: createHash('sha256').update(exactPrompt, 'utf-8').digest('hex'),
+        }]);
+        const meta = JSON.parse(readFileSync(join(repoRoot, '.ai/harness/chatgpt/sessions', payload.sessionId, 'meta.json'), 'utf-8'));
+        expect(meta.security.promptSecretScan).toEqual(payload.dryRun.secretScan);
+
+        const sessionsRoot = join(repoRoot, '.ai/harness/chatgpt/sessions');
+        const before = readdirSync(sessionsRoot).sort();
+        const rejectedFollowup = runChatgpt([
+          'browser-followup',
+          '--repo',
+          repoRoot,
+          '--session',
+          payload.sessionId,
+          '--dry-run',
+          '--prompt',
+          'SYNTHETIC_DELEGATE_SECRET',
+        ], ROOT, env);
+        expect(rejectedFollowup.status).toBe(2);
+        expect(rejectedFollowup.stderr).toContain('PROMPT_SECRET_SCAN_FAILED');
+        expect(rejectedFollowup.stderr).not.toContain('SYNTHETIC_DELEGATE_SECRET');
+        expect(readdirSync(sessionsRoot).sort()).toEqual(before);
+      } finally {
+        rmSync(binDir, { recursive: true, force: true });
+      }
+    });
+  }, 30_000);
+
+  test('a scan-bound source session cannot disable inherited scanning programmatically', async () => {
+    await withAsyncRepo(async (repoRoot) => {
+      const binDir = mkdtempSync(join(tmpdir(), 'repo-harness-fake-gitleaks-inheritance-'));
+      try {
+        const gitleaksBin = writeFakeGitleaks(binDir);
+        const source = await runBrowserConsult({
+          repoRoot,
+          prompt: 'Review this clean bundle.',
+          files: [{ path: 'docs/example.md' }],
+          dryRun: true,
+          requireSecretScan: true,
+          gitleaksBin,
+        });
+        const before = readdirSync(join(repoRoot, '.ai/harness/chatgpt/sessions')).sort();
+        await expect(runBrowserFollowup({
+          repoRoot,
+          sessionId: source.sessionId,
+          prompt: 'SYNTHETIC_DELEGATE_SECRET',
+          dryRun: true,
+          requireSecretScan: false,
+          gitleaksBin,
+        })).rejects.toThrow('PROMPT_SECRET_SCAN_FAILED');
+        expect(readdirSync(join(repoRoot, '.ai/harness/chatgpt/sessions')).sort()).toEqual(before);
+      } finally {
+        rmSync(binDir, { recursive: true, force: true });
+      }
+    });
   });
+
+  test('secret scan rejects findings, missing binaries, and incompatible versions before session creation', () => {
+    withRepo((repoRoot) => {
+      const binDir = mkdtempSync(join(tmpdir(), 'repo-harness-fake-gitleaks-errors-'));
+      try {
+        const scanner = writeFakeGitleaks(binDir);
+        writeFileSync(join(repoRoot, 'docs/example.md'), 'SYNTHETIC_DELEGATE_SECRET # gitleaks:allow\n');
+        const finding = runChatgpt([
+          'browser-consult',
+          '--repo',
+          repoRoot,
+          '--dry-run',
+          '--secret-scan',
+          '--gitleaks-bin',
+          scanner,
+          '--prompt',
+          'Read the staged context.',
+          '--file',
+          'docs/example.md',
+        ]);
+        expect(finding.status).toBe(2);
+        expect(finding.stderr).toContain('PROMPT_SECRET_SCAN_FAILED');
+        expect(finding.stderr).not.toContain('SYNTHETIC_DELEGATE_SECRET');
+        expect(existsSync(join(repoRoot, '.ai/harness/chatgpt/sessions'))).toBe(false);
+
+        const unboundBinary = runChatgpt([
+          'browser-consult',
+          '--repo',
+          repoRoot,
+          '--dry-run',
+          '--gitleaks-bin',
+          scanner,
+          '--prompt',
+          'Clean prompt.',
+        ]);
+        expect(unboundBinary.status).toBe(2);
+        expect(unboundBinary.stderr).toContain('--gitleaks-bin requires --secret-scan');
+        expect(existsSync(join(repoRoot, '.ai/harness/chatgpt/sessions'))).toBe(false);
+
+        const missing = runChatgpt([
+          'browser-consult',
+          '--repo',
+          repoRoot,
+          '--dry-run',
+          '--secret-scan',
+          '--gitleaks-bin',
+          join(binDir, 'missing-gitleaks'),
+          '--prompt',
+          'Clean prompt.',
+        ]);
+        expect(missing.status).toBe(2);
+        expect(missing.stderr).toContain('PROMPT_SECRET_SCAN_UNAVAILABLE');
+        expect(existsSync(join(repoRoot, '.ai/harness/chatgpt/sessions'))).toBe(false);
+
+        const incompatible = writeFakeGitleaks(binDir, '8.18.4');
+        const old = runChatgpt([
+          'browser-consult',
+          '--repo',
+          repoRoot,
+          '--dry-run',
+          '--secret-scan',
+          '--gitleaks-bin',
+          incompatible,
+          '--prompt',
+          'Clean prompt.',
+        ]);
+        expect(old.status).toBe(2);
+        expect(old.stderr).toContain('version >= 8.19');
+        expect(existsSync(join(repoRoot, '.ai/harness/chatgpt/sessions'))).toBe(false);
+      } finally {
+        rmSync(binDir, { recursive: true, force: true });
+      }
+    });
+  }, 30_000);
+
+  test('scan-bound Oracle sends immutable captured file bytes instead of a post-scan source mutation', () => {
+    withRepo((repoRoot) => {
+      const binDir = mkdtempSync(join(tmpdir(), 'repo-harness-scan-bound-oracle-'));
+      try {
+        const sourcePath = join(repoRoot, 'docs/example.md');
+        writeFileSync(sourcePath, 'ORIGINAL_SCANNED_CONTEXT\n');
+        const gitleaksPath = writeFakeGitleaks(binDir);
+        const oraclePath = join(binDir, 'oracle');
+        writeFileSync(oraclePath, [
+          '#!/bin/sh',
+          'OUT=""',
+          'FILE=""',
+          'PREV=""',
+          'for a in "$@"; do',
+          '  if [ "$PREV" = "--write-output" ]; then OUT="$a"; fi',
+          '  if [ "$PREV" = "--file" ]; then FILE="$a"; fi',
+          '  PREV="$a"',
+          'done',
+          'printf "%s\\n" "FILE_PATH=$FILE" > "$OUT"',
+          '/bin/cat "$FILE" >> "$OUT"',
+        ].join('\n') + '\n');
+        chmodSync(oraclePath, 0o755);
+
+        const result = runChatgpt([
+          'browser-consult',
+          '--repo',
+          repoRoot,
+          '--secret-scan',
+          '--gitleaks-bin',
+          gitleaksPath,
+          '--oracle-bin',
+          oraclePath,
+          '--prompt',
+          'Read the attached context.',
+          '--file',
+          'docs/example.md',
+        ], ROOT, {
+          ...process.env,
+          FAKE_GITLEAKS_MUTATE_PATH: sourcePath,
+          FAKE_GITLEAKS_MUTATE_CONTENT: 'SYNTHETIC_DELEGATE_SECRET\n',
+        });
+        expect(result.status).toBe(0);
+        const payload = JSON.parse(result.stdout);
+        expect(payload.status).toBe('completed');
+        const output = readFileSync(payload.paths.output, 'utf-8');
+        expect(output).toContain('repo-harness-oracle-egress-');
+        expect(output).toContain('ORIGINAL_SCANNED_CONTEXT');
+        expect(output).not.toContain('SYNTHETIC_DELEGATE_SECRET');
+        expect(readFileSync(sourcePath, 'utf-8')).toBe('SYNTHETIC_DELEGATE_SECRET\n');
+      } finally {
+        rmSync(binDir, { recursive: true, force: true });
+      }
+    });
+  }, 30_000);
+
+  test('explicit skill projection is canonical, idempotent, reversible, and refuses unowned destinations', () => {
+    const testHome = mkdtempSync(join(tmpdir(), 'repo-harness-chatgpt-skill-home-'));
+    try {
+      const env = { ...process.env, HOME: testHome, REPO_HARNESS_SOURCE_ROOT: ROOT };
+      const install = runChatgpt(['install-skill', '--target', 'both'], ROOT, env);
+      expect(install.status).toBe(0);
+      const canonical = realpathSync(join(ROOT, 'assets/skills/repo-harness-chatgpt'));
+      const claudeSkill = join(testHome, '.claude/skills/repo-harness-chatgpt');
+      const codexSkill = join(testHome, '.codex/skills/repo-harness-chatgpt');
+      for (const destination of [claudeSkill, codexSkill]) {
+        expect(lstatSync(destination).isSymbolicLink()).toBe(true);
+        expect(realpathSync(destination)).toBe(canonical);
+      }
+
+      const reinstall = runChatgpt(['install-skill', '--target', 'both'], ROOT, env);
+      expect(reinstall.status).toBe(0);
+      expect(reinstall.stdout).toContain('[claude] already installed');
+      expect(reinstall.stdout).toContain('[codex] already installed');
+
+      const uninstall = runChatgpt(['uninstall-skill', '--target', 'both'], ROOT, env);
+      expect(uninstall.status).toBe(0);
+      expect(existsSync(claudeSkill)).toBe(false);
+      expect(existsSync(codexSkill)).toBe(false);
+
+      mkdirSync(codexSkill, { recursive: true });
+      const refused = runChatgpt(['uninstall-skill', '--target', 'both'], ROOT, env);
+      expect(refused.status).toBe(2);
+      expect(refused.stderr).toContain('refusing unowned ChatGPT Skill destination');
+      expect(existsSync(codexSkill)).toBe(true);
+      expect(existsSync(claudeSkill)).toBe(false);
+    } finally {
+      rmSync(testHome, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   test('dry-run consult writes a repo-local session with inline files', () => {
     withRepo((repoRoot) => {
@@ -131,7 +425,7 @@ describe('chatgpt browser command', () => {
       expect(cleanupPlan.status).toBe(0);
       expect(JSON.parse(cleanupPlan.stdout).dryRun).toBe(true);
     });
-  });
+  }, 30_000);
 
   test('denies secret files before writing a session', () => {
     withRepo((repoRoot) => {
@@ -149,7 +443,7 @@ describe('chatgpt browser command', () => {
       expect(result.stderr).toContain('path is denied by ChatGPT browser policy');
       expect(existsSync(join(repoRoot, '.ai/harness/chatgpt/sessions'))).toBe(false);
     });
-  });
+  }, 30_000);
 
   test('denies allowed-path symlink escapes before writing a session', () => {
     withRepo((repoRoot) => {
@@ -174,7 +468,7 @@ describe('chatgpt browser command', () => {
         rmSync(outside, { recursive: true, force: true });
       }
     });
-  });
+  }, 30_000);
 
   test('validates write-output path and overwrite policy before writing a session', () => {
     withRepo((repoRoot) => {
@@ -222,7 +516,7 @@ describe('chatgpt browser command', () => {
       expect(noOverwrite.stderr).toContain('write output already exists');
       expect(readFileSync(join(repoRoot, 'tasks/reviews/existing.md'), 'utf-8')).toBe('old\n');
     });
-  });
+  }, 30_000);
 
   test('native provider readiness and dry-run are wired without opening a browser', () => {
     withRepo((repoRoot) => {
@@ -303,7 +597,7 @@ describe('chatgpt browser command', () => {
       expect(unboundPayload.status).toBe('failed');
       expect(unboundPayload.error.code).toBe('NATIVE_PROFILE_NOT_BOUND');
     });
-  });
+  }, 30_000);
 
   test('rejects removed bridge provider and browser-bind command surfaces', () => {
     withRepo((repoRoot) => {
@@ -319,7 +613,7 @@ describe('chatgpt browser command', () => {
       expect(bind.status).not.toBe(0);
       expect(bind.stderr).toContain("unknown command 'browser-bind'");
     });
-  });
+  }, 30_000);
 
   test('browser setup binds a user-selected ChatGPT profile and native dry-run uses it', () => {
     withRepo((repoRoot) => {
@@ -391,7 +685,7 @@ describe('chatgpt browser command', () => {
       expect(meta.browser.selectedProfilePath).toBe(profileDir);
       expect(meta.browser.channel).toBe('chrome');
     });
-  });
+  }, 30_000);
 
   test('native provider blocks the default Chrome profile before CDP launch', () => {
     if (process.platform !== 'darwin') {
@@ -441,7 +735,7 @@ describe('chatgpt browser command', () => {
       expect(payload.error.recovery).toContain('Chrome 136+ requires a non-standard --user-data-dir');
       expect(readFileSync(payload.paths.output, 'utf-8')).toContain('Chrome 136+ requires a non-standard --user-data-dir');
     });
-  });
+  }, 30_000);
 
   test('oracle provider reads the --write-output answer file and treats stdout as logs', () => {
     withRepo((repoRoot) => {
@@ -528,7 +822,7 @@ describe('chatgpt browser command', () => {
         rmSync(binDir, { recursive: true, force: true });
       }
     });
-  });
+  }, 30_000);
 
   test('oracle provider uses the bound ChatGPT profile cookie database', () => {
     withRepo((repoRoot) => {
@@ -594,7 +888,7 @@ describe('chatgpt browser command', () => {
         rmSync(binDir, { recursive: true, force: true });
       }
     });
-  });
+  }, 30_000);
 
   test('oracle provider prefers modern Network/Cookies over legacy Cookies', () => {
     withRepo((repoRoot) => {
@@ -654,7 +948,7 @@ describe('chatgpt browser command', () => {
         rmSync(binDir, { recursive: true, force: true });
       }
     });
-  });
+  }, 30_000);
 
   test('oracle provider fails closed when the bound profile has no regular cookie database', () => {
     withRepo((repoRoot) => {
@@ -707,7 +1001,7 @@ describe('chatgpt browser command', () => {
         rmSync(binDir, { recursive: true, force: true });
       }
     });
-  });
+  }, 30_000);
 
   test('oracle provider downgrades an empty answer file to recoverable, not completed', () => {
     withRepo((repoRoot) => {
@@ -744,7 +1038,7 @@ describe('chatgpt browser command', () => {
         rmSync(binDir, { recursive: true, force: true });
       }
     });
-  });
+  }, 30_000);
 
   test('oracle provider maps thinking to Oracle browser thinking time', () => {
     withRepo((repoRoot) => {
@@ -791,7 +1085,7 @@ describe('chatgpt browser command', () => {
         rmSync(binDir, { recursive: true, force: true });
       }
     });
-  });
+  }, 30_000);
 
   test('oracle app preselection fails closed when the binary lacks browser-app support', () => {
     withRepo((repoRoot) => {
@@ -836,7 +1130,7 @@ describe('chatgpt browser command', () => {
         rmSync(binDir, { recursive: true, force: true });
       }
     });
-  });
+  }, 30_000);
 
   test('oracle provider passes ChatGPT app preselection to Oracle when supported', () => {
     withRepo((repoRoot) => {
@@ -884,7 +1178,7 @@ describe('chatgpt browser command', () => {
         rmSync(binDir, { recursive: true, force: true });
       }
     });
-  });
+  }, 30_000);
 
   test('oracle doctor probes binary capabilities and reports ready', () => {
     withRepo((repoRoot) => {
@@ -953,7 +1247,7 @@ describe('chatgpt browser command', () => {
         rmSync(binDir, { recursive: true, force: true });
       }
     });
-  });
+  }, 30_000);
 
   test('oracle doctor requires every runtime flag before reporting ready', () => {
     withRepo((repoRoot) => {
@@ -1006,7 +1300,7 @@ describe('chatgpt browser command', () => {
         rmSync(binDir, { recursive: true, force: true });
       }
     });
-  });
+  }, 30_000);
 
   test('oracle doctor repairs repo-local and env-selected binaries through source-aware actions', () => {
     withRepo((repoRoot) => {
@@ -1048,7 +1342,7 @@ describe('chatgpt browser command', () => {
         command: 'REPO_HARNESS_ORACLE_BIN=<path-to-pinned-oracle> repo-harness chatgpt browser-doctor --repo <repo> --provider oracle --json',
       });
     });
-  });
+  }, 30_000);
 
   test('oracle follow-up uses providerSessionId instead of local sessionId', () => {
     withRepo((repoRoot) => {
@@ -1128,7 +1422,7 @@ describe('chatgpt browser command', () => {
         rmSync(binDir, { recursive: true, force: true });
       }
     });
-  });
+  }, 30_000);
 
   test('rejects invalid session ids for read/open surfaces', () => {
     withRepo((repoRoot) => {
@@ -1136,12 +1430,13 @@ describe('chatgpt browser command', () => {
       expect(read.status).toBe(2);
       expect(read.stderr).toContain('invalid ChatGPT browser session id');
     });
-  });
+  }, 30_000);
 
-  test('ships browser engine docs and Codex Skill', () => {
+  test('ships browser engine docs', () => {
+    // SSD-06 migration: docs/repo-harness-chatgpt-browser-engine.md documents
+    // the SURVIVING src/cli/chatgpt-browser CLI engine (R3) and stays
+    // byte-unchanged by this cutover; this half of the test is untouched.
     const guide = join(ROOT, 'docs/repo-harness-chatgpt-browser-engine.md');
-    const skill = join(ROOT, '.agents/skills/repo-harness-chatgpt-browser/SKILL.md');
-    const gptproSkill = join(ROOT, 'assets/skill-commands/repo-harness-gptpro/SKILL.md');
     expect(readFileSync(guide, 'utf-8')).toContain('repo-harness chatgpt browser-consult');
     expect(readFileSync(guide, 'utf-8')).toContain('--provider native');
     expect(readFileSync(guide, 'utf-8')).not.toContain('--provider bridge');
@@ -1154,29 +1449,51 @@ describe('chatgpt browser command', () => {
     expect(readFileSync(guide, 'utf-8')).toContain('agent_actions');
     expect(readFileSync(guide, 'utf-8')).toContain('chatgpt-oracle-install-pinned');
     expect(readFileSync(guide, 'utf-8')).toContain('--chatgpt-app <serverName>');
-    const browserSkillText = readFileSync(skill, 'utf-8');
-    expect(browserSkillText).toContain('repo-harness-chatgpt-browser');
-    expect(browserSkillText).toContain('--provider oracle --json');
-    expect(browserSkillText).toContain('node >=24');
-    expect(browserSkillText).toContain('chatgpt-oracle-install-pinned');
-    expect(browserSkillText).toContain('default repo-harness install');
-    const gptproSkillText = readFileSync(gptproSkill, 'utf-8');
-    expect(gptproSkillText).toContain('date -u +%Y%m%dT%H%M%SZ');
-    expect(gptproSkillText).toContain('mkdir -p .ai/harness/handoff/gptpro');
-    expect(gptproSkillText).toContain('.ai/harness/handoff/gptpro/gptpro-${stamp}-${slug}.md');
-    expect(gptproSkillText).toContain('--model gpt-5.5-pro');
-    expect(gptproSkillText).toContain('MCP Read-Back Acceptance');
-    expect(gptproSkillText).toContain('chatgpt.serverName');
-    expect(gptproSkillText).toContain('--chatgpt-app "$serverName"');
-    expect(gptproSkillText).toContain('.repo-harness/mcp.local.json');
-    expect(gptproSkillText).toContain('MCP Read Evidence');
-    expect(gptproSkillText).toContain('right-side process pane');
-    expect(gptproSkillText).toContain('Called tool');
-    expect(gptproSkillText).toContain('sandbox/process flow');
-    expect(gptproSkillText).toContain('15 minutes or more');
-    expect(gptproSkillText).toContain('Do not treat elapsed time as failure');
-    expect(gptproSkillText).toContain('no thinking status detected yet');
-    expect(gptproSkillText).not.toContain('gptpro-consult.md');
-    assertChatGptMcpContract(gptproSkillText);
+    expect(readFileSync(guide, 'utf-8')).toContain('chatgpt install-skill --target both');
+    expect(readFileSync(guide, 'utf-8')).toContain('PROMPT_SECRET_SCAN_FAILED');
+    expect(readFileSync(guide, 'utf-8')).toContain('meta.security.promptSecretScan');
+    expect(readFileSync(guide, 'utf-8')).toContain('immutable staged paths');
+  });
+
+  // SSD-06 migration: the static .agents/skills/repo-harness-chatgpt-browser/
+  // source dir and the assets/skill-commands/repo-harness-gptpro facade are
+  // both deleted. Their content reconciled into the one canonical
+  // repo-harness-chatgpt package (SSD-05); these path-specific assertions
+  // migrate to that package's setup/consult/read-back references.
+  test('canonical repo-harness-chatgpt package carries the Oracle setup and GPT Pro consult/read-back content', () => {
+    const setup = readFileSync(join(ROOT, 'assets/skills/repo-harness-chatgpt/references/setup.md'), 'utf-8');
+    expect(setup).toContain('--provider oracle --json');
+    expect(setup).toContain('node >=24');
+    expect(setup).toContain('chatgpt-oracle-install-pinned');
+    expect(setup).toContain('default repo-harness install');
+    expect(setup).toContain('chatgpt install-skill --target both');
+    expect(setup).toContain('Gitleaks CLI >= 8.19');
+
+    const consult = readFileSync(join(ROOT, 'assets/skills/repo-harness-chatgpt/references/consult.md'), 'utf-8');
+    expect(consult).toContain('date -u +%Y%m%dT%H%M%SZ');
+    expect(consult).toContain('.ai/harness/handoff/gptpro/gptpro-${stamp}-<slug>.md');
+    expect(consult).toContain('--model gpt-5.5-pro');
+    expect(consult).toContain('commonly take 15');
+    expect(consult).toContain('minutes or more');
+    expect(consult).toContain('Do not treat elapsed time as failure');
+    expect(consult).toContain('no thinking status detected yet');
+    expect(consult).not.toContain('gptpro-consult.md');
+
+    const readBack = readFileSync(join(ROOT, 'assets/skills/repo-harness-chatgpt/references/read-back.md'), 'utf-8');
+    expect(readBack).toContain('chatgpt.serverName');
+    expect(readBack).toContain('MCP Read Evidence');
+    expect(readBack).toContain('right-side process pane');
+    expect(readBack).toContain('Called tool');
+    expect(readBack).toContain('sandbox/process flow');
+    assertChatGptMcpContract(readBack);
+
+    const bridge = readFileSync(join(ROOT, 'assets/skills/repo-harness-chatgpt/references/bridge.md'), 'utf-8');
+    expect(bridge).toContain('.repo-harness/mcp.local.json');
+
+    const delegate = readFileSync(join(ROOT, 'assets/skills/repo-harness-chatgpt/references/delegate.md'), 'utf-8');
+    expect(delegate).toContain('browser-consult --dry-run --secret-scan');
+    expect(delegate).toContain('PROMPT_SECRET_SCAN_UNAVAILABLE');
+    expect(delegate).toContain('meta.security.promptSecretScan');
+    expect(delegate).not.toContain('Because there is no scanner');
   });
 });

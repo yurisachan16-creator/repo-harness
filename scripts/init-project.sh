@@ -40,24 +40,14 @@ command_exists() {
 }
 
 install_hook_settings_template() {
-    pi_install_hook_adapters "$PWD" "$ASSETS_HOOKS_DIR" "apply"
     pi_print_codex_hook_trust_notice
 }
 
 ensure_runtime_gitignore_block() {
     local file_path="$1"
     local extra_entries=""
-    local helper_entries=""
     if pi_should_enable_factor_factory "$(pi_plan_type "$STACK")"; then
         extra_entries="$(pi_factor_factory_gitignore_entries)"
-    fi
-    helper_entries="$(pi_helper_wrapper_gitignore_entries "$ASSETS_WORKFLOW_CONTRACT")"
-    if [[ -n "$helper_entries" ]]; then
-        if [[ -n "$extra_entries" ]]; then
-            extra_entries="${extra_entries}"$'\n'"${helper_entries}"
-        else
-            extra_entries="$helper_entries"
-        fi
     fi
     pi_ensure_gitignore_block "$file_path" "" "$extra_entries" "apply"
 }
@@ -354,6 +344,7 @@ EOF
     ensure_gitignore_entry .gitignore ""
     ensure_gitignore_entry .gitignore "# External references"
     ensure_gitignore_entry .gitignore "_ref/"
+    ensure_gitignore_entry .gitignore ".archcontext/"
     ensure_gitignore_entry .gitignore ".codegraph/"
     ensure_gitignore_entry .gitignore ""
     ensure_gitignore_entry .gitignore "# Local operations state"
@@ -385,9 +376,11 @@ EOF
 - `deploy/scripts/` for operational scripts.
 - `deploy/submissions/` for submission or review materials.
 - `deploy/runbooks/` and `deploy/release-checklists/` for operational documentation.
-- `deploy/sql/` for ordered deployment SQL files named like `0001_create_tables.sql`.
+- `deploy/sql/` as the default SQL root for ordered files named like `0001_create_tables.sql`.
 - `deploy/*.md` for runbooks and operating notes.
 - `deploy/env/.env.example` for documented variable shapes only.
+
+If `.ai/harness/policy.json` defines `operations.deploy_sql`, its roots, naming modes, and `invariant_file` are the sole authority for an established alternate SQL layout. When it is absent, SQL files remain direct children of `deploy/sql/` with `ordered4` names.
 
 ## Do Not Track
 
@@ -493,9 +486,10 @@ main() {
     echo "  1. cd $PROJECT_NAME"
     echo "  2. Copy .env.example to .env and configure"
     echo "  3. Run: $PKG_MANAGER run dev"
-    echo "  4. Use Codex Plan mode or Waza /think, then capture it with: bash scripts/capture-plan.sh --slug first-feature --title \"First Feature\""
-    echo "  5. After approval, run: bash scripts/plan-to-todo.sh --plan <active-plan>"
+    echo "  4. Use Codex Plan mode or Waza /think, then capture it with: repo-harness run capture-plan --slug first-feature --title \"First Feature\""
+    echo "  5. After approval, run: repo-harness run plan-to-todo --plan <active-plan>"
     echo ""
+    pi_maybe_install_agent_fleet "$PWD" "apply" "$SCRIPT_DIR/install-agent-fleet.sh"
     pi_print_external_tooling_report "$PWD" "apply" "$SCRIPT_DIR/check-agent-tooling.sh"
     echo ""
 }

@@ -1,6 +1,31 @@
 #!/bin/bash
 set -euo pipefail
 
+helper_source="$0"
+if [[ -n "${REPO_HARNESS_HELPER_SOURCE_PATH:-}" && -f "$REPO_HARNESS_HELPER_SOURCE_PATH" \
+      && "$(basename "$REPO_HARNESS_HELPER_SOURCE_PATH")" == "$(basename "$0")" ]]; then
+  helper_source="$REPO_HARNESS_HELPER_SOURCE_PATH"
+fi
+helper_dir="$(cd "$(dirname "$helper_source")" && pwd)"
+case "$helper_dir" in
+  */assets/templates/helpers)
+    package_root="$(cd "$helper_dir/../../.." && pwd)"
+    ;;
+  */scripts)
+    package_root="$(cd "$helper_dir/.." && pwd)"
+    ;;
+  *)
+    echo "check-agent-tooling.sh cannot resolve repo-harness package root from helper path: $helper_source" >&2
+    exit 1
+    ;;
+esac
+AGENT_FLEET_SOURCE_DIR="$package_root/agents/fleet"
+if [[ ! -d "$AGENT_FLEET_SOURCE_DIR" ]]; then
+  echo "check-agent-tooling.sh missing packaged agent fleet source: $AGENT_FLEET_SOURCE_DIR" >&2
+  exit 1
+fi
+export REPO_HARNESS_AGENT_FLEET_SOURCE_DIR="$AGENT_FLEET_SOURCE_DIR"
+
 if command -v node >/dev/null 2>&1; then
   RUNTIME_BIN="$(command -v node)"
 elif command -v bun >/dev/null 2>&1; then
@@ -76,22 +101,32 @@ const WAZA_RAW_BASE_URL = "https://raw.githubusercontent.com/tw93/Waza/main";
 const WAZA_MANAGED_SKILLS = ["think", "hunt", "check", "health"];
 const WAZA_SHARED_RULES = ["anti-patterns.md", "chinese.md", "durable-context.md", "english.md"];
 const CODEX_AUTOMATION_SKILLS = ["health", "check", "mermaid"];
+// Official Obsidian skills the repo-owned obsidian-memory facade delegates to
+// for vault Markdown authoring and vault runtime operations. Runtime-referenced
+// on both hosts, never vendored into this repo; a missing skill is reported as
+// a gap rather than a hard failure, matching CODEX_AUTOMATION_SKILLS.
+const OBSIDIAN_RUNTIME_SKILLS = ["obsidian-markdown", "obsidian-cli"];
+const OBSIDIAN_RUNTIME_CONSUMER = "obsidian-memory";
+const AGENT_FLEET_SOURCE_DIR = process.env.REPO_HARNESS_AGENT_FLEET_SOURCE_DIR;
+const AGENT_FLEET_SOURCE_LABEL = "package:agents/fleet";
+const AGENT_FLEET_DEFAULT_MANAGED = ["explorer", "deep-reasoner", "fast-worker", "deep-worker", "gatekeeper", "root-cause-prover", "harness-evaluator"];
+const AGENT_FLEET_INSTALL_COMMAND = "repo-harness run install-agent-fleet";
+const AGENT_FLEET_USER_MANAGED_RECEIPT_PATH = path.join(HOME, ".repo-harness", "agent-fleet-user-managed.json");
 const CODEGRAPH_PACKAGE = "@colbymchenry/codegraph";
 const CODEGRAPH_GLOBAL_INSTALL_COMMAND = `bun add -g ${CODEGRAPH_PACKAGE} && repo-harness tools configure codegraph --target codex --location global`;
-const GBRAIN_INSTALL_COMMAND = "bun install -g github:garrytan/gbrain";
-const GBRAIN_INSTALL_NOTE =
-  "Install from GitHub; npm registry package gbrain is an unrelated GPU library and does not ship this CLI.";
 const CODEGRAPH_MCP_CONFIGURE_COMMAND = "repo-harness tools configure codegraph --target <codex|claude|both> --location global";
 const CODEGRAPH_LOCAL_INSTALL_COMMAND = "bun install";
 const CODEGRAPH_ENSURE_COMMAND = [
-  ".ai/harness/scripts/ensure-codegraph.sh",
   "scripts/ensure-codegraph.sh",
 ].find((relPath) => fs.existsSync(path.join(REPO_ROOT, relPath)));
 const CODEGRAPH_ENSURE_BASH_COMMAND = CODEGRAPH_ENSURE_COMMAND
   ? `bash ${CODEGRAPH_ENSURE_COMMAND}`
   : null;
-const SKILLS_CLI_TIMEOUT_MS = 5000;
-const CODEGRAPH_PROBE_TIMEOUT_MS = 5000;
+const ARCHCTX_CLI_PACKAGE = "archctx";
+const ARCHCTX_CONTRACTS_PACKAGE = "archctx-contracts";
+const ARCHCTX_MODEL_DIR = ".archcontext/model";
+const ARCHCTX_NODES_DIR = ".archcontext/model/nodes";
+const ARCHCTX_CAPABILITY_SOURCE_KEY = ".ai/harness/policy.json#context.capability_source";
 const WAZA_STAGING_ROOT = path.join(HOME, ".agents");
 const WAZA_STAGING_DIR = path.join(WAZA_STAGING_ROOT, "skills");
 const WAZA_STAGING_RULES_DIR = path.join(WAZA_STAGING_ROOT, "rules");
@@ -101,15 +136,15 @@ const HOSTS = {
     label: "Claude Code",
     agentLabel: "Claude Code",
     skillsDir: path.join(HOME, ".claude", "skills"),
-    gstackDir: path.join(HOME, ".claude", "skills", "gstack"),
     configPath: path.join(HOME, ".claude", "settings.json"),
+    agentsDir: path.join(HOME, ".claude", "agents"),
   },
   codex: {
     label: "Codex",
     agentLabel: "Codex",
     skillsDir: path.join(HOME, ".codex", "skills"),
-    gstackDir: path.join(HOME, ".codex", "skills", "gstack"),
     configPath: path.join(HOME, ".codex", "config.toml"),
+    agentsDir: path.join(HOME, ".codex", "agents"),
   },
 };
 
@@ -223,6 +258,10 @@ function sha1(text) {
 
 function sha1Buffer(buffer) {
   return crypto.createHash("sha1").update(buffer).digest("hex");
+}
+
+function sha256Buffer(buffer) {
+  return `sha256:${crypto.createHash("sha256").update(buffer).digest("hex")}`;
 }
 
 function parseSkillVersion(text) {
@@ -367,140 +406,6 @@ function inspectDirectorySync(localDir, stagingDir) {
     missing_files: diff.missing,
     extra_files: diff.extra,
     changed_files: diff.changed,
-  };
-}
-
-function summarizeStatus(hostStatuses) {
-  const values = Object.values(hostStatuses);
-  const presentCount = values.filter((entry) => entry.present).length;
-  if (presentCount === 0) return "missing";
-  if (presentCount === values.length) return "present";
-  return "partial";
-}
-
-function detectRepoGstackTeamMode() {
-  const claudeMd = readText(path.join(REPO_ROOT, "CLAUDE.md"));
-  const settings = readText(path.join(REPO_ROOT, ".claude", "settings.json"));
-  const hookPath = path.join(REPO_ROOT, ".claude", "hooks", "check-gstack.sh");
-
-  if (settings.includes("check-gstack.sh") || fs.existsSync(hookPath) || claudeMd.includes("## gstack (REQUIRED")) {
-    return {
-      status: "required",
-      reason: "Repo has gstack enforcement traces (required CLAUDE.md section or check-gstack hook).",
-    };
-  }
-
-  if (claudeMd.includes("## gstack")) {
-    return {
-      status: "optional",
-      reason: "Repo has a gstack guidance section in CLAUDE.md but no enforcement hook.",
-    };
-  }
-
-  return {
-    status: "not-detected",
-    reason: "No repo-local gstack team-mode traces detected in CLAUDE.md or the shared .ai/hooks/ layer.",
-  };
-}
-
-function detectGstack() {
-  const hostStatuses = {};
-
-  for (const host of SELECTED_HOSTS) {
-    const meta = HOSTS[host];
-    const present = fs.existsSync(meta.gstackDir);
-    const versionFile = path.join(meta.gstackDir, "VERSION");
-    const gitDir = path.join(meta.gstackDir, ".git");
-    const version = present && fs.existsSync(versionFile) ? readText(versionFile).trim() : "";
-    let updateStatus = checkUpdates ? "unknown" : "not-checked";
-    let origin = "";
-    let head = "";
-    let remoteHead = "";
-    let updateReason = "";
-
-    if (present && checkUpdates && fs.existsSync(gitDir)) {
-      const originResult = run("git", ["-C", meta.gstackDir, "remote", "get-url", "origin"], { timeoutMs: 1000 });
-      if (originResult.ok) {
-        origin = originResult.stdout.trim();
-      }
-
-      const headResult = run("git", ["-C", meta.gstackDir, "rev-parse", "HEAD"], { timeoutMs: 1000 });
-      if (headResult.ok) {
-        head = headResult.stdout.trim();
-      }
-
-      const remoteResult = run("git", ["-C", meta.gstackDir, "ls-remote", "--symref", "origin", "HEAD"], { timeoutMs: 1500 });
-      if (remoteResult.ok) {
-        const match = remoteResult.stdout.match(/^([0-9a-f]+)\s+HEAD$/m);
-        remoteHead = match ? match[1] : "";
-      }
-
-      if (head && remoteHead) {
-        updateStatus = head === remoteHead ? "up-to-date" : "update-available";
-        updateReason = head === remoteHead
-          ? "Local gstack matches origin/HEAD."
-          : "Local gstack HEAD differs from origin/HEAD."
-      } else if (origin || head) {
-        updateStatus = "unknown";
-        updateReason = remoteResult.timed_out
-          ? "Timed out while checking gstack origin/HEAD."
-          : "Unable to resolve both local and remote HEAD for gstack."
-      }
-    } else if (present) {
-      updateStatus = checkUpdates ? "unknown" : "not-checked";
-      updateReason = fs.existsSync(gitDir)
-        ? "Update checks were skipped."
-        : "gstack install is present but not a full git checkout in this host path.";
-    }
-
-    hostStatuses[host] = {
-      label: meta.label,
-      present,
-      path: meta.gstackDir,
-      version: version || null,
-      origin: origin || null,
-      head: head || null,
-      remote_head: remoteHead || null,
-      update_status: updateStatus,
-      reason: present
-        ? (updateReason || `Detected gstack at ${meta.gstackDir}.`)
-        : `Missing gstack at ${meta.gstackDir}.`,
-      install_command: host === "claude"
-        ? "git clone --depth 1 https://github.com/garrytan/gstack.git ~/.claude/skills/gstack && cd ~/.claude/skills/gstack && ./setup"
-        : `${fs.existsSync(HOSTS.claude.gstackDir) ? "cd ~/.claude/skills/gstack" : "git clone --depth 1 https://github.com/garrytan/gstack.git ~/.claude/skills/gstack && cd ~/.claude/skills/gstack"} && ./setup --host codex`,
-      upgrade_command: host === "claude"
-        ? "cd ~/.claude/skills/gstack && git pull && ./setup"
-        : "cd ~/.claude/skills/gstack && git pull && ./setup --host codex",
-    };
-  }
-
-  const repoTeamMode = detectRepoGstackTeamMode();
-  const status = summarizeStatus(hostStatuses);
-  const selectedMeta = Object.values(hostStatuses);
-  const installCommand = SELECTED_HOSTS.length === 2
-    ? "git clone --depth 1 https://github.com/garrytan/gstack.git ~/.claude/skills/gstack && cd ~/.claude/skills/gstack && ./setup && ./setup --host codex"
-    : selectedMeta[0].install_command;
-  const upgradeCommand = SELECTED_HOSTS.length === 2
-    ? "cd ~/.claude/skills/gstack && git pull && ./setup && ./setup --host codex"
-    : selectedMeta[0].upgrade_command;
-
-  return {
-    name: "gstack",
-    status,
-    reason: status === "present"
-      ? `Detected gstack in all requested hosts (${SELECTED_HOSTS.join(", ")}).`
-      : status === "partial"
-        ? `Detected gstack in ${selectedMeta.filter((entry) => entry.present).length}/${selectedMeta.length} requested hosts.`
-        : "gstack is missing from all requested hosts.",
-    hosts: hostStatuses,
-    repo_team_mode: repoTeamMode,
-    install_command: installCommand,
-    upgrade_command: upgradeCommand,
-    impact: {
-      complex_tasks: status === "present" ? "full" : status === "partial" ? "degraded" : "missing",
-      simple_tasks: "unaffected",
-      knowledge_tasks: "unaffected",
-    },
   };
 }
 
@@ -707,7 +612,7 @@ function inspectWazaSkill(host, skill, skillLock, skillItems, upstreamSkills) {
 function detectWaza() {
   const skillLockPath = path.join(HOME, ".agents", ".skill-lock.json");
   const skillLock = readJson(skillLockPath);
-  const skillsResult = run("npx", ["-y", "skills", "ls", "-g", "--json"], { timeoutMs: SKILLS_CLI_TIMEOUT_MS });
+  const skillsResult = run("bunx", ["skills", "ls", "-g", "--json"], { timeoutMs: 1500 });
   const skillItems = skillsResult.ok ? parseJson(skillsResult.stdout) || [] : [];
   const wazaEntries = Object.entries(skillLock?.skills || {}).filter(([, meta]) => meta?.source === WAZA_SOURCE_REPO);
   const upstream = fetchWazaUpstreamSkills();
@@ -813,7 +718,7 @@ function detectWaza() {
         : "Local Waza SKILL.md and shared rule files match upstream GitHub raw content.";
 
   const status = summarizeWazaStatus(hostStatuses);
-  const installCommand = `npx -y skills add tw93/Waza -g -a ${
+  const installCommand = `bunx skills add tw93/Waza -g -a ${
     hostMode === "both" ? "claude-code codex" : hostMode === "claude" ? "claude-code" : "codex"
   } -s think hunt check health -y`;
   const syncCommand = SELECTED_HOSTS.map((host) => buildWazaHostSyncCommand(host)).join(" && ");
@@ -876,8 +781,8 @@ function detectRuntimeCapabilities(waza) {
     ),
     npx: commandCapability(
       "npx",
-      "external Skills CLI bootstrap/update commands for Waza and Mermaid",
-      "external-skills-cli",
+      "no repo-harness usage; Skills CLI bootstrap/update for Waza and Mermaid runs through bunx instead",
+      "npm-registry",
       false
     ),
     skills_cli: {
@@ -887,7 +792,7 @@ function detectRuntimeCapabilities(waza) {
       owner: "external-skills-cli",
       required: false,
       required_for: "Waza/Mermaid external skill bootstrap; repo-harness reports this as an explicit exception boundary",
-      command: "npx -y skills ls -g --json",
+      command: "bunx skills ls -g --json",
     },
     bash: commandCapability(
       "bash",
@@ -949,141 +854,474 @@ function detectCodexAutomationProfile() {
   };
 }
 
-function detectGbrainMcp(host) {
-  const meta = HOSTS[host];
-  const content = readText(meta.configPath);
-  if (!content) {
-    return {
-      status: "disabled",
-      reason: `No ${meta.label} config found at ${meta.configPath}.`,
-    };
-  }
-
-  if (host === "codex") {
-    if (/\[mcp_servers\.(gbrain|gbrain_http)\]/.test(content)) {
-      return {
-        status: "configured",
-        reason: "Codex config contains a gbrain MCP server entry.",
-      };
-    }
-
-    return {
-      status: "disabled",
-      reason: "Codex config does not contain a gbrain MCP server entry.",
-    };
-  }
-
-  if (/gbrain/i.test(content)) {
-    return {
-      status: "configured",
-      reason: "Claude settings contain a gbrain reference.",
-    };
-  }
+function inspectObsidianRuntimeSkill(host, skill) {
+  const skillFile = path.join(HOSTS[host].skillsDir, skill, "SKILL.md");
+  const local = readSkillFile(skillFile);
 
   return {
-    status: "disabled",
-    reason: "Claude settings do not contain a gbrain MCP configuration.",
+    name: skill,
+    path: skillFile,
+    real_path: resolveRealPath(skillFile),
+    present: local.exists,
+    version: local.version,
+    hash: local.hash,
   };
 }
 
-function isGbrainFastOnlyConnectionSkip(doctorJson) {
-  if (!doctorJson || doctorJson.status !== "warnings") return false;
-  if (!Array.isArray(doctorJson.checks)) return false;
-  const warnings = doctorJson.checks.filter((entry) => entry?.status === "warn" || entry?.status === "warning");
-  if (warnings.length !== 1) return false;
-  const warning = warnings[0];
-  const message = String(warning.message || "");
-  return warning.name === "connection"
-    && (/Skipping DB checks \((--fast mode|"--fast mode)/i.test(message) || /fast mode skipped DB checks/i.test(message));
+function detectObsidianRuntimeSkillsHost(host) {
+  const meta = HOSTS[host];
+  const skills = OBSIDIAN_RUNTIME_SKILLS.map((skill) => inspectObsidianRuntimeSkill(host, skill));
+  const installedSkills = skills.filter((entry) => entry.present).map((entry) => entry.name);
+  const missingSkills = skills.filter((entry) => !entry.present).map((entry) => entry.name);
+  const status = missingSkills.length === 0 ? "present" : installedSkills.length > 0 ? "partial" : "missing";
+
+  return {
+    label: meta.label,
+    status,
+    source: meta.skillsDir,
+    installed_skills: installedSkills,
+    missing_skills: missingSkills,
+    skills,
+  };
 }
 
-function detectGbrain() {
-  const gbrainBin = resolvePathCommand("gbrain");
-  let versionResult = gbrainBin
-    ? run(gbrainBin, ["--version"], { timeoutMs: 1000 })
-    : { ok: false, stdout: "", timed_out: false };
-  if (!versionResult.ok && versionResult.timed_out) {
-    versionResult = run(gbrainBin, ["--version"], { timeoutMs: 1000 });
-  }
-  const present = versionResult.ok;
-  const version = present ? versionResult.stdout.trim().replace(/^gbrain\s+/i, "") : null;
-  let doctorCommand = ["doctor", "--json", "--fast"];
-  let doctorResult = present ? run(gbrainBin, doctorCommand, { timeoutMs: 1500 }) : null;
-  let doctorJson = doctorResult?.ok ? parseJson(doctorResult.stdout) : null;
-  if (present && !doctorJson) {
-    doctorCommand = ["doctor", "--json"];
-    doctorResult = run(gbrainBin, doctorCommand, { timeoutMs: 1500 });
-    doctorJson = doctorResult?.ok ? parseJson(doctorResult.stdout) : null;
-  }
-  const checkUpdateResult = present && checkUpdates ? run(gbrainBin, ["check-update", "--json"], { timeoutMs: 1500 }) : null;
-  const checkUpdateJson = checkUpdateResult?.ok ? parseJson(checkUpdateResult.stdout) : null;
-  const integrationsResult = present ? run(gbrainBin, ["integrations", "list", "--json"], { timeoutMs: 1500 }) : null;
-  const integrationsJson = integrationsResult?.ok ? parseJson(integrationsResult.stdout) : null;
-  const integrationsAvailable = integrationsJson
-    ? Object.values(integrationsJson).reduce((count, value) => count + (Array.isArray(value) ? value.length : 0), 0)
-    : 0;
-  const mcpHosts = {};
-
+function detectObsidianRuntimeSkills() {
+  const hosts = {};
   for (const host of SELECTED_HOSTS) {
-    mcpHosts[host] = {
-      label: HOSTS[host].label,
-      ...detectGbrainMcp(host),
+    hosts[host] = detectObsidianRuntimeSkillsHost(host);
+  }
+
+  const values = Object.values(hosts);
+  const presentCount = values.filter((entry) => entry.status === "present").length;
+  const anyInstalled = values.some((entry) => entry.installed_skills.length > 0);
+  const status = values.length > 0 && presentCount === values.length
+    ? "present"
+    : anyInstalled
+      ? "partial"
+      : "missing";
+  const gaps = Object.entries(hosts)
+    .filter(([, entry]) => entry.missing_skills.length > 0)
+    .map(([host, entry]) => `${host}: ${entry.missing_skills.join(", ")}`);
+
+  return {
+    name: "obsidian_runtime_skills",
+    status,
+    reason: status === "present"
+      ? `Detected all official Obsidian skills required by ${OBSIDIAN_RUNTIME_CONSUMER} on every selected host.`
+      : `Missing official Obsidian skills required by ${OBSIDIAN_RUNTIME_CONSUMER} (${gaps.join("; ")}).`,
+    required_skills: OBSIDIAN_RUNTIME_SKILLS,
+    optional_skills: [],
+    required_by: OBSIDIAN_RUNTIME_CONSUMER,
+    mode: "runtime-reference",
+    readiness: "advisory",
+    vendoring_policy: "do-not-vendor-skill-body",
+    hosts,
+  };
+}
+
+function resolveManagedAgents() {
+  const policy = readJson(path.join(REPO_ROOT, ".ai", "harness", "policy.json"));
+  const configured = policy?.external_tooling?.agent_fleet?.managed_agents;
+  if (Array.isArray(configured) && configured.length > 0 && configured.every((entry) => typeof entry === "string")) {
+    return configured;
+  }
+  return AGENT_FLEET_DEFAULT_MANAGED;
+}
+
+function agentFleetFileExtension(host) {
+  return host === "codex" ? "toml" : "md";
+}
+
+function inspectAgentFleetFile(host, agent) {
+  const meta = HOSTS[host];
+  const filePath = path.join(meta.agentsDir, `${agent}.${agentFleetFileExtension(host)}`);
+  const local = readFileHash(filePath);
+  return {
+    name: agent,
+    path: filePath,
+    present: local.exists,
+    hash: local.hash,
+  };
+}
+
+function readAgentFleetSource(agent) {
+  const sourcePath = path.join(AGENT_FLEET_SOURCE_DIR, `${agent}.md`);
+  const source = readFileHash(sourcePath);
+  if (!source.exists) {
+    return { status: "source-missing", path: sourcePath, hash: null };
+  }
+  return { status: "read", path: sourcePath, hash: source.hash };
+}
+
+// Read-only mirror of install-agent-fleet.sh's loadUserManagedReceipt(): this
+// checker never writes ~/.repo-harness/agent-fleet-user-managed.json, it only
+// consults it so an operator-accepted customized file is not misreported as
+// drift. Any malformation invalidates the whole receipt (fail-closed) rather
+// than exempting individual entries.
+function loadAgentFleetUserManagedReceipt() {
+  if (!fs.existsSync(AGENT_FLEET_USER_MANAGED_RECEIPT_PATH)) return { ok: true, hashes: new Map() };
+  try {
+    const parsed = JSON.parse(fs.readFileSync(AGENT_FLEET_USER_MANAGED_RECEIPT_PATH, "utf8"));
+    if (
+      parsed?.protocol !== 1
+      || parsed?.authority !== "user-managed-agent-fleet"
+      || !Array.isArray(parsed.files)
+    ) return { ok: false, hashes: new Map() };
+    const hashes = new Map();
+    for (const entry of parsed.files) {
+      if (
+        !entry
+        || typeof entry.path !== "string"
+        || typeof entry.sha256 !== "string"
+        || !/^sha256:[a-f0-9]{64}$/.test(entry.sha256)
+        || hashes.has(entry.path)
+      ) return { ok: false, hashes: new Map() };
+      hashes.set(entry.path, entry.sha256);
+    }
+    return { ok: true, hashes };
+  } catch (_error) {
+    return { ok: false, hashes: new Map() };
+  }
+}
+
+function detectAgentFleetHost(host, managedAgents) {
+  const meta = HOSTS[host];
+  const files = managedAgents.map((agent) => inspectAgentFleetFile(host, agent));
+  const installedAgents = files.filter((entry) => entry.present).map((entry) => entry.name);
+  const missingAgents = files.filter((entry) => !entry.present).map((entry) => entry.name);
+  const status = missingAgents.length === 0 ? "present" : installedAgents.length > 0 ? "partial" : "missing";
+
+  let updateStatus = "not-checked";
+  let updateReason = "Update checks were skipped.";
+  const driftAgents = [];
+  const syncedAgents = [];
+  const sourceMissingAgents = [];
+  const userManagedAgents = [];
+
+  if (checkUpdates) {
+    if (host === "claude") {
+      const receipt = loadAgentFleetUserManagedReceipt();
+      for (const entry of files) {
+        if (!entry.present) continue;
+        const source = readAgentFleetSource(entry.name);
+        if (source.status === "source-missing") {
+          sourceMissingAgents.push(entry.name);
+          continue;
+        }
+        if (source.hash === entry.hash) {
+          syncedAgents.push(entry.name);
+          continue;
+        }
+        // Differs from the packaged source: only a valid receipt entry whose
+        // sha256 matches the file's *current* installed content exempts it.
+        // A missing/invalid receipt, a path with no entry, or a hash mismatch
+        // (edited again after acceptance) all fall through to drift.
+        if (receipt.ok && receipt.hashes.get(entry.path) !== undefined) {
+          let installedHash = null;
+          try {
+            installedHash = sha256Buffer(fs.readFileSync(entry.path));
+          } catch (_error) {
+            installedHash = null;
+          }
+          if (installedHash === receipt.hashes.get(entry.path)) {
+            userManagedAgents.push(entry.name);
+            continue;
+          }
+        }
+        driftAgents.push(entry.name);
+      }
+
+      if (driftAgents.length > 0) {
+        updateStatus = "drift";
+        updateReason = `Installed Claude agent definitions differ from the packaged repo-harness fleet source for: ${driftAgents.join(", ")}.`;
+      } else if (sourceMissingAgents.length > 0) {
+        updateStatus = "unknown";
+        updateReason = `Packaged repo-harness fleet source is missing files for: ${sourceMissingAgents.join(", ")}.`;
+      } else if (syncedAgents.length > 0 || userManagedAgents.length > 0) {
+        updateStatus = "up-to-date";
+        updateReason = userManagedAgents.length > 0
+          ? `Installed Claude agent definitions match the packaged repo-harness fleet source, with user-managed exemptions accepted via receipt for: ${userManagedAgents.join(", ")}.`
+          : "Installed Claude agent definitions match the packaged repo-harness fleet source.";
+      } else {
+        updateStatus = "not-checked";
+        updateReason = "No installed Claude agent definitions to compare.";
+      }
+    } else {
+      updateStatus = "not-applicable";
+      updateReason = "Codex agent definitions are generated artifacts derived from the packaged repo-harness fleet source; readiness checks presence while installer golden tests prove generation.";
+    }
+  }
+
+  return {
+    label: meta.agentLabel,
+    status,
+    installed_agents: installedAgents,
+    missing_agents: missingAgents,
+    agents: files,
+    update_status: updateStatus,
+    update_reason: updateReason,
+    drift_agents: driftAgents,
+    synced_agents: syncedAgents,
+    source_missing_agents: sourceMissingAgents,
+    user_managed_agents: userManagedAgents,
+  };
+}
+
+function detectCodexNativeRoleRouting() {
+  if (!SELECTED_HOSTS.includes("codex")) {
+    return {
+      status: "not-applicable",
+      reason: "Codex was not selected for this tooling report.",
+      evidence_path: null,
     };
   }
 
-  const mcpConfigured = Object.values(mcpHosts).some((entry) => entry.status === "configured");
-  const acceptedFastWarning = doctorCommand.join(" ") === "doctor --json --fast" && isGbrainFastOnlyConnectionSkip(doctorJson);
-  const status = !present
-    ? "missing"
-    : (doctorJson?.status === "ok" || acceptedFastWarning ? "present" : doctorJson?.status === "warnings" ? "warning" : "warning");
-  const updateStatus = !checkUpdates
-    ? "not-checked"
-    : checkUpdateJson?.update_available
-      ? "update-available"
-      : checkUpdateJson
-        ? "up-to-date"
-        : "unknown";
+  const stateRoot = path.join(REPO_ROOT, ".ai", "harness", "delegation");
+  const statePath = path.join(stateRoot, "native-role-routing.json");
+  if (!fs.existsSync(statePath)) {
+    return {
+      status: "unverified",
+      reason: "No repo-scoped SubagentStart role/model evidence has been recorded.",
+      evidence_path: statePath,
+      observations: [],
+    };
+  }
+
+  const state = readJson(statePath);
+  if (!state || typeof state !== "object") {
+    return {
+      status: "invalid",
+      reason: "The repo-scoped delegation evidence file is not valid JSON.",
+      evidence_path: statePath,
+      observations: [],
+    };
+  }
+
+  const routingState = state;
+  if (routingState.schema_version !== 1
+    || routingState.required !== true
+    || routingState.reasoning_effort_status !== "configured_unverified") {
+    return {
+      status: "invalid",
+      reason: "The native role/model evidence state is malformed.",
+      evidence_path: statePath,
+      observations: [],
+    };
+  }
+
+  function resolveEvidenceDirectory(relative) {
+    if (typeof relative !== "string" || !relative.trim() || path.isAbsolute(relative)) return null;
+    const stateRootStat = fs.lstatSync(stateRoot);
+    if (stateRootStat.isSymbolicLink() || !stateRootStat.isDirectory()) return null;
+    const root = fs.realpathSync(stateRoot);
+    const resolved = path.resolve(root, relative);
+    if (resolved === root || !resolved.startsWith(`${root}${path.sep}`)) return null;
+    let current = root;
+    for (const segment of path.relative(root, resolved).split(path.sep)) {
+      current = path.join(current, segment);
+      if (!fs.existsSync(current)) return { path: resolved, exists: false };
+      const stat = fs.lstatSync(current);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) return null;
+      const canonical = fs.realpathSync(current);
+      if (!canonical.startsWith(`${root}${path.sep}`)) return null;
+    }
+    return { path: current, exists: true };
+  }
+
+  const currentEvidence = resolveEvidenceDirectory(routingState.evidence_dir);
+  if (!currentEvidence) {
+    return {
+      status: "invalid",
+      reason: "The native role/model evidence directory is missing or unsafe.",
+      evidence_path: statePath,
+      observations: [],
+    };
+  }
+  if (!currentEvidence.exists) {
+    return {
+      status: "invalid",
+      reason: "The native role/model evidence pointer targets a missing directory.",
+      evidence_path: currentEvidence.path,
+      observations: [],
+    };
+  }
+
+  function observationFiles(directory) {
+    if (!fs.existsSync(directory)) return [];
+    try {
+      const stat = fs.lstatSync(directory);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) return null;
+      const entries = fs.readdirSync(directory, { withFileTypes: true })
+        .filter((entry) => entry.name.endsWith(".json"));
+      if (entries.some((entry) => !entry.isFile())) return null;
+      return entries.map((entry) => path.join(directory, entry.name)).sort();
+    } catch {
+      return null;
+    }
+  }
+
+  const evidenceDir = currentEvidence.path;
+  const files = observationFiles(evidenceDir);
+  if (files === null) {
+    return {
+      status: "invalid",
+      reason: "The native role/model evidence directory cannot be read safely.",
+      evidence_path: evidenceDir,
+      observations: [],
+    };
+  }
+  if (files.length === 0) {
+    return {
+      status: "unverified",
+      reason: "No authoritative SubagentStart role/model observation has been recorded.",
+      evidence_path: evidenceDir,
+      observations: [],
+    };
+  }
+
+  const bounded = (value, pattern) => typeof value === "string"
+    && value.length > 0
+    && value.length <= 128
+    && !/[\u0000-\u001f\u007f]/.test(value)
+    && pattern.test(value);
+  const validDate = (value) => typeof value === "string" && Number.isFinite(Date.parse(value));
+  function configDigestMatches(observation) {
+    if (!/^[a-f0-9]{64}$/.test(observation.config_sha256 || "")) return false;
+    const roots = [path.join(REPO_ROOT, ".codex", "agents")];
+    const codexHome = process.env.CODEX_HOME || (process.env.HOME ? path.join(process.env.HOME, ".codex") : "");
+    if (codexHome) roots.push(path.join(codexHome, "agents"));
+    try {
+      const stat = fs.lstatSync(observation.config_path);
+      if (stat.isSymbolicLink() || !stat.isFile()) return false;
+      const canonicalFile = fs.realpathSync(observation.config_path);
+      const withinAllowedRoot = roots.some((root) => {
+        if (!fs.existsSync(root)) return false;
+        const rootStat = fs.lstatSync(root);
+        if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) return false;
+        const canonicalRoot = fs.realpathSync(root);
+        return canonicalFile.startsWith(`${canonicalRoot}${path.sep}`);
+      });
+      if (!withinAllowedRoot) return false;
+      const currentDigest = crypto.createHash("sha256").update(fs.readFileSync(canonicalFile)).digest("hex");
+      return currentDigest === observation.config_sha256;
+    } catch {
+      return false;
+    }
+  }
+  const observations = [];
+  for (const file of files) {
+    const observation = readJson(file);
+    const commonValid = observation
+      && typeof observation === "object"
+      && observation.schema_version === 1
+      && observation.required === true
+      && ["verified", "unavailable", "mismatch", "unverified", "invalid"].includes(observation.status)
+      && typeof observation.reason === "string"
+      && observation.reason.trim().length > 0
+      && observation.reason.length <= 512
+      && !/[\u0000-\u001f\u007f]/.test(observation.reason)
+      && observation.reasoning_effort_status === "configured_unverified"
+      && validDate(observation.checked_at);
+    let semanticValid = commonValid;
+    if (semanticValid && ["verified", "mismatch"].includes(observation.status)) {
+      semanticValid = bounded(observation.agent_id, /^[A-Za-z0-9._:-]+$/)
+        && bounded(observation.turn_id, /^[A-Za-z0-9._:-]+$/)
+        && bounded(observation.agent_type, /^[A-Za-z0-9_-]+$/)
+        && observation.agent_type !== "default"
+        && bounded(observation.observed_model, /^[A-Za-z0-9._-]+$/)
+        && bounded(observation.configured_model, /^[A-Za-z0-9._-]+$/)
+        && typeof observation.config_path === "string"
+        && path.isAbsolute(observation.config_path)
+        && configDigestMatches(observation)
+        && (observation.status === "verified"
+          ? observation.observed_model === observation.configured_model
+          : observation.observed_model !== observation.configured_model);
+    } else if (semanticValid && observation.status === "unavailable") {
+      semanticValid = bounded(observation.agent_id, /^[A-Za-z0-9._:-]+$/)
+        && bounded(observation.turn_id, /^[A-Za-z0-9._:-]+$/)
+        && observation.agent_type === "default"
+        && bounded(observation.observed_model, /^[A-Za-z0-9._-]+$/)
+        && observation.configured_model === null
+        && observation.config_path === null
+        && observation.config_sha256 === null;
+    } else if (semanticValid && observation.status === "unverified") {
+      const agentIdValid = observation.agent_id === null
+        || bounded(observation.agent_id, /^[A-Za-z0-9._:-]+$/);
+      const turnIdValid = observation.turn_id === null
+        || bounded(observation.turn_id, /^[A-Za-z0-9._:-]+$/);
+      const agentTypeValid = observation.agent_type === null
+        || bounded(observation.agent_type, /^[A-Za-z0-9_-]+$/);
+      const observedModelValid = observation.observed_model === null
+        || bounded(observation.observed_model, /^[A-Za-z0-9._-]+$/);
+      semanticValid = agentIdValid
+        && turnIdValid
+        && agentTypeValid
+        && observedModelValid
+        && (observation.agent_id === null
+          || observation.turn_id === null
+          || observation.agent_type === null
+          || observation.observed_model === null)
+        && observation.configured_model === null
+        && observation.config_path === null
+        && observation.config_sha256 === null;
+    }
+    if (!semanticValid) {
+      return {
+        status: "invalid",
+        reason: "A native role/model observation is structurally or semantically invalid.",
+        evidence_path: evidenceDir,
+        observations: [],
+      };
+    }
+    observations.push({ ...observation, evidence_path: file });
+  }
+
+  const precedence = ["invalid", "mismatch", "unavailable", "unverified", "verified"];
+  const status = precedence.find((candidate) => observations.some((entry) => entry.status === candidate)) || "invalid";
+  const counts = Object.fromEntries(precedence.map((candidate) => [
+    candidate,
+    observations.filter((entry) => entry.status === candidate).length,
+  ]));
+  const reason = observations.length === 1
+    ? observations[0].reason
+    : `Aggregated ${observations.length} child observations: ${precedence.map((key) => `${key}=${counts[key]}`).join(", ")}.`;
+  return {
+    status,
+    reason,
+    evidence_path: evidenceDir,
+    observations,
+  };
+}
+
+function detectAgentFleet() {
+  const managedAgents = resolveManagedAgents();
+  const hosts = {};
+  for (const host of SELECTED_HOSTS) {
+    hosts[host] = detectAgentFleetHost(host, managedAgents);
+  }
+
+  const values = Object.values(hosts);
+  const presentCount = values.filter((entry) => entry.status === "present").length;
+  const anyInstalled = values.some((entry) => entry.installed_agents.length > 0);
+  const status = values.length > 0 && presentCount === values.length
+    ? "present"
+    : anyInstalled
+      ? "partial"
+      : "missing";
 
   return {
-    name: "gbrain",
-    required: false,
+    name: "agent_fleet",
     status,
-    reason: !present
-      ? "gbrain CLI is not installed; install the official GitHub package, not npm registry package gbrain."
-      : acceptedFastWarning
-        ? "gbrain CLI is present; fast doctor only skipped DB checks."
-      : doctorJson
-        ? `gbrain CLI is present; doctor status is ${doctorJson.status}.`
-        : "gbrain CLI is present, but doctor output could not be parsed.",
-    cli_present: present,
-    version,
-    doctor_command: present ? `gbrain ${doctorCommand.join(" ")}` : null,
-    doctor: doctorJson,
-    update_status: updateStatus,
-    update_reason: checkUpdateJson?.error
-      ? `gbrain check-update returned ${checkUpdateJson.error}.`
-      : checkUpdateResult?.timed_out
-        ? "gbrain check-update timed out before update status could be determined."
-      : updateStatus === "update-available"
-        ? "gbrain check-update reports a newer version."
-        : updateStatus === "up-to-date"
-          ? "gbrain check-update did not find a newer version."
-          : "gbrain update status is unknown.",
-    integrations_available: integrationsAvailable,
-    mcp_hosts: mcpHosts,
-    install_command: GBRAIN_INSTALL_COMMAND,
-    install_note: GBRAIN_INSTALL_NOTE,
-    upgrade_command: checkUpdateJson?.upgrade_command || "gbrain upgrade",
-    sync_command: "gbrain sync --repo <path>",
-    impact: {
-      complex_tasks: "unaffected",
-      simple_tasks: "unaffected",
-      knowledge_tasks: !present
-        ? "missing"
-        : mcpConfigured
-          ? "full"
-          : "manual-only",
-    },
+    reason: status === "present"
+      ? "Detected all repo-harness managed agent definitions on the requested hosts."
+      : status === "partial"
+        ? "Some repo-harness managed agent definitions are missing on the requested hosts."
+        : "No repo-harness managed agent definitions were found on the requested hosts.",
+    managed_agents: managedAgents,
+    source: AGENT_FLEET_SOURCE_LABEL,
+    install_command: AGENT_FLEET_INSTALL_COMMAND,
+    native_role_routing: detectCodexNativeRoleRouting(),
+    hosts,
   };
 }
 
@@ -1268,10 +1506,10 @@ function resolveCodeGraphBinary() {
 
 function codeGraphVersion(binPath) {
   if (!binPath) return null;
-  const result = run(binPath, ["--version"], { timeoutMs: CODEGRAPH_PROBE_TIMEOUT_MS });
+  const result = run(binPath, ["--version"], { timeoutMs: 1000 });
   if (result.ok) return result.stdout.trim() || null;
   if (result.timed_out) {
-    const retry = run(binPath, ["--version"], { timeoutMs: CODEGRAPH_PROBE_TIMEOUT_MS });
+    const retry = run(binPath, ["--version"], { timeoutMs: 1000 });
     if (retry.ok) return retry.stdout.trim() || null;
   }
   return null;
@@ -1298,7 +1536,7 @@ function detectCodeGraph() {
   }
 
   const selectedMcpConfigured = SELECTED_HOSTS.every((host) => mcpHosts[host]?.status === "configured");
-  const statusResult = cliPresent ? run(resolution.bin_path, ["status", "."], { timeoutMs: CODEGRAPH_PROBE_TIMEOUT_MS }) : null;
+  const statusResult = cliPresent ? run(resolution.bin_path, ["status", "."], { timeoutMs: 1500 }) : null;
   const statusOutput = `${statusResult?.stdout || ""}\n${statusResult?.stderr || ""}`;
   const projectIndexStatus = cliPresent ? parseCodeGraphProjectStatus(statusOutput) : "unavailable";
   const indexInitialized = fs.existsSync(path.join(REPO_ROOT, ".codegraph"))
@@ -1389,6 +1627,93 @@ function detectCodeGraph() {
   };
 }
 
+function archctxContractsVersion() {
+  const pkg = readJson(path.join(REPO_ROOT, "package.json"));
+  if (!pkg || typeof pkg !== "object") return null;
+  return (
+    pkg.devDependencies?.[ARCHCTX_CONTRACTS_PACKAGE] ||
+    pkg.dependencies?.[ARCHCTX_CONTRACTS_PACKAGE] ||
+    pkg.optionalDependencies?.[ARCHCTX_CONTRACTS_PACKAGE] ||
+    null
+  );
+}
+
+/**
+ * Reads the capability authority switch this repo runs on. Advisory only: a
+ * missing or malformed policy never fails the probe, it just reports what could
+ * be read so the operator sees which source the resolver would use.
+ */
+function archctxCapabilitySource() {
+  const policy = readJson(path.join(REPO_ROOT, ".ai/harness/policy.json"));
+  if (!policy || typeof policy !== "object") return "unknown";
+  const context = policy.context;
+  if (!context || typeof context !== "object") return "registry";
+  const value = context.capability_source;
+  if (value === undefined) return "registry";
+  return typeof value === "string" ? value : "unknown";
+}
+
+function archctxNodeCount(nodesDir) {
+  try {
+    return fs.readdirSync(nodesDir).filter((name) => /\.ya?ml$/.test(name)).length;
+  } catch (_error) {
+    return 0;
+  }
+}
+
+/**
+ * Advisory global ArchContext probe. This is deliberately orthogonal to the
+ * package-local architecture projection provider: a PATH installation can help
+ * an operator, but never satisfies provider readiness or blocks hooks.
+ */
+function detectArchctx() {
+  const binPath = resolvePathCommand(ARCHCTX_CLI_PACKAGE);
+  const cliPresent = Boolean(binPath);
+  const versionResult = cliPresent ? run(binPath, ["--version"], { timeoutMs: 1500 }) : null;
+  // Some archctx builds have no --version flag and answer with a multi-line help
+  // envelope at exit 0. Report an unknown version instead of storing that blob.
+  const versionOutput = versionResult?.ok ? versionResult.stdout.trim() : "";
+  const version = versionOutput && !versionOutput.includes("\n") ? versionOutput : null;
+  const contractsPackageVersion = archctxContractsVersion();
+  const capabilitySource = archctxCapabilitySource();
+  const nodesDir = path.join(REPO_ROOT, ARCHCTX_NODES_DIR);
+  const nodesDirPresent = fs.existsSync(nodesDir);
+  const nodeCount = nodesDirPresent ? archctxNodeCount(nodesDir) : 0;
+  const nodesReady = nodesDirPresent && nodeCount > 0;
+  const status = capabilitySource === "archcontext" && !nodesReady ? "partial" : "present";
+
+  return {
+    name: "archctx",
+    status,
+    reason: capabilitySource === "archcontext"
+      ? nodesReady
+        ? `Capability source is archcontext and ${ARCHCTX_NODES_DIR} holds ${nodeCount} node file(s).`
+        : `Capability source is archcontext, but ${ARCHCTX_NODES_DIR} is missing or empty.`
+      : `Capability source is ${capabilitySource}; archctx nodes are not read by the resolver.`,
+    cli_package: ARCHCTX_CLI_PACKAGE,
+    contracts_package: ARCHCTX_CONTRACTS_PACKAGE,
+    contracts_scope: "release-gated-packed-schema-authority",
+    install_mode: "release-gated-runtime-dependency-when-projection-enabled",
+    cli_present: cliPresent,
+    bin_path: binPath,
+    version,
+    contracts_package_version: contractsPackageVersion,
+    capability_source: capabilitySource,
+    capability_source_key: ARCHCTX_CAPABILITY_SOURCE_KEY,
+    model_dir: path.join(REPO_ROOT, ARCHCTX_MODEL_DIR),
+    nodes_dir: path.join(REPO_ROOT, ARCHCTX_NODES_DIR),
+    nodes_dir_present: nodesDirPresent,
+    node_count: nodeCount,
+    readiness: "advisory",
+    hook_policy: "do-not-block-hooks",
+    vendoring_policy: "do-not-vendor",
+    impact: {
+      capability_resolution: status === "present" ? "unaffected" : "archcontext-nodes-missing",
+      hook_correctness: "unaffected",
+    },
+  };
+}
+
 const wazaReport = detectWaza();
 const report = {
   generated_at: new Date().toISOString(),
@@ -1397,17 +1722,28 @@ const report = {
   check_updates: checkUpdates,
   runtime_capabilities: detectRuntimeCapabilities(wazaReport),
   tools: {
-    gstack: detectGstack(),
     waza: wazaReport,
     codex_automation_profile: detectCodexAutomationProfile(),
-    gbrain: detectGbrain(),
+    obsidian_runtime_skills: detectObsidianRuntimeSkills(),
+    agent_fleet: detectAgentFleet(),
     codegraph: detectCodeGraph(),
+    archctx: detectArchctx(),
   },
 };
 
 const strictFailures = [];
 if (strictReadiness && ["missing", "partial"].includes(report.tools.codegraph.status)) {
   strictFailures.push(`CodeGraph readiness is ${report.tools.codegraph.status}: ${report.tools.codegraph.reason}`);
+}
+if (strictReadiness && ["missing", "partial"].includes(report.tools.agent_fleet.status)) {
+  strictFailures.push(`Agent fleet readiness is ${report.tools.agent_fleet.status}: ${report.tools.agent_fleet.reason}`);
+}
+if (
+  strictReadiness
+  && ["unverified", "unavailable", "mismatch", "invalid"].includes(report.tools.agent_fleet.native_role_routing.status)
+) {
+  const routing = report.tools.agent_fleet.native_role_routing;
+  strictFailures.push(`Codex native role routing is ${routing.status}: ${routing.reason}`);
 }
 
 function printText(result) {
@@ -1422,20 +1758,6 @@ function printText(result) {
     console.log(`  - ${capability.name}: ${capability.status} (${required})${pathBits}`);
     console.log(`    owner=${capability.owner}; required_for=${capability.required_for}`);
   }
-  console.log("");
-
-  const gstack = result.tools.gstack;
-  console.log(`gstack [${gstack.status}]`);
-  for (const host of SELECTED_HOSTS) {
-    const entry = gstack.hosts[host];
-    const versionBits = entry.version ? ` v${entry.version}` : "";
-    const updateBits = entry.update_status && entry.update_status !== "not-checked" ? `, ${entry.update_status}` : "";
-    console.log(`  - ${entry.label}: ${entry.present ? "present" : "missing"}${versionBits}${updateBits}`);
-  }
-  console.log(`  - Team mode: ${gstack.repo_team_mode.status} (${gstack.repo_team_mode.reason})`);
-  console.log(`  - Impact: complex=${gstack.impact.complex_tasks}`);
-  console.log(`  - Install: ${gstack.install_command}`);
-  console.log(`  - Upgrade: ${gstack.upgrade_command}`);
   console.log("");
 
   const waza = result.tools.waza;
@@ -1493,24 +1815,41 @@ function printText(result) {
   console.log(`  - Vendoring: ${codexAutomation.vendoring_policy}`);
   console.log("");
 
-  const gbrain = result.tools.gbrain;
-  console.log(`gbrain [${gbrain.status}]`);
-  console.log(`  - CLI: ${gbrain.cli_present ? `present${gbrain.version ? ` (v${gbrain.version})` : ""}` : "missing"}`);
-  if (gbrain.doctor?.status) {
-    console.log(`  - Doctor: ${gbrain.doctor.status} (score ${gbrain.doctor.health_score ?? "n/a"})`);
-  }
+  const obsidianRuntime = result.tools.obsidian_runtime_skills;
+  console.log(`Obsidian runtime skills [${obsidianRuntime.status}]`);
+  console.log(`  - Required: ${obsidianRuntime.required_skills.join(", ")}`);
+  console.log(`  - Required by: ${obsidianRuntime.required_by}`);
+  console.log(`  - Mode: ${obsidianRuntime.mode} (${obsidianRuntime.readiness})`);
   for (const host of SELECTED_HOSTS) {
-    const entry = gbrain.mcp_hosts[host];
-    console.log(`  - ${entry.label} MCP: ${entry.status}`);
+    const entry = obsidianRuntime.hosts[host];
+    console.log(`  - ${entry.label}: ${entry.status} (${entry.source})`);
+    if (entry.missing_skills.length) {
+      console.log(`    missing: ${entry.missing_skills.join(", ")}`);
+    }
   }
-  if (gbrain.integrations_available) {
-    console.log(`  - Integrations available: ${gbrain.integrations_available}`);
+  console.log(`  - Vendoring: ${obsidianRuntime.vendoring_policy}`);
+  console.log("");
+
+  const agentFleet = result.tools.agent_fleet;
+  console.log(`Agent fleet [${agentFleet.status}]`);
+  console.log(`  - Managed: ${agentFleet.managed_agents.join(", ")}`);
+  for (const host of SELECTED_HOSTS) {
+    const entry = agentFleet.hosts[host];
+    console.log(`  - ${entry.label}: ${entry.status}, ${entry.installed_agents.length}/${agentFleet.managed_agents.length} agents`);
+    if (entry.missing_agents.length) {
+      console.log(`    missing: ${entry.missing_agents.join(", ")}`);
+    }
+    if (entry.update_status !== "not-checked") {
+      console.log(`    updates: ${entry.update_status} (${entry.update_reason})`);
+    }
+    if (entry.user_managed_agents.length) {
+      console.log(`    user-managed (receipt): ${entry.user_managed_agents.join(", ")}`);
+    }
   }
-  console.log(`  - Updates: ${gbrain.update_status} (${gbrain.update_reason})`);
-  console.log(`  - Impact: knowledge=${gbrain.impact.knowledge_tasks}`);
-  console.log(`  - Install: ${gbrain.install_command}`);
-  console.log(`  - Upgrade: ${gbrain.upgrade_command}`);
-  console.log(`  - Manual sync: ${gbrain.sync_command}`);
+  console.log(`  - Install: ${agentFleet.install_command}`);
+  if (SELECTED_HOSTS.includes("codex")) {
+    console.log(`  - Codex native role routing: ${agentFleet.native_role_routing.status} (${agentFleet.native_role_routing.reason})`);
+  }
   console.log("");
 
   const codegraph = result.tools.codegraph;
@@ -1533,6 +1872,16 @@ function printText(result) {
   }
   console.log(`  - Init index: ${codegraph.init_command}`);
   console.log(`  - Sync index: ${codegraph.sync_command}`);
+  console.log("");
+
+  const archctx = result.tools.archctx;
+  console.log(`ArchContext [${archctx.status}] (advisory)`);
+  console.log(`  - CLI: ${archctx.cli_present ? `present${archctx.version ? ` (v${archctx.version})` : ""} at ${archctx.bin_path}` : "missing"}`);
+  console.log(`  - Contracts package: ${archctx.contracts_package}${archctx.contracts_package_version ? `@${archctx.contracts_package_version}` : " (not declared)"} (${archctx.contracts_scope})`);
+  console.log(`  - Capability source: ${archctx.capability_source} via ${archctx.capability_source_key}`);
+  console.log(`  - Nodes: ${archctx.nodes_dir_present ? `${archctx.node_count} file(s) in ${archctx.nodes_dir}` : `missing ${archctx.nodes_dir}`}`);
+  console.log(`  - Impact: capability-resolution=${archctx.impact.capability_resolution}, hooks=${archctx.impact.hook_correctness}`);
+  console.log(`  - Readiness: ${archctx.readiness} (${archctx.reason})`);
 }
 
 if (jsonOutput) {

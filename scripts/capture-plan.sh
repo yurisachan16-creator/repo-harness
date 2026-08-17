@@ -2,13 +2,15 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null)"; then
+if [[ -n "${REPO_HARNESS_TARGET_REPO_ROOT:-}" ]]; then
+  cd "$REPO_HARNESS_TARGET_REPO_ROOT"
+elif REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null)"; then
   cd "$REPO_ROOT"
-elif [[ "$SCRIPT_DIR" == */.ai/harness/scripts ]]; then
-  cd "$SCRIPT_DIR/../../.."
 else
   cd "$SCRIPT_DIR/.."
 fi
+REPO_ROOT="$(pwd)"
+helper_dir="$SCRIPT_DIR"
 
 _WF_LIB=".ai/hooks/lib/workflow-state.sh"
 if [[ -f "$_WF_LIB" ]]; then
@@ -78,14 +80,12 @@ promotion_reason_is_forbidden() {
 }
 
 ACTIVE_PLAN_MARKER=".ai/harness/active-plan"
-LEGACY_ACTIVE_PLAN_MARKER=".claude/.active-plan"
 ACTIVE_WORKTREE_MARKER=".ai/harness/active-worktree"
 
 write_active_plan_marker() {
   local plan_file="$1"
-  mkdir -p "$(dirname "$ACTIVE_PLAN_MARKER")" "$(dirname "$LEGACY_ACTIVE_PLAN_MARKER")" "$(dirname "$ACTIVE_WORKTREE_MARKER")"
+  mkdir -p "$(dirname "$ACTIVE_PLAN_MARKER")" "$(dirname "$ACTIVE_WORKTREE_MARKER")"
   printf '%s' "$plan_file" > "$ACTIVE_PLAN_MARKER"
-  printf '%s' "$plan_file" > "$LEGACY_ACTIVE_PLAN_MARKER"
   pwd -P > "$ACTIVE_WORKTREE_MARKER"
 }
 
@@ -132,8 +132,7 @@ read_active_plan_marker() {
 }
 
 get_active_plan() {
-  read_active_plan_marker "$ACTIVE_PLAN_MARKER" \
-    || read_active_plan_marker "$LEGACY_ACTIVE_PLAN_MARKER"
+  read_active_plan_marker "$ACTIVE_PLAN_MARKER"
 }
 
 append_task_breakdown_rows() {
@@ -332,7 +331,7 @@ fi
 if [[ "$artifact_level" == "checklist-row" ]]; then
   active_plan="$(get_active_plan || true)"
   if [[ -z "$active_plan" ]]; then
-    echo "No active plan marker resolves to a plan; checklist-row capture needs .ai/harness/active-plan or .claude/.active-plan." >&2
+    echo "No active plan marker resolves to a plan; checklist-row capture needs .ai/harness/active-plan." >&2
     exit 1
   fi
 
@@ -358,7 +357,7 @@ done
 artifact_stem="$(artifact_stem_for_capture "$plan_file" "$slug" "$title")"
 
 promotion_reason_for_plan="${promotion_reason:-"(required before projection)"}"
-verification_boundary_for_plan="${verification_boundary:-"Commands named in the captured planning output plus \`bash scripts/verify-contract.sh --contract tasks/contracts/${artifact_stem}.contract.md --strict\`."}"
+verification_boundary_for_plan="${verification_boundary:-"Commands named in the captured planning output plus \`repo-harness run verify-contract --contract tasks/contracts/${artifact_stem}.contract.md --strict\`."}"
 rollback_surface_for_plan="${rollback_surface:-"Before execution remove \`${plan_file}\`; after execution revert branch \`codex/${slug}\` or the explicitly reviewed diff."}"
 
 cat > "$plan_file" <<PLAN_EOF
@@ -400,8 +399,8 @@ Complete this inventory before implementation. If any line is unknown, keep the 
 - Current checks: \`.ai/harness/checks/latest.json\`
 - Run snapshots: \`.ai/harness/runs/\`
 - Scope authority: \`tasks/contracts/${artifact_stem}.contract.md\` \`allowed_paths\`
-- Concurrency rule: \`.ai/harness/active-plan\` selects the active plan for this worktree when present; \`.ai/harness/active-worktree\` records the owning worktree; \`.claude/.active-plan\` is a legacy fallback during transition. If another worktree already owns active work, open or switch to the matching worktree instead of serializing unrelated plans.
-- Execution isolation: approved contract-level work projects through \`scripts/plan-to-todo.sh --plan ${plan_file}\` and may start \`scripts/contract-worktree.sh start --plan ${plan_file}\`.
+- Concurrency rule: \`.ai/harness/active-plan\` selects the active plan for this worktree when present; \`.ai/harness/active-worktree\` records the owning worktree. If another worktree already owns active work, open or switch to the matching worktree instead of serializing unrelated plans.
+- Execution isolation: approved contract-level work projects through \`repo-harness run plan-to-todo --plan ${plan_file}\` and may start \`repo-harness run contract-worktree start --plan ${plan_file}\`.
 
 ## Approach
 ### Strategy
@@ -434,8 +433,8 @@ See captured planning output.
 - Review file: \`tasks/reviews/${artifact_stem}.review.md\`
 - Implementation notes file: \`tasks/notes/${artifact_stem}.notes.md\`
 - Template: \`.claude/templates/contract.template.md\`
-- Verification command: \`bash scripts/verify-contract.sh --contract tasks/contracts/${artifact_stem}.contract.md --strict\`
-- Active plan rule: this captured plan is written to \`.ai/harness/active-plan\`, the owning worktree is written to \`.ai/harness/active-worktree\`, and the plan is mirrored to \`.claude/.active-plan\` unless --no-active is used. Do not infer active execution from the latest non-archived plan.
+- Verification command: \`repo-harness run verify-contract --contract tasks/contracts/${artifact_stem}.contract.md --strict\`
+- Active plan rule: this captured plan is written to \`.ai/harness/active-plan\` and the owning worktree is written to \`.ai/harness/active-worktree\` unless --no-active is used. Do not infer active execution from the latest non-archived plan.
 
 ## Handoff
 
@@ -483,6 +482,6 @@ fi
 echo "Captured plan: $plan_file"
 
 if [[ "$execute" -eq 1 ]]; then
-  [[ -f "scripts/plan-to-todo.sh" ]] || { echo "Missing scripts/plan-to-todo.sh" >&2; exit 1; }
-  bash "scripts/plan-to-todo.sh" --plan "$plan_file"
+  [[ -x "$helper_dir/plan-to-todo.sh" ]] || { echo "Missing plan-to-todo helper in $helper_dir" >&2; exit 1; }
+  REPO_HARNESS_TARGET_REPO_ROOT="$REPO_ROOT" bash "$helper_dir/plan-to-todo.sh" --plan "$plan_file"
 fi

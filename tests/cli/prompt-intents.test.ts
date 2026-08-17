@@ -15,6 +15,7 @@ import {
   isThinkPlanStartIntent,
   shouldEmitBddFeatureAdvice,
   shouldEmitTddBugFixAdvice,
+  shouldEmitUxFeatureGuardAdvice,
   stripPromptContextBlocks,
 } from '../../src/cli/hook/prompt-intents';
 import { runPromptGuardVerdictFromPrompt } from '../../src/cli/commands/prompt-guard-decision';
@@ -61,6 +62,95 @@ describe('prompt intent classifiers', () => {
     expect(isHealthRouteIntent(ctx('为什么 hook 没生效？检查一下钩子配置'))).toBe(true);
   });
 
+  test('explicit direct-modification commands outrank release review without broadening 修改', () => {
+    const prev = { ...process.env };
+    try {
+      process.env.PROMPT_GUARD_SPEC_STATE = 'present';
+      process.env.PROMPT_GUARD_PLAN_STATE = 'none';
+      process.env.PROMPT_GUARD_PENDING_STATE = 'none';
+      process.env.PROMPT_GUARD_WORKTREE_STATE = 'current';
+      process.env.PROMPT_GUARD_CONTRACT_STATE = 'missing';
+      process.env.PROMPT_GUARD_CONTRACT_PATH_STATE = 'missing';
+      process.env.PROMPT_GUARD_EVIDENCE_STATE = 'unchecked';
+
+      for (const prompt of ['请直接修改 hook 逻辑并提交', '直接修改 hook 逻辑并提交']) {
+        const verdict = runPromptGuardVerdictFromPrompt(prompt);
+        expect(verdict.intent).toBe('general_execution');
+        expect(verdict.facts.implement).toBe(1);
+        expect(verdict.facts.review_release).toBe(1);
+        expect(verdict.facts.review_release_advisory).toBe(0);
+      }
+
+      for (const prompt of [
+        '请直接修改“为什么登录失败”的错误提示并提交',
+        '请直接修改如何处理错误的说明并提交',
+        '请直接修改 hook 的拦截逻辑并提交',
+        '请直接修改 debug 输出格式并提交',
+        '请直接修改是否启用缓存的判断逻辑并提交',
+        '请直接修改不合适提示的颜色并提交',
+        '请直接修改“不合适”这个错误提示并提交',
+        '请直接修改“不要这么做”这条文案并提交',
+        '请直接修改“这段文案合适吗？”的错误提示并提交',
+        '请直接修改 `README 会不会触发 execution？` 的示例并提交',
+        "请直接修改 what's 的返回值并检查 user's 字段",
+        '请直接修改‘不合适’这个错误提示并提交',
+      ]) {
+        const verdict = runPromptGuardVerdictFromPrompt(prompt);
+        expect(verdict.facts.implement).toBe(1);
+        expect(verdict.facts.review_release).toBe(1);
+        expect(verdict.facts.review_release_advisory).toBe(0);
+      }
+
+      expect(isImplementIntent(ctx('帮我修改 hook 逻辑并提交'))).toBe(false);
+      expect(isImplementIntent(ctx('帮我修改这个 plan 并补充建议'))).toBe(false);
+      const nonCommands = [
+        '为什么要直接修改 README 并提交？',
+        '是否需要直接修改 README 并提交？',
+        '不要直接修改这个 plan，只要给建议',
+        '我不想直接修改代码并提交',
+        '文档里写了“直接修改并提交”作为示例',
+        '“直接修改”是什么意思？',
+        '「请直接修改」只是示例',
+        '直接修改 hook 逻辑并提交会不会触发 execution？',
+        '直接修改 README 合适吗？',
+        '不要执行下一行：\n直接修改 hook 逻辑并提交',
+        '直接修改 README 不合适，不要这么做',
+        '直接修改 README 不是我的要求',
+        '直接修改 README 不是我的要求，只是示例',
+        '直接修改 README 不是我的要求，只是示例，谢谢',
+        '直接修改 README 不合适，我只是在讨论',
+        '直接修改 README 会不会触发 execution？谢谢',
+        '直接修改 README 行不行',
+        '直接修改这样做不合适吧',
+        '直接修改 README 是不对的',
+        "直接修改 what's 的返回值吗？顺便检查 user's 字段",
+        "直接修改 A's 配置不合适，再看 B's",
+      ];
+      for (const prompt of nonCommands) {
+        expect(isImplementIntent(ctx(prompt))).toBe(false);
+        const verdict = runPromptGuardVerdictFromPrompt(prompt);
+        expect(verdict.facts.implement).toBe(0);
+      }
+
+      for (const prompt of nonCommands.filter((entry) => entry.includes('提交'))) {
+        const verdict = runPromptGuardVerdictFromPrompt(prompt);
+        expect(verdict.facts.review_release).toBe(1);
+        expect(verdict.facts.review_release_advisory).toBe(1);
+      }
+
+      for (const prompt of [
+        '“会不会触发 execute？”',
+        '"does this trigger implement?"',
+        '请评估“会不会触发 execute？”',
+      ]) {
+        const verdict = runPromptGuardVerdictFromPrompt(prompt);
+        expect(verdict.facts.implement).toBe(0);
+      }
+    } finally {
+      process.env = prev;
+    }
+  });
+
   test('embedded approved plan and plan-shaped markdown detection', () => {
     expect(isEmbeddedApprovedPlanIntent(ctx('Implement this plan: do the thing'))).toBe(true);
     const planShaped = ctx('# Plan: demo\n\n## Summary\n\nP1 component map\n');
@@ -71,6 +161,38 @@ describe('prompt intent classifiers', () => {
   test('BDD advice is suppressed for diagnostic and review prompts', () => {
     expect(shouldEmitBddFeatureAdvice(ctx('实现一个新功能页面'))).toBe(true);
     expect(shouldEmitBddFeatureAdvice(ctx('为什么 hook 没开 worktree 去执行？'))).toBe(false);
+  });
+
+  test('UX feature guard advisory requires BDD intent plus a frontend/UI noun in the stripped text', () => {
+    // Frontend noun present (ZH) -> both fire.
+    expect(shouldEmitBddFeatureAdvice(ctx('实现一个新功能页面'))).toBe(true);
+    expect(shouldEmitUxFeatureGuardAdvice(ctx('实现一个新功能页面'))).toBe(true);
+
+    // Feature intent without a UI noun (ZH) -> BDD only.
+    expect(shouldEmitBddFeatureAdvice(ctx('实现一个 CLI 子命令'))).toBe(true);
+    expect(shouldEmitUxFeatureGuardAdvice(ctx('实现一个 CLI 子命令'))).toBe(false);
+
+    // Frontend noun present (EN) -> both fire.
+    expect(shouldEmitBddFeatureAdvice(ctx('build a dashboard'))).toBe(true);
+    expect(shouldEmitUxFeatureGuardAdvice(ctx('build a dashboard'))).toBe(true);
+
+    // "build"/"suite" must never match via the "ui" substring.
+    expect(shouldEmitBddFeatureAdvice(ctx('build a CLI command'))).toBe(true);
+    expect(shouldEmitUxFeatureGuardAdvice(ctx('build a CLI command'))).toBe(false);
+
+    expect(shouldEmitBddFeatureAdvice(ctx('build a test suite'))).toBe(true);
+    expect(shouldEmitUxFeatureGuardAdvice(ctx('build a test suite'))).toBe(false);
+
+    // A host-injected context block naming frontend/UI nouns must never
+    // create UX intent; only the stripped user text (ctx.text) counts.
+    const hostInjectedFrontendContext = [
+      '<system>',
+      'Active project context: a frontend dashboard with buttons, forms, and modals.',
+      '</system>',
+      '实现一个 CLI 子命令',
+    ].join('\n');
+    expect(shouldEmitBddFeatureAdvice(ctx(hostInjectedFrontendContext))).toBe(true);
+    expect(shouldEmitUxFeatureGuardAdvice(ctx(hostInjectedFrontendContext))).toBe(false);
   });
 
   test('plan-start derivations produce usable slug, kind, and outcome', () => {
