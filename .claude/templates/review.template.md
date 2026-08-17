@@ -7,18 +7,18 @@
 > **Checks File**: {{CHECKS_FILE}}
 > **Last Updated**: {{TIMESTAMP}}
 > **Recommendation**: fail
-> **Review Rubric Version**: 1
-> **Reviewed Diff Fingerprint**: pending
-> **Reviewed Scope**: branch+staged+unstaged+untracked
+> **Review Rubric Version**: 2
+> **Reviewed Subject SHA256**: pending
+> **Reviewed Subject Scope**: normalized-final-content
+> **Reviewed Target Revision**: pending
 
 ## Human Review Card
 
 - Verdict: pending
-- Change type: code-change | docs-only | ledger-closeout | migration | eval-only | delegated-run
+- Change type: code-change | docs-only | ledger-closeout | migration | eval-only | delegated-run | frontend
 - Intended files changed:
 - Actual files changed:
 - Commands passed:
-- External acceptance: unavailable
 - Residual risks:
 - Reviewer action required: inspect diff and card
 - Rollback:
@@ -38,17 +38,20 @@
 - Implementation notes reviewed:
 - Run snapshot:
 
-## External Acceptance Advice
+## Acceptance Receipt Projection
 
-> **External Acceptance**: unavailable
-> **External Reviewer**:
-> **External Source**:
-> **External Started**:
-> **External Completed**:
+> **Disposition**: unavailable
+> **Reviewer**: unavailable
+> **Source**: unavailable
+> **Actor**: not-applicable
+> **Reviewed Subject SHA256**: pending
+> **Reviewed Subject Scope**: normalized-final-content
+> **Reviewed Target Revision**: pending
+> **Verification Evidence SHA256**: pending
+> **Issued At**: pending
 
-- P1 blockers:
-- P2 advisories:
-- Acceptance checklist:
+- Summary: No AcceptanceReceipt has been recorded.
+- Findings: none
 
 ## Behavior Diff Notes
 

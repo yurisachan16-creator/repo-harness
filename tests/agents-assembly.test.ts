@@ -44,16 +44,17 @@ describe("AGENTS Target Assembly", () => {
     expect(output).toContain(".ai/harness/policy.json");
     expect(output).toContain(".ai/context/context-map.json");
     expect(output).toContain("Agentic skill routing");
-    expect(output).toContain("gstack `plan-eng-review`");
+    expect(output).toContain("parent agent with `geju` pre-contract framing and parent-owned P1/P2/P3");
+    expect(output.toLowerCase()).not.toContain("gstack");
     expect(output).toContain("Waza `/think`, `/hunt`, `/check`");
     expect(output).toContain(".ai/harness/active-plan as authoritative only for this worktree");
-    expect(output).toContain("new-spec.sh");
-    expect(output).toContain("new-sprint.sh");
+    expect(output).toContain("repo-harness run new-spec");
+    expect(output).toContain("repo-harness run new-plan");
     expect(output).toContain("The main agent decides whether to spawn based on task breadth");
     expect(output).toContain("Do not ask the user for spawn confirmation");
-    expect(output).toContain("bash .ai/harness/scripts/check-task-sync.sh");
-    expect(output).toContain("bash .ai/harness/scripts/check-task-workflow.sh --strict");
-    expect(output).toContain("bash .ai/harness/scripts/verify-contract.sh --contract <active-plan-contract> --strict");
+    expect(output).toContain("repo-harness run check-task-sync");
+    expect(output).toContain("repo-harness run check-task-workflow --strict");
+    expect(output).toContain("repo-harness run verify-contract --contract <active-plan-contract> --strict");
     expect(output).toContain("Which workflow artifacts were updated");
   });
 
@@ -80,8 +81,10 @@ describe("AGENTS Target Assembly", () => {
     expect(agents.toLowerCase()).toContain("single source of truth");
     expect(claude).toContain("RECOVERY: hybrid");
     expect(agents).toContain("Recovery profile: `hybrid`.");
-    expect(claude).toContain("gstack `plan-eng-review`");
-    expect(agents).toContain("gstack `plan-eng-review`");
+    expect(claude).toContain("use `geju` for pre-contract framing");
+    expect(agents).toContain("parent agent with `geju` pre-contract framing and parent-owned P1/P2/P3");
+    expect(claude.toLowerCase()).not.toContain("gstack");
+    expect(agents.toLowerCase()).not.toContain("gstack");
   });
 
   test("should render cloudflare section for both targets when enabled by plan", () => {

@@ -2,17 +2,22 @@ import { createHash } from 'crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync, appendFileSync } from 'fs';
 import { homedir } from 'os';
 import { basename, dirname, isAbsolute, join, resolve } from 'path';
-import { isRegisteredRepoHarnessRoot, readRegisteredRepoHarnessRepos, repoHarnessRepoIdFor } from '../../effects/repo-registry';
+import { isRegisteredRepoHarnessRoot, readRegisteredRepoHarnessRepos } from '../../effects/repo-registry';
 import { runProcess } from '../../effects/process-runner';
 import { runHelper } from '../runtime/helper-runner';
 import { listSessions, openSession, readSession, runBrowserConsult, runBrowserFollowup } from '../chatgpt-browser/engine';
 import type { BrowserProviderName, NativeBrowserChannel, ThinkingLevel } from '../chatgpt-browser/types';
 import { hashMcpInput, tryWriteMcpAuditEntry } from './audit';
+import { loadMcpLocalConfig } from './auth';
 import { isPathInside, resolveMcpPath } from './paths';
 import { buildReaderToolDefinitions, callReaderTool, createReaderToolContext, isReaderTool } from './reader-tools';
-import { callGeneralRepoTool } from './general-repo-access';
+import { buildCodingToolDefinitions, callCodingTool, isCodingTool, type CodingToolContext } from './coding-tools';
+import type { CodingWorkspaceManager } from './coding-workspaces';
+import type { GeneralRepoCodeGraphAdapter } from './codegraph-adapter';
+import type { McpProcessSessionManager } from './process-sessions';
 import { currentGitBranch, isRepoHarnessAdopted, resolveMcpRepoRoot } from './repo';
 import { redactMcpText } from './redaction';
+import { buildStateToolDefinitions, callStateTool, isStateTool } from './state-tools';
 import type { McpAgentRunnerName, McpPolicy } from './types';
 import type { WorkspaceManager } from './workspaces';
 
@@ -21,6 +26,24 @@ export interface McpToolContext {
   policy: McpPolicy;
   enableChatgptBrowser?: boolean;
   workspaceManager?: WorkspaceManager;
+  codingWorkspaceManager?: CodingWorkspaceManager;
+  processManager?: McpProcessSessionManager;
+  sessionOwnerId?: string;
+  codeGraphAdapter?: GeneralRepoCodeGraphAdapter;
+}
+
+function codingContext(ctx: McpToolContext): CodingToolContext {
+  if (!ctx.codingWorkspaceManager || !ctx.processManager || !ctx.sessionOwnerId) {
+    throw new Error('coding MCP runtime is not initialized');
+  }
+  return {
+    repoRoot: ctx.repoRoot,
+    policy: ctx.policy,
+    ownerId: ctx.sessionOwnerId,
+    workspaceManager: ctx.codingWorkspaceManager,
+    processManager: ctx.processManager,
+    codeGraphAdapter: ctx.codeGraphAdapter,
+  };
 }
 
 function readerContext(ctx: McpToolContext) {
@@ -44,7 +67,6 @@ interface CallToolResult {
 
 const DEFAULT_DISCOVERY_DEPTH = 7;
 const DEFAULT_DISCOVERY_LIMIT = 25;
-const GENERAL_REPO_READ_SINGLE_CHUNK_BYTES = 262_144;
 const DISCOVERY_SKIP_DIRS = new Set([
   '.bun',
   '.codegraph',
@@ -388,33 +410,6 @@ function fileSummary(path: string, repoRoot: string): { path: string; size: numb
   }
 }
 
-async function readWorkflowFileViaGeneralRepo(ctx: McpToolContext, repoRoot: string, relativePath: string, fileSize: number): Promise<CallToolResult | null> {
-  if (
-    !ctx.policy.generalRepo.general_repo_read ||
-    ctx.policy.generalRepo.rollback_to_legacy_tools ||
-    fileSize > GENERAL_REPO_READ_SINGLE_CHUNK_BYTES
-  ) {
-    return null;
-  }
-  const repoId = repoHarnessRepoIdFor(realpathSync(repoRoot));
-  const result = await callGeneralRepoTool(ctx, 'read_file', { repo_id: repoId, path: relativePath });
-  const payload = typeof result.structuredContent === 'object' && result.structuredContent !== null
-    ? result.structuredContent as Record<string, unknown>
-    : JSON.parse(result.content[0]?.text ?? '{}') as Record<string, unknown>;
-  if (payload.error) return result;
-  if (payload.encoding !== 'utf-8' || typeof payload.content !== 'string' || payload.has_more === true) return null;
-  const redacted = redactMcpText(payload.content);
-  return textResult({
-    path: relativePath,
-    size: fileSize,
-    sha256: payload.sha256,
-    redactions: redacted.redactions,
-    content: redacted.text,
-    source: 'general_repo_read_file',
-    correlation_id: payload.correlation_id,
-  });
-}
-
 function listFilesUnder(repoRoot: string, root: string, maxFiles: number, out: string[]): void {
   if (out.length >= maxFiles) return;
   const absoluteRoot = join(repoRoot, root);
@@ -546,7 +541,7 @@ function runAgentGoal(ctx: McpToolContext, args: Record<string, unknown>): CallT
     timedOut: result.timedOut,
     stdout: stdout.text,
     stderr: stderr.text,
-    redactions: redactedGoal.redactions + stdout.redactions + stderr.redactions,
+    redactions: redactedGoal.redactions.concat(stdout.redactions, stderr.redactions),
   });
 }
 
@@ -605,12 +600,27 @@ function writeMarkdownArtifact(
   return textResult({ status: 'written', repoRoot, path: relativePath, ...(extra ?? {}) });
 }
 
+// Canonical anti-extras clause injected into every runner-reachable surface (this
+// codex-goal path, the contract-run.ts worker prompt, the Codex delegation advisor hook,
+// and subagent start context). Keep the first sentence byte-identical across all
+// sources; a parity test asserts they never drift apart.
+const EXECUTION_BOUNDARY = [
+  'Execution boundary: implement exactly the Goal, In scope items, Allowed Paths, and Exit Criteria in this brief. Treat absent requirements as forbidden design space, not as permission to improve.',
+  '',
+  'Do not add optional features, alternate UX, extra integrations, migration paths, compatibility behavior, fallback behavior, telemetry, broad cleanup, refactors, new abstractions, extra docs, or polish unless that work is explicitly listed under In scope or required by Exit Criteria.',
+  '',
+  'If you discover useful additional work, record it under Out of scope / Future work in the notes or review artifact. Do not implement it. Do not end with unsolicited offers to do more work.',
+  '',
+  'If the requested outcome cannot be completed without expanding scope, fail closed: stop, name the missing decision, and cite the exact file/section that blocks execution.',
+].join('\n');
+
 function validateGoal(body: string): string[] {
   return [
     '# Codex Goal',
     '## Source of truth',
     '## Role',
     '## Scope',
+    '## Execution boundary',
     '## Required workflow',
     '## Required checks',
     '## Done when',
@@ -768,6 +778,10 @@ function renderCodexGoalFromSprint(args: Record<string, unknown>): { body: strin
     '- Update the Sprint checklist as phases complete.',
     '- Stage each completed phase before continuing to the next phase.',
     '- Do not modify the reference repo or ignored secrets/ops state.',
+    '',
+    '## Execution boundary',
+    '',
+    EXECUTION_BOUNDARY,
     '',
     '## Required workflow',
     '',
@@ -962,7 +976,7 @@ export function buildMcpToolDefinitions(policy: McpPolicy, opts: { enableChatgpt
     { name: 'latest_checks', description: 'Return latest repo-harness check artifacts.', inputSchema: optionalRepoSchema, annotations: readOnly },
     { name: 'list_prds', description: 'List PRD artifacts under plans/prds.', inputSchema: optionalRepoSchema, annotations: readOnly },
     { name: 'list_sprints', description: 'List sprint artifacts under plans/sprints.', inputSchema: optionalRepoSchema, annotations: readOnly },
-    { name: 'summarize_repo_harness_state', description: 'Return a compact planning state summary.', inputSchema: optionalRepoSchema, annotations: readOnly },
+    ...buildStateToolDefinitions(),
     { name: 'write_prd', description: 'Write a PRD under plans/prds/*.prd.md.', inputSchema: markdownWriterSchema, annotations: write },
     { name: 'write_prd_from_idea', description: 'Turn a product idea into a strict-compatible draft PRD under plans/prds/*.prd.md.', inputSchema: ideaPrdSchema, annotations: write },
     { name: 'write_sprint', description: 'Write a sprint under plans/sprints/*.sprint.md.', inputSchema: markdownWriterSchema, annotations: write },
@@ -998,6 +1012,9 @@ export function buildMcpToolDefinitions(policy: McpPolicy, opts: { enableChatgpt
   }
   if (policy.capabilities.workspaceReader) {
     tools.push(...buildReaderToolDefinitions(policy));
+  }
+  if (policy.capabilities.workspaceCoder && policy.execution.codingShell) {
+    tools.push(...buildCodingToolDefinitions());
   }
   if (opts.enableChatgptBrowser === true) {
     tools.push(
@@ -1059,11 +1076,24 @@ export function buildMcpToolDefinitions(policy: McpPolicy, opts: { enableChatgpt
 
 export async function callMcpTool(ctx: McpToolContext, name: string, args: Record<string, unknown> = {}): Promise<CallToolResult> {
   try {
+    if (isCodingTool(name) && ctx.policy.capabilities.workspaceCoder) {
+      return callCodingTool(codingContext(ctx), name, args);
+    }
     if (isReaderTool(name, ctx.policy)) {
       if (!ctx.policy.capabilities.workspaceReader) {
         return errorResult('TOOL_NOT_AVAILABLE', 'reader tools require the workspace reader capability to be enabled in MCP config.');
       }
       return callReaderTool(readerContext(ctx), name, args);
+    }
+    if (isStateTool(name)) {
+      const target = targetRepoRoot(ctx, args);
+      if (!target.ok) return target.result;
+      const result = callStateTool({
+        repoRoot: target.repoRoot,
+        mcpPolicyProfile: ctx.policy.profile,
+      }, name);
+      audit(ctx, name, 'ok', args);
+      return textResult(result);
     }
     switch (name) {
       case 'harness_status': {
@@ -1082,7 +1112,10 @@ export async function callMcpTool(ctx: McpToolContext, name: string, args: Recor
       case 'harness_doctor': {
         const target = targetRepoRoot(ctx, args);
         if (!target.ok) return target.result;
-        const localConfig = existsSync(join(target.repoRoot, '.repo-harness', 'mcp.local.json'));
+        // MCP config has one storage authority (~/.repo-harness, or
+        // REPO_HARNESS_HOME); it is not per-repo, so this must not probe the
+        // retired <repo>/.repo-harness path. Same shape as runMcpDoctor.
+        const localConfig = Boolean(loadMcpLocalConfig());
         const codexConfig = existsSync(join(target.repoRoot, '.codex', 'config.toml'));
         audit(ctx, name, 'ok', args);
         return textResult({
@@ -1133,11 +1166,6 @@ export async function callMcpTool(ctx: McpToolContext, name: string, args: Recor
         const fileStat = statSync(decision.absolutePath);
         if (!fileStat.isFile()) return errorResult('NOT_A_FILE', `path is not a file: ${decision.relativePath}`);
         if (fileStat.size > ctx.policy.maxFileBytes) return errorResult('FILE_TOO_LARGE', `file exceeds ${ctx.policy.maxFileBytes} bytes`);
-        const generalRepoRead = await readWorkflowFileViaGeneralRepo(ctx, target.repoRoot, decision.relativePath, fileStat.size);
-        if (generalRepoRead) {
-          audit(ctx, name, generalRepoRead.isError ? 'blocked' : 'ok', args, decision.relativePath);
-          return generalRepoRead;
-        }
         const bytes = readFileSync(decision.absolutePath);
         if (isProbablyBinary(bytes)) return errorResult('BINARY_FILE', 'binary files are not supported');
         const raw = bytes.toString('utf-8');
@@ -1186,22 +1214,6 @@ export async function callMcpTool(ctx: McpToolContext, name: string, args: Recor
         listFilesUnder(target.repoRoot, root, 200, files);
         audit(ctx, name, 'ok', args);
         return textResult({ files: files.map((path) => fileSummary(path, target.repoRoot)).filter(Boolean) });
-      }
-      case 'summarize_repo_harness_state': {
-        const target = targetRepoRoot(ctx, args);
-        if (!target.ok) return target.result;
-        const current = existsSync(join(target.repoRoot, 'tasks/current.md'))
-          ? readFileSync(join(target.repoRoot, 'tasks/current.md'), 'utf-8').split(/\r?\n/).slice(0, 50).join('\n')
-          : null;
-        audit(ctx, name, 'ok', args);
-        return textResult({
-          status: {
-            adopted: isRepoHarnessAdopted(target.repoRoot),
-            branch: currentGitBranch(target.repoRoot),
-            profile: ctx.policy.profile,
-          },
-          current: current ? redactMcpText(current).text : null,
-        });
       }
       case 'write_prd': {
         const target = targetRepoRoot(ctx, args);

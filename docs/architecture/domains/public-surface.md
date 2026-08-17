@@ -1,6 +1,6 @@
 # Architecture Domain: Public Surface
 
-> **Source**: `.ai/context/capabilities.json`
+> **Source**: `repo-harness run capability-resolver`
 > **Owner**: Root router and command facade docs.
 
 ## Purpose
@@ -27,4 +27,4 @@ compatibility router, README, root agent docs, the `repo-harness` CLI, and thin
 
 - `bun test tests/action-command-skills.test.ts`
 - `bun scripts/inspect-project-state.ts --repo . --format text`
-- `bash scripts/migrate-project-template.sh --repo . --dry-run`
+- `repo-harness init --repo . --dry-run`

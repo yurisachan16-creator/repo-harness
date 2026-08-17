@@ -4,26 +4,63 @@ import { join } from "path";
 
 const ROOT = join(import.meta.dir, "..");
 
+const RETIRED_HOOK_RUNTIME_FILES = [
+  "assets/hooks/anti-simplification.sh",
+  "assets/hooks/changelog-guard.sh",
+  "assets/hooks/codex-delegation-advisor.sh",
+  "assets/hooks/first-principles-guard.sh",
+  "assets/hooks/hook-input.sh",
+  "assets/hooks/post-bash.sh",
+  "assets/hooks/post-tool-observer.sh",
+  "assets/hooks/prompt-guard.sh",
+  "assets/hooks/run-hook.sh",
+  "assets/hooks/subagent-return-channel-guard.sh",
+  "assets/hooks/subagent-start-context.sh",
+  "assets/hooks/subagent-stop-quality.sh",
+  "assets/hooks/lib/minimal-change.sh",
+  "assets/hooks/lib/session-state.sh",
+  ".ai/hooks/anti-simplification.sh",
+  ".ai/hooks/changelog-guard.sh",
+  ".ai/hooks/codex-delegation-advisor.sh",
+  ".ai/hooks/first-principles-guard.sh",
+  ".ai/hooks/hook-input.sh",
+  ".ai/hooks/post-bash.sh",
+  ".ai/hooks/post-tool-observer.sh",
+  ".ai/hooks/prompt-guard.sh",
+  ".ai/hooks/run-hook.sh",
+  ".ai/hooks/subagent-return-channel-guard.sh",
+  ".ai/hooks/subagent-start-context.sh",
+  ".ai/hooks/subagent-stop-quality.sh",
+  ".ai/hooks/lib/minimal-change.sh",
+  ".ai/hooks/lib/session-state.sh",
+  "scripts/hook-shim.sh",
+  "scripts/repo-harness.sh",
+];
+
 function read(relPath: string): string {
   return readFileSync(join(ROOT, relPath), "utf-8");
 }
 
 describe("Bootstrap Script Contracts", () => {
-  test("SKILL.md should stay within 500-line budget", () => {
+  test("root SKILL stays a compact five-action router", () => {
     const skill = read("SKILL.md");
-    expect(skill.split("\n").length).toBeLessThanOrEqual(500);
+    const body = skill.replace(/^---\n[\s\S]*?\n---\n/u, "");
+    // The root SKILL.md is the router: every host loads it into context on every
+    // session, before any action is chosen. The 2048-byte ceiling is a standing
+    // budget on that always-resident cost, not an arbitrary style limit — content
+    // that grows past it belongs in a reference file the router points at.
+    expect(Buffer.byteLength(body, "utf-8")).toBeLessThanOrEqual(2048);
+    expect(skill.split("\n").length).toBeLessThanOrEqual(80);
   });
 
-  test("router should advertise scaffold plus existing-repo maintenance paths", () => {
+  test("router exposes only the five default semantic actions", () => {
     const skill = read("SKILL.md");
-    expect(skill).toContain("1. **Scaffold**");
-    expect(skill).toContain("2. **Initialize**");
-    expect(skill).toContain("3. **Migrate**");
-    expect(skill).toContain("4. **Audit**");
-    expect(skill).toContain("5. **Repair**");
-    expect(skill).not.toContain("5. **Skill Factory**");
-    expect(skill).not.toContain("references/skill-factory-guide.md");
-    expect(existsSync(join(ROOT, "references/skill-factory-guide.md"))).toBe(false);
+    for (const [index, action] of ["setup", "plan", "execute", "verify", "handoff"].entries()) {
+      expect(skill).toContain(`${index + 1}. **${action}**`);
+    }
+    expect(skill).not.toContain("Core Plans (A-F)");
+    expect(skill).not.toContain("Custom Presets (G-K)");
+    expect(skill).not.toContain("## Hook");
   });
 
   test("Codex agent metadata should exist for user-level installation", () => {
@@ -34,12 +71,76 @@ describe("Bootstrap Script Contracts", () => {
     expect(metadata).toContain("default_prompt:");
   });
 
-  test("repo root should include routing docs and self-host hook implementation", () => {
+  test("Codex fleet subagent TOML definitions should exist with required keys", () => {
+    const packageManifest = JSON.parse(read("package.json"));
+    expect(packageManifest.files).toContain("agents/");
+    const specs: Array<{ name: string; model: string; effort: string; sandboxMode?: string }> = [
+      { name: "explorer", model: "gpt-5.6-luna", effort: "high", sandboxMode: "read-only" },
+      { name: "deep-reasoner", model: "gpt-5.6-terra", effort: "xhigh", sandboxMode: "read-only" },
+      { name: "fast-worker", model: "gpt-5.6-luna", effort: "max", sandboxMode: "workspace-write" },
+      { name: "deep-worker", model: "gpt-5.6-terra", effort: "xhigh", sandboxMode: "workspace-write" },
+      { name: "gatekeeper", model: "gpt-5.6-terra", effort: "xhigh", sandboxMode: "read-only" },
+      { name: "root-cause-prover", model: "gpt-5.6-terra", effort: "high", sandboxMode: "workspace-write" },
+      { name: "harness-evaluator", model: "gpt-5.6-terra", effort: "high", sandboxMode: "workspace-write" },
+    ];
+
+    for (const spec of specs) {
+      const path = `.codex/agents/${spec.name}.toml`;
+      expect(existsSync(join(ROOT, path))).toBe(true);
+
+      const toml = read(path);
+      expect(toml).toContain(`name = "${spec.name}"`);
+      expect(toml).toContain("description = ");
+      expect(toml).toContain(`model = "${spec.model}"`);
+      expect(toml).toContain(`model_reasoning_effort = "${spec.effort}"`);
+      expect(toml).not.toContain("Opus 4.8 at max effort");
+      expect(toml).not.toContain("Sonnet 5 at max effort");
+      expect(toml).toContain("developer_instructions = '''");
+      expect(toml).toContain(
+        "Execution boundary: implement exactly the Goal, In scope items, Allowed Paths, and Exit Criteria in this brief."
+      );
+      expect(read(`agents/fleet/${spec.name}.md`)).toContain(`name: ${spec.name}`);
+      if (spec.sandboxMode) {
+        expect(toml).toContain(`sandbox_mode = "${spec.sandboxMode}"`);
+      }
+    }
+
+    expect(existsSync(join(ROOT, "agents/fleet/explore.md"))).toBe(false);
+    const rootCause = read("agents/fleet/root-cause-prover.md");
+    for (const field of ["root_cause", "repro", "regression_guard", "pre_fix_failure_artifact"]) {
+      expect(rootCause).toContain(field);
+    }
+    expect(rootCause).toContain("DIAGNOSIS: CONFIRMED");
+    expect(rootCause).toContain("Never edit production source");
+    expect(rootCause).toContain("pipeline is forbidden");
+
+    const evaluator = read("agents/fleet/harness-evaluator.md");
+    expect(evaluator).toContain("EVAL: PASS");
+    expect(evaluator).toContain("evals/bdd2/**");
+    expect(evaluator).toContain("scripts/run-bdd2-evals.ts");
+    expect(evaluator).toContain("fail closed");
+    expect(evaluator).toContain("disposable clone/worktree");
+    expect(evaluator).toContain("--run-adoption-profile");
+    expect(evaluator).toContain("Workspace-write is disposable-only");
+
+    const routing = read("docs/reference-configs/agentic-development-flow.md");
+    expect(routing).toContain("host-native Explore");
+    expect(routing).toContain("Formal contract");
+    expect(routing).toContain("prompt inheritance");
+  });
+
+  test("repo root should include routing docs and one typed hook implementation", () => {
     expect(existsSync(join(ROOT, "CLAUDE.md"))).toBe(true);
     expect(existsSync(join(ROOT, "AGENTS.md"))).toBe(true);
     expect(existsSync(join(ROOT, ".claude/settings.json"))).toBe(false);
     expect(existsSync(join(ROOT, ".codex/hooks.json"))).toBe(false);
-    expect(existsSync(join(ROOT, ".ai/hooks/run-hook.sh"))).toBe(true);
+    expect(existsSync(join(ROOT, "src/cli/hook-entry.ts"))).toBe(true);
+    expect(existsSync(join(ROOT, "src/cli/hook/runtime.ts"))).toBe(true);
+    expect(existsSync(join(ROOT, "src/cli/hook/hook-input.ts"))).toBe(true);
+    expect(existsSync(join(ROOT, "assets/hooks/lib/workflow-state.sh"))).toBe(true);
+    for (const retired of RETIRED_HOOK_RUNTIME_FILES) {
+      expect(existsSync(join(ROOT, retired))).toBe(false);
+    }
 
     const claude = read("CLAUDE.md");
     const agents = read("AGENTS.md");
@@ -48,10 +149,13 @@ describe("Bootstrap Script Contracts", () => {
     expect(claude).toContain(".ai/hooks/");
     expect(claude).toContain("agentic-development-flow.md");
     expect(claude).toContain("external-tooling.md");
-    expect(claude).toContain("gstack");
+    expect(claude).toContain("geju");
+    expect(claude).not.toContain("gstack");
+    expect(claude).toContain("operations.deploy_sql");
     expect(agents).toContain("tasks/todos.md");
-    expect(agents).toContain("check-task-workflow.sh --strict");
+    expect(agents).toContain("repo-harness run check-task-workflow --strict");
     expect(agents).toContain("check-agent-tooling.sh --host both --check-updates");
+    expect(agents).toContain("operations.deploy_sql");
   });
 
   test("repo package should expose workflow verification scripts", () => {
@@ -61,20 +165,20 @@ describe("Bootstrap Script Contracts", () => {
     expect(pkg.version).toMatch(/^\d+\.\d+\.\d+$/);
     expect(pkg.private).toBeUndefined();
     expect(pkg.bin["repo-harness"]).toBe("src/cli/index.ts");
-    expect(pkg.bin["repo-harness-hook"]).toBe("src/cli/hook-entry.ts");
+    expect(pkg.bin["repo-harness-hook"]).toBe("dist/hook-entry.js");
     expect(pkg.files).toContain("assets/");
     expect(pkg.files).not.toContain("docs/reference-configs/");
     expect(cliEntry).toContain("CLI_VERSION");
     expect(cliEntry).toContain("buildDocsCommand");
     expect(cliEntry).not.toMatch(/\\.version\\(['\"][0-9]+\\.[0-9]+\\.[0-9]+['\"]\\)/);
     expect(pkg.scripts["check:ci"]).toBe("bash scripts/check-ci.sh");
-    expect(pkg.scripts["check:brain-manifest"]).toBe("bash scripts/check-brain-manifest.sh");
-    expect(pkg.scripts["check:task-sync"]).toBe("bash scripts/check-task-sync.sh");
-    expect(pkg.scripts["check:deploy-sql"]).toBe("bash scripts/check-deploy-sql-order.sh");
-    expect(pkg.scripts["check:architecture-sync"]).toBe("bash scripts/check-architecture-sync.sh");
-    expect(pkg.scripts["check:task-workflow"]).toBe("bash scripts/check-task-workflow.sh --strict");
-    expect(pkg.scripts["check:context-files"]).toBe("bash scripts/check-context-files.sh");
-    expect(pkg.scripts["sync:brain-docs"]).toBe("bash scripts/sync-brain-docs.sh --all");
+    expect(pkg.scripts["check:brain-manifest"]).toBe("repo-harness run check-brain-manifest");
+    expect(pkg.scripts["check:task-sync"]).toBe("repo-harness run check-task-sync");
+    expect(pkg.scripts["check:deploy-sql"]).toBe("repo-harness run check-deploy-sql-order");
+    expect(pkg.scripts["check:architecture-sync"]).toBe("repo-harness run check-architecture-sync");
+    expect(pkg.scripts["check:task-workflow"]).toBe("repo-harness run check-task-workflow --strict");
+    expect(pkg.scripts["check:context-files"]).toBe("repo-harness run check-context-files");
+    expect(pkg.scripts["sync:brain-docs"]).toBe("repo-harness run sync-brain-docs --all");
   });
 
   test("ci gate should refresh handoff current before resume packet", () => {
@@ -129,13 +233,14 @@ describe("Bootstrap Script Contracts", () => {
     expect(content).toContain("cat > tasks/lessons.md");
     expect(content).toContain("cat > docs/researches/README.md");
     expect(content).not.toContain("docs/TODO.md");
-    expect(sharedLib).toContain("new-plan.sh");
-    expect(sharedLib).toContain("capture-plan.sh");
-    expect(sharedLib).toContain("plan-to-todo.sh");
-    expect(sharedLib).toContain("contract-worktree.sh");
-    expect(sharedLib).toContain("archive-workflow.sh");
-    expect(sharedLib).toContain("verify-contract.sh");
-    expect(sharedLib).toContain("summarize-failures.sh");
+    expect(sharedLib).toContain("pi_install_helpers requires contract helper inventory");
+    expect(contract.helpers.scripts).toContain("new-plan.sh");
+    expect(contract.helpers.scripts).toContain("capture-plan.sh");
+    expect(contract.helpers.scripts).toContain("plan-to-todo.sh");
+    expect(contract.helpers.scripts).toContain("contract-worktree.sh");
+    expect(contract.helpers.scripts).toContain("archive-workflow.sh");
+    expect(contract.helpers.scripts).toContain("verify-contract.sh");
+    expect(contract.helpers.scripts).toContain("summarize-failures.sh");
     expect(sharedLib).toContain("check:context-files");
     expect(sharedLib).toContain("check:deploy-sql");
     expect(sharedLib).toContain("check:brain-manifest");
@@ -144,7 +249,7 @@ describe("Bootstrap Script Contracts", () => {
     expect(sharedLib).toContain("fallback_runner");
     expect(sharedLib).toContain("if spawning is not worthwhile");
     expect(sharedLib).toContain("pi_print_external_tooling_report");
-    expect(sharedLib).toContain("check-task-sync.sh");
+    expect(contract.helpers.scripts).toContain("check-task-sync.sh");
     expect(content).toContain("mkdir -p .ai/context");
     expect(content).toContain(".ai/harness/policy.json");
     expect(content).toContain(".ai/context/context-map.json");
@@ -179,8 +284,8 @@ describe("Bootstrap Script Contracts", () => {
     expect(contract.helpers.scripts).toContain("select-agent-context-blocks.sh");
     expect(contract.helpers.scripts).toContain("architecture-event.ts");
     expect(contract.helpers.scripts).toContain("capability-config.ts");
-    expect(sharedLib).toContain("ensure-task-workflow.sh");
-    expect(sharedLib).toContain("check-task-workflow.sh");
+    expect(contract.helpers.scripts).toContain("ensure-task-workflow.sh");
+    expect(contract.helpers.scripts).toContain("check-task-workflow.sh");
     expect(sharedLib).not.toContain("skill-factory-create.sh");
     expect(sharedLib).not.toContain("skill-factory-check.sh");
     expect(sharedLib).toContain("pi_install_workflow_contract");
@@ -196,26 +301,25 @@ describe("Bootstrap Script Contracts", () => {
     expect(contract.artifacts.requiredFiles).toContain(".claude/templates/implementation-notes.template.md");
     expect(content).toContain("install_workflow_contract");
     expect(content).toContain("pi_install_hook_assets");
-    expect(content).toContain('pi_install_hook_adapters "$PWD" "$ASSETS_HOOKS_DIR" "apply"');
+    expect(content).not.toContain("pi_install_hook_adapters");
     expect(content).toContain("pi_print_codex_hook_trust_notice");
     expect(sharedLib).toContain('local hooks_dir="$target_dir/.ai/hooks"');
     expect(content).not.toContain("mkdir -p .codex");
-    expect(sharedLib).toContain("pi_retire_project_hook_adapter");
-    expect(sharedLib).toContain(".claude/settings.json");
-    expect(sharedLib).toContain(".codex/hooks.json");
+    expect(sharedLib).not.toContain("pi_retire_project_hook_adapter");
+    expect(sharedLib).not.toContain("pi_prune_repo_local_hook_runtime");
     expect(contract.helpers.scripts).toContain("switch-plan.sh");
     expect(contract.helpers.scripts).toContain("capability-resolver.ts");
     expect(contract.helpers.scripts).toContain("architecture-event.ts");
     expect(contract.helpers.scripts).toContain("capability-config.ts");
-    expect(contract.artifacts.requiredFiles).toContain("scripts/contract-worktree.sh");
-    expect(contract.artifacts.requiredFiles).toContain("scripts/contract-run.ts");
-    expect(contract.artifacts.requiredFiles).toContain("scripts/ship-worktrees.sh");
-    expect(contract.artifacts.requiredFiles).toContain("scripts/heartbeat-triage.sh");
-    expect(contract.artifacts.requiredFiles).toContain("scripts/capture-plan.sh");
-    expect(contract.artifacts.requiredFiles).toContain("scripts/refresh-current-status.sh");
-    expect(contract.artifacts.requiredFiles).toContain("scripts/sync-brain-docs.sh");
+    expect(contract.artifacts.requiredFiles).not.toContain("scripts/contract-worktree.sh");
+    expect(contract.artifacts.requiredFiles).not.toContain("scripts/contract-run.ts");
+    expect(contract.artifacts.requiredFiles).not.toContain("scripts/ship-worktrees.sh");
+    expect(contract.artifacts.requiredFiles).not.toContain("scripts/heartbeat-triage.sh");
+    expect(contract.artifacts.requiredFiles).not.toContain("scripts/capture-plan.sh");
+    expect(contract.artifacts.requiredFiles).not.toContain("scripts/refresh-current-status.sh");
+    expect(contract.artifacts.requiredFiles).not.toContain("scripts/sync-brain-docs.sh");
     expect(contract.artifacts.requiredFiles).toContain("tasks/current.md");
-    expect(contract.artifacts.requiredFiles).toContain("scripts/capability-config.ts");
+    expect(contract.artifacts.requiredFiles).not.toContain("scripts/capability-config.ts");
     expect(contract.artifacts.requiredFiles).toContain(".ai/harness/workflow-contract.json");
     expect(contract.artifacts.requiredFiles).not.toContain(".codex/hooks.json");
     expect(contract.artifacts.requiredFiles).toContain(".ai/harness/brain-manifest.json");
@@ -223,8 +327,8 @@ describe("Bootstrap Script Contracts", () => {
     expect(contract.artifacts.requiredFiles).toContain(".ai/context/capability-source-map.json");
     expect(contract.artifacts.requiredFiles).not.toContain(".ai/harness/handoff/resume.md");
     expect(contract.artifacts.requiredFiles).not.toContain(".ai/harness/context-budget/latest.json");
-    expect(read("assets/templates/review.template.md")).toContain("## External Acceptance Advice");
-    expect(sharedLib).toContain("## External Acceptance Advice");
+    expect(read("assets/templates/review.template.md")).toContain("## Acceptance Receipt Projection");
+    expect(sharedLib).toContain("AcceptanceReceipt");
     expect(contract.artifacts.runtimeFiles).toContain(".ai/harness/handoff/resume.md");
     expect(contract.artifacts.runtimeFiles).not.toContain(".ai/harness/context-budget/latest.json");
     expect(contract.artifacts.runtimeFiles).toContain(".ai/harness/capability-context/");
@@ -252,12 +356,11 @@ describe("Bootstrap Script Contracts", () => {
     expect(contract.artifacts.requiredDirectories).toContain("tasks/notes");
     expect(contract.artifacts.requiredDirectories).toContain("tasks/workstreams");
     expect(contract.artifacts.requiredDirectories).toContain(".ai/harness/triage");
-    expect(contract.agenticDevelopment.routing.productDiscovery).toBe("gstack:office-hours");
+    expect(contract.agenticDevelopment.routing.productDiscovery).toBe("parent-agent:geju");
     expect(sharedLib).not.toContain(".skill-factory-state.json");
     expect(sharedLib).not.toContain(".memory-context.json");
     expect(sharedLib).not.toContain(".memory-snapshot.json");
     expect(content).not.toContain("install_skill_factory_files");
-    expect(content).toContain("create_contract_directories");
     expect(contract.artifacts.requiredDirectories).toContain("tasks/contracts");
     expect(contract.artifacts.requiredDirectories).toContain("tasks/reviews");
     expect(contract.artifacts.requiredDirectories).toContain("tasks/notes");
@@ -282,15 +385,16 @@ describe("Bootstrap Script Contracts", () => {
     expect(content).toContain("install_workflow_contract");
     expect(sharedLib).toContain("contract.template.md");
     expect(sharedLib).toContain("implementation-notes.template.md");
-    expect(sharedLib).toContain("verify-contract.sh");
-    expect(sharedLib).toContain("summarize-failures.sh");
+    expect(sharedLib).toContain("pi_install_helpers requires contract helper inventory");
+    expect(contract.helpers.scripts).toContain("verify-contract.sh");
+    expect(contract.helpers.scripts).toContain("summarize-failures.sh");
     expect(sharedLib).toContain("check:context-files");
     expect(sharedLib).toContain("check:deploy-sql");
     expect(sharedLib).toContain("pi_print_external_tooling_report");
-    expect(sharedLib).toContain("check-task-sync.sh");
-    expect(sharedLib).toContain("ensure-task-workflow.sh");
-    expect(sharedLib).toContain("capture-plan.sh");
-    expect(sharedLib).toContain("check-task-workflow.sh");
+    expect(contract.helpers.scripts).toContain("check-task-sync.sh");
+    expect(contract.helpers.scripts).toContain("ensure-task-workflow.sh");
+    expect(contract.helpers.scripts).toContain("capture-plan.sh");
+    expect(contract.helpers.scripts).toContain("check-task-workflow.sh");
     expect(content).toContain(".ai/context");
     expect(content).toContain(".ai/harness/policy.json");
     expect(content).toContain(".ai/context/context-map.json");
@@ -313,9 +417,9 @@ describe("Bootstrap Script Contracts", () => {
     expect(contract.helpers.scripts).toContain("contract-run.ts");
     expect(contract.helpers.scripts).toContain("heartbeat-triage.sh");
     expect(contract.artifacts.requiredFiles).toContain("docs/reference-configs/agentic-development-flow.md");
-    expect(contract.artifacts.requiredFiles).toContain("scripts/capture-plan.sh");
-    expect(contract.artifacts.requiredFiles).toContain("scripts/contract-run.ts");
-    expect(contract.artifacts.requiredFiles).toContain("scripts/heartbeat-triage.sh");
+    expect(contract.artifacts.requiredFiles).not.toContain("scripts/capture-plan.sh");
+    expect(contract.artifacts.requiredFiles).not.toContain("scripts/contract-run.ts");
+    expect(contract.artifacts.requiredFiles).not.toContain("scripts/heartbeat-triage.sh");
     expect(contract.artifacts.requiredFiles).toContain(".claude/templates/implementation-notes.template.md");
     expect(contract.artifacts.requiredDirectories).toContain("tasks/notes");
     expect(contract.artifacts.requiredDirectories).toContain("tasks/workstreams");
@@ -335,21 +439,19 @@ describe("Bootstrap Script Contracts", () => {
     expect(contract.artifacts.requiredFiles).toContain("docs/reference-configs/document-generation.md");
     expect(contract.artifacts.requiredFiles).toContain("docs/reference-configs/global-working-rules.md");
     expect(contract.artifacts.requiredFiles).toContain("docs/reference-configs/heartbeat-triage.md");
-    expect(content).toContain('pi_install_hook_adapters "$PWD" "$ASSETS_HOOKS_DIR" "apply"');
+    expect(content).not.toContain("pi_install_hook_adapters");
     expect(content).toContain("pi_print_codex_hook_trust_notice");
     expect(content).toContain("pi_install_hook_assets");
-    expect(sharedLib).toContain("pi_retire_project_hook_adapter");
-    expect(sharedLib).toContain("pi_repo_pins_hook_source");
+    expect(sharedLib).not.toContain("pi_retire_project_hook_adapter");
+    expect(sharedLib).not.toContain("pi_prune_repo_local_hook_runtime");
+    expect(sharedLib).not.toContain("pi_repo_pins_hook_source");
     expect(sharedLib).toContain("pi_write_hook_runtime_readme");
     expect(sharedLib).toContain("pi_install_hook_assets");
-    expect(sharedLib).toContain(".claude/settings.json");
-    expect(sharedLib).toContain(".codex/hooks.json");
     expect(sharedLib).toContain('local hooks_dir="$target_dir/.ai/hooks"');
     expect(content).not.toContain("mkdir -p .codex");
     expect(sharedLib).not.toContain(".skill-factory-state.json");
     expect(sharedLib).not.toContain(".memory-context.json");
     expect(sharedLib).not.toContain(".memory-snapshot.json");
-    expect(content).toContain("create_contract_directories");
     expect(contract.artifacts.requiredDirectories).toContain("tasks/contracts");
     expect(contract.artifacts.requiredDirectories).toContain("tasks/reviews");
     expect(contract.artifacts.requiredDirectories).toContain("tasks/notes");
@@ -359,108 +461,71 @@ describe("Bootstrap Script Contracts", () => {
     expect(content).toContain("install_hook_settings_template");
     expect(content).not.toContain("\"$TOOL_INPUT\"");
     expect(content).not.toContain("\"$PROMPT\"");
-    expect(content).toContain("pi_install_reference_configs");
     expect(content).not.toContain("cp \"$ASSETS_REF_DIR\"/*.md docs/reference-configs/");
     expect(content).toContain("pi_print_external_tooling_report");
   });
 
-  test("prompt-guard should monitor tasks-first files", () => {
-    const content = read("assets/hooks/prompt-guard.sh");
+  test("typed hook runtime owns host events while workflow-state remains an operator helper", () => {
+    const runtime = read("src/cli/hook/runtime.ts");
+    const hookInput = read("src/cli/hook/hook-input.ts");
     const workflowState = read("assets/hooks/lib/workflow-state.sh");
 
-    expect(content).toContain("tasks/todos.md");
-    expect(content).toContain("tasks/lessons.md");
-    expect(content).toContain("docs/researches/");
+    expect(runtime).toContain("getHandlerForRoute");
+    expect(runtime).toContain("runHook");
+    expect(runtime).not.toContain("route.scripts");
+    expect(hookInput).toContain("export function parseHookInput");
+    expect(hookInput).toContain("getApplyPatchPaths");
     expect(workflowState).toContain("git status --porcelain=v1");
-    expect(content).toContain("has_changes_glob");
-    expect(content).toContain("PlanStatusGuard");
-    expect(content).toContain("ensure-task-workflow.sh");
-    // Block-path guards must use exit 2 so Claude Code's hook protocol treats
-    // them as blocking and surfaces stderr to the model (exit 1 is reported as
-    // "non-blocking status code: No stderr output").
-    expect(content).toContain("exit 2");
+    expect(workflowState).toContain("tasks/todos.md");
+    expect(workflowState).toContain("workflow_hook_cli_json");
   });
 
-  test("cross-review skills should include dirty working tree scope", () => {
-    const claudeReview = read("assets/skills/claude-review/SKILL.md");
-    const codexReview = read("assets/skills/codex-review/SKILL.md");
+  // SSD-06 migration: the two live shell-embedded provider skills
+  // (assets/skills/{claude-review,codex-review}) are deleted; their
+  // deterministic scope-capture mechanics (branch/staged/unstaged/untracked
+  // diff, exact-base binding) moved to code
+  // (src/effects/review/cross-review-runner.ts#captureCrossReviewScope,
+  // reused via diff-fingerprint.ts's buildReviewSubject) and are covered by
+  // tests/cli/cross-review.test.ts, not by scanning Skill Markdown for
+  // embedded shell variable assignments. This test now checks the one
+  // canonical repo-harness-cross-review package's own prose properties:
+  // read-only provider boundaries, model/timeout budgets, transcript
+  // recovery, and the no-merge-gate guarantee.
+  test("repo-harness-cross-review documents read-only scope, timeouts, transcript recovery, and no-merge-gate boundaries", () => {
+    const claudeMode = read("assets/skills/repo-harness-cross-review/references/claude-mode.md");
+    const codexMode = read("assets/skills/repo-harness-cross-review/references/codex-mode.md");
 
-    expect(claudeReview).toContain("BRANCH_DIFF=$(git diff");
-    expect(claudeReview).toContain("STAGED_DIFF=$(git diff --cached");
-    expect(claudeReview).toContain("UNSTAGED_DIFF=$(git diff");
-    expect(claudeReview).toContain("git ls-files --others --exclude-standard -z");
-    expect(claudeReview).toContain("git diff --no-index -- /dev/null");
-    expect(claudeReview).toContain("BASE=origin/main");
-    expect(claudeReview).toContain("else BASE=HEAD");
-    expect(claudeReview).toContain("Review the combined branch, staged, unstaged, and untracked changes");
-    expect(claudeReview).toContain("run_with_optional_timeout claude -p");
-    expect(claudeReview).toContain("recover_claude_review_from_transcript");
-    expect(claudeReview).toContain("~/.claude/projects/<project>/<session-id>.jsonl");
-    expect(claudeReview).toContain("CLAUDE_CONFIG_DIR");
-    expect(claudeReview).toContain("stdout was empty; output above was recovered from the session transcript");
-    expect(claudeReview).toContain("intentionally does not pass `--no-session-persistence`");
-    expect(claudeReview).not.toContain("${TO:+$TO 330}");
+    expect(claudeMode).toContain("read-only reviewer");
+    expect(claudeMode).toContain("no `Bash`/`Edit`/`Write`");
+    expect(claudeMode).toContain("Pinned to the `fable` alias");
+    expect(claudeMode).toContain("Exactly two attempts");
+    expect(claudeMode).toContain("attempt 2 always re-runs on `opus`");
+    expect(claudeMode).toContain("`skipped`: advisory and\n  non-blocking (exit 0)");
+    expect(claudeMode).toContain("do not re-run the review");
+    expect(claudeMode).toContain("330 seconds");
+    expect(claudeMode).toContain("~/.claude/projects/<project>/<session-id>.jsonl");
+    expect(claudeMode).toContain("malformed_transcript");
+    expect(claudeMode).toContain("repo-harness cross-review --provider claude");
+    expect(claudeMode).toContain("No merge-gate");
+    expect(claudeMode).toContain("silently retried against Codex");
 
-    expect(codexReview).toContain("committed branch diff");
-    expect(codexReview).toContain("git diff --cached");
-    expect(codexReview).toContain("unstaged tracked changes");
-    expect(codexReview).toContain("git ls-files --others --exclude-standard");
-    expect(codexReview).toContain("git diff --no-index -- /dev/null <file>");
-    expect(codexReview).toContain("BASE=origin/main");
-    expect(codexReview).toContain("else BASE=HEAD");
-    expect(codexReview).toContain("run_with_optional_timeout codex exec");
-    expect(codexReview).not.toContain("${TO:+$TO 330}");
+    expect(codexMode).toContain("read-only reviewer");
+    expect(codexMode).toContain("read-only Bash access");
+    expect(codexMode).toContain("resolved commit SHA");
+    expect(codexMode).toContain('model_reasoning_effort="high"');
+    expect(codexMode).toContain("1800 seconds");
+    expect(codexMode).toContain("Exactly two attempts");
+    expect(codexMode).toContain("`skipped`: advisory and\n  non-blocking (exit 0)");
+    expect(codexMode).toContain("do not re-run the review");
+    expect(codexMode).toContain("repo-harness cross-review --provider codex");
+    expect(codexMode).toContain("No merge-gate");
+    expect(codexMode).toContain("retried against Claude");
   });
 
-  test("hook template should reference existing local hook scripts", () => {
-    const settings = read("assets/hooks/settings.template.json");
-    const codexHooks = read("assets/hooks/codex.hooks.template.json");
-    const hookCommands = [...`${settings}\n${codexHooks}`.matchAll(/\.ai\/hooks\/([A-Za-z0-9.-]+\.sh)/g)].map((m) => m[1]);
-
-    expect(hookCommands.length).toBeGreaterThan(0);
-    for (const fileName of hookCommands) {
-      expect(existsSync(join(ROOT, "assets/hooks", fileName))).toBe(true);
-    }
-
-    expect(hookCommands).toContain("run-hook.sh");
-    expect(settings).toContain(".ai/hooks/run-hook.sh");
-    expect(codexHooks).toContain(".ai/hooks/run-hook.sh");
-    expect(settings).toContain("worktree-guard.sh");
-    expect(settings).toContain("pre-edit-guard.sh");
-    expect(settings).toContain("subagent-return-channel-guard.sh");
-    expect(settings).toContain("post-edit-guard.sh");
-    expect(settings).toContain("minimal-change-observer.sh");
-    expect(settings).toContain("prompt-guard.sh");
-    expect(settings).not.toContain("autoresearch-advisory.sh");
-    expect(codexHooks).not.toContain("autoresearch-advisory.sh");
-    expect(settings).toContain("stop-orchestrator.sh");
-    expect(settings).toContain("post-bash.sh");
-    expect(settings).toContain("post-tool-observer.sh");
-    expect(settings).not.toContain("trace-event.sh");
-    expect(settings).not.toContain("context-pressure-hook.sh");
-    expect(settings).toContain("session-start-context.sh");
-    expect(settings).toContain("minimal-change-context.sh");
-    expect(settings).not.toContain("codex-delegation-advisor.sh");
-    expect(settings).not.toContain("subagent-start-context.sh");
-    expect(settings).not.toContain("subagent-stop-quality.sh");
-    expect(codexHooks).toContain("codex-delegation-advisor.sh");
-    expect(codexHooks).toContain("subagent-start-context.sh");
-    expect(codexHooks).toContain("subagent-stop-quality.sh");
-    expect(codexHooks).toContain("minimal-change-context.sh");
-    expect(codexHooks).toContain("minimal-change-observer.sh");
-    expect(settings).not.toContain("memory-intake.sh");
-    expect(settings).not.toContain("skill-factory-session-end.sh");
-    expect(settings).not.toContain("bash -lc");
-    expect(settings).not.toContain("atomic-pending.sh");
-    expect(settings).not.toContain("atomic-commit.sh");
-    expect(settings).not.toContain("\"$TOOL_INPUT\"");
-    expect(settings).not.toContain("\"$PROMPT\"");
-  });
-
-  test("setup script should delegate to the typed global init path", () => {
+  test("setup script should delegate to the typed global install path", () => {
     const setup = read("scripts/setup-plugins.sh");
-    expect(setup).toContain("repo-harness init");
-    expect(setup).toContain('bun "$ROOT_DIR/src/cli/index.ts" init');
+    expect(setup).toContain("repo-harness install");
+    expect(setup).toContain('bun "$ROOT_DIR/src/cli/index.ts" install');
     expect(setup).not.toContain("ESSENTIAL_PLUGINS");
     expect(setup).not.toContain("feature-dev");
   });

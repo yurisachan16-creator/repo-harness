@@ -16,6 +16,8 @@ import { Command } from 'commander';
 import { runDoctor, type CheckStatus, type DoctorReport } from './doctor';
 import { runStatus, type StatusReport } from './status';
 import type { InstallTargetSpec } from './install';
+import { planAdoption } from '../../core/adoption/plan';
+import { isRepoHarnessSourceCheckout } from '../../core/adoption/source-checkout';
 
 export type InitHookTarget = InstallTargetSpec;
 export type InitHookStatus = 'ok' | 'attention' | 'blocked';
@@ -144,6 +146,10 @@ function verificationCommand(target: InitHookTarget, checkUpdates: boolean): str
   return `repo-harness setup check --target ${target}${checkUpdates ? ' --check-updates' : ''} --json`;
 }
 
+function shellQuoteArg(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
 function addAction(actions: InitHookAction[], action: InitHookAction): void {
   if (actions.some((entry) => entry.id === action.id)) return;
   actions.push(action);
@@ -169,6 +175,31 @@ function statusChecks(
   actions: InitHookAction[],
 ): InitHookCheck[] {
   const checks: InitHookCheck[] = [];
+  const invalidProfile = report.installedProfile.recorded === 'invalid'
+    ? report.installedProfile
+    : null;
+  if (invalidProfile?.kind === 'legacy_protocol') {
+    addAction(actions, {
+      id: 'install-profile.migrate',
+      status: 'needs_agent',
+      reason: `Installed profile state is invalid: ${invalidProfile.error}`,
+      requires_agent: true,
+      risk: 'Reprojects package-owned user-level runtime surfaces under protocol 2; unmanaged host entries are preserved and the transaction compensates on failure.',
+      command: `repo-harness install --migrate-profile-state --profile full --target ${target}`,
+      targets: [invalidProfile.path],
+      verification: verificationCommand(target, checkUpdates),
+    });
+  } else if (invalidProfile) {
+    addAction(actions, {
+      id: 'install-profile.repair',
+      status: 'needs_agent',
+      reason: `Installed profile state is corrupt and cannot be migrated automatically: ${invalidProfile.error}`,
+      requires_agent: true,
+      risk: 'Requires operator inspection of the user-level state authority; do not overwrite or delete it until the intended profile and ownership manifest are established.',
+      targets: [invalidProfile.path],
+      verification: verificationCommand(target, checkUpdates),
+    });
+  }
   for (const id of selectedTargets(target)) {
     const entry = report.targets.find((candidate) => candidate.id === id);
     if (!entry) {
@@ -193,18 +224,22 @@ function statusChecks(
       continue;
     }
 
-    const configured = entry.alreadyConfigured && entry.managedEntryCount === entry.expectedEntryCount;
+    const configured = invalidProfile === null
+      && entry.alreadyConfigured
+      && entry.managedEntryCount === entry.expectedEntryCount;
     checks.push({
       id: `status.adapter.${id}`,
       title: `${targetLabel(id)} global hook adapter`,
       status: configured ? 'ok' : 'needs_agent',
       source: 'status',
-      detail: configured
+      detail: invalidProfile
+        ? `installed profile state is invalid: ${invalidProfile.error}`
+        : configured
         ? `${entry.managedEntryCount}/${entry.expectedEntryCount} managed entries at ${entry.configPath}`
         : `${entry.managedEntryCount}/${entry.expectedEntryCount} managed entries at ${entry.configPath ?? '(unknown config path)'}`,
     });
 
-    if (!configured) {
+    if (!configured && invalidProfile === null) {
       addAction(actions, {
         id: `adapter.${id}.install`,
         status: 'needs_agent',
@@ -218,6 +253,85 @@ function statusChecks(
     }
   }
   return checks;
+}
+
+function adoptionRefreshCheck(
+  report: StatusReport,
+  target: InitHookTarget,
+  checkUpdates: boolean,
+  actions: InitHookAction[],
+): InitHookCheck {
+  const id = 'repo.init-refresh';
+  const title = 'Repo-local adoption refresh';
+  if (!checkUpdates) {
+    return {
+      id,
+      title,
+      status: 'na',
+      source: 'status',
+      detail: 'disabled; run setup check with --check-updates to evaluate repo-local init refresh',
+    };
+  }
+
+  if (!report.repo.inGitRepo || !report.repo.repoRoot) {
+    return {
+      id,
+      title,
+      status: 'na',
+      source: 'status',
+      detail: 'current directory is not inside a git repo',
+    };
+  }
+
+  if (!report.repo.optIn) {
+    return {
+      id,
+      title,
+      status: 'na',
+      source: 'status',
+      detail: `repo is not repo-harness adopted (${report.repo.optInMarker} missing)`,
+    };
+  }
+
+  if (isRepoHarnessSourceCheckout(report.repo.repoRoot)) {
+    return {
+      id,
+      title,
+      status: 'na',
+      source: 'status',
+      detail: 'self-host source checkout owns its workflow surfaces; downstream init refresh is not applicable',
+    };
+  }
+
+  const plan = planAdoption({ repoRoot: report.repo.repoRoot, mode: 'standard', apply: false });
+  if (plan.summary.plannedTotal === 0) {
+    return {
+      id,
+      title,
+      status: 'ok',
+      source: 'status',
+      detail: `up-to-date; ${plan.summary.total} operations skipped`,
+    };
+  }
+
+  const command = `repo-harness init --repo ${shellQuoteArg(report.repo.repoRoot)}`;
+  addAction(actions, {
+    id: 'repo.init-refresh',
+    status: 'needs_agent',
+    reason: 'The current adopted repo has pending repo-harness adoption plan operations.',
+    requires_agent: true,
+    risk: 'Updates repo-local workflow files; review the init dry-run first and preserve user-owned content.',
+    command,
+    targets: [report.repo.repoRoot],
+    verification: verificationCommand(target, checkUpdates),
+  });
+  return {
+    id,
+    title,
+    status: 'needs_agent',
+    source: 'status',
+    detail: `planned=${plan.summary.plannedTotal}; skipped=${plan.summary.skippedTotal}; user_owned=${plan.summary.userOwnedFilesTouched}; command=${command}`,
+  };
 }
 
 function parseActionCommand(detail: string): string | undefined {
@@ -237,6 +351,7 @@ function doctorChecks(
 ): InitHookCheck[] {
   const checks: InitHookCheck[] = [];
   for (const entry of report.checks) {
+    if (target === 'claude' && entry.id === 'codex-cli-version') continue;
     const source: InitHookCheckSource = entry.id === 'security-config' ? 'security' : 'doctor';
     let checkStatus: InitHookCheckStatus = entry.status;
 
@@ -591,6 +706,7 @@ export function runInitHook(opts: InitHookOptions = {}): InitHookReport {
 
   const checks: InitHookCheck[] = [
     ...statusChecks(statusReport, target, checkUpdates, actions),
+    adoptionRefreshCheck(statusReport, target, checkUpdates, actions),
     ...doctorChecks(doctorReport, target, checkUpdates, actions),
     ...globalRulesChecks(target, opts.env, checkUpdates, actions),
     ...runtimeCapabilityChecks(toolingProbe.report, target, checkUpdates, actions),

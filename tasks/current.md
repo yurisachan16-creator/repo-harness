@@ -1,27 +1,27 @@
 # Current Status Snapshot
 
 <!-- generated-by: repo-harness refresh-current-status v1 -->
-<!-- updated_at: 2026-06-29T04:50:31+0800 -->
+<!-- updated_at: 2026-08-15T03:24:05+0800 -->
 <!-- stale_after: 24h -->
 
-> **Status**: Idle
-> **Updated At**: 2026-06-29T04:50:31+0800
-> **Source Branch**: main
-> **Source Commit**: c878664
+> **Status**: ManualClearedWithActiveWork
+> **Updated At**: 2026-08-15T03:24:05+0800
+> **Source Branch**: codex/release-0-15-1-closeout
+> **Source Commit**: 87799292
 > **Target Branch**: main
 > **Stale After**: 24h
-> **Reason**: release-0.8.2
+> **Reason**: archive-workflow
 > **Derived From**: active-plan, active-sprint, workstreams, handoff, checks, git status
 
 This file is a tracked mainline snapshot derived from repo artifacts. It is not a live lock, not a kanban board, and not an implementation gate. If it is stale, read the source artifacts below.
 
 ## Current Focus
 
-- Status: Idle
+- Status: ManualClearedWithActiveWork
 - Active Plan: (none)
 - Plan Status: (none)
-- Next Task: (none)
-- Clear Note: (none)
+- Next Task: inspect active worktree marker(s)
+- Clear Note: Manual clear requested, but active work markers still exist. Idle was not written.
 
 ## Mainline Snapshot Reading
 
@@ -31,37 +31,45 @@ This file is a tracked mainline snapshot derived from repo artifacts. It is not 
 
 ## Active Work
 
-- (none)
+- /private/tmp/repo-harness-wt-fix-oracle-redaction: plans/plan-20260815-0230-change-assessment-oracle-redaction.md
+- /private/tmp/repo-harness-wt-fix-oracle-redaction: active-worktree owner -> /private/tmp/repo-harness-wt-fix-oracle-redaction
+- /private/tmp/repo-harness-wt-release-0-15-1-v2: plans/plan-20260815-0140-release-0-15-1.md
+- /private/tmp/repo-harness-wt-release-0-15-1-v2: active-worktree owner -> /private/tmp/repo-harness-wt-release-0-15-1-v2
 ## Active Sprint
 
 - Sprint: (none)
 ## Workstreams
 
-- `tasks/workstreams/workflow-engine/contract-assets/cleanup-script-policy.md`: status=completed, current_slice=todo-01, source_plan=(none)
+- `tasks/workstreams/runtime-harness/hook-adapters/github-issues-158-159.md`: status=completed, current_slice=completed-20260805-contract-scoped-check-repair, source_plan=plans/plan-20260805-0001-github-issues-158-159.md
+- `tasks/workstreams/verification/evals-checks/github-issues-158-159.md`: status=completed, current_slice=completed-20260805-deployed-emitter-binding, source_plan=plans/plan-20260805-0001-github-issues-158-159.md
+- `tasks/workstreams/workflow-engine/contract-assets/20260712-contract-assets.md`: status=completed, current_slice=completed-20260712-repo-owned-agent-fleet, source_plan=`plans/archive/plan-20260712-2053-repo-owned-agent-fleet.md`
+- `tasks/workstreams/workflow-engine/contract-assets/20260714-merge-gate-enforcement.md`: status=completed, current_slice=completed-20260715-merge-gate-enforcement, source_plan=`plans/archive/plan-20260714-1713-merge-gate-enforcement.md`
+- `tasks/workstreams/workflow-engine/contract-assets/agent-fleet-specialists.md`: status=completed, current_slice=completed-20260713-specialist-roles, source_plan=`plans/archive/plan-20260712-2215-agent-fleet-specialists.md`
+- `tasks/workstreams/workflow-engine/contract-assets/cleanup-script-policy.md`: status=completed, current_slice=completed-20260529-cleanup-script-policy, source_plan=(none)
+- `tasks/workstreams/workflow-engine/contract-assets/github-issues-158-159.md`: status=completed, current_slice=completed-20260805-packaged-helper-projection, source_plan=plans/plan-20260805-0001-github-issues-158-159.md
+- `tasks/workstreams/workflow-engine/inspection-migration/20260703-inspection-migration.md`: status=completed, current_slice=completed-20260703-architecture-closeout, source_plan=(none)
 ## Handoff
 
 - Exact Next Step: (none)
 
 ## Checks
 
-- status=(none), source=(none), exit_code=(none), file=.ai/harness/checks/latest.json
+- status=(none), source=(none), file=.ai/harness/checks/latest.json
 
 ## Git Status
 
-- Summary: 11 changed/untracked path(s)
+- Summary: 9 changed/untracked path(s)
 
 ```
- M .claude/.skill-version
- M README.es.md
- M README.fr.md
- M README.ja.md
- M README.md
- M README.zh-CN.md
- M assets/skill-version.json
- M bun.lock
- M docs/CHANGELOG.md
- M package.json
-?? deploy/release-checklists/260629-repo-harness-0.8.2.md
+ D plans/plan-20260815-0140-release-0-15-1.md
+ D tasks/contracts/20260815-0140-release-0-15-1.contract.md
+ D tasks/notes/20260815-0140-release-0-15-1.notes.md
+ D tasks/reviews/20260815-0140-release-0-15-1.review.md
+?? plans/archive/plan-20260815-0140-release-0-15-1.md
+?? tasks/archive/contract-20260815-0324-release-0-15-1.md
+?? tasks/archive/notes-20260815-0324-release-0-15-1.md
+?? tasks/archive/review-20260815-0324-release-0-15-1.md
+?? tasks/archive/todo-20260815-0324-release-0-15-1.md
 ```
 
 ## Source Artifacts

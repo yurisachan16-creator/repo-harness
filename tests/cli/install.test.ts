@@ -11,17 +11,88 @@ const CLI = path.join(ROOT, 'src/cli/index.ts');
 function withTempHome(fn: (home: string) => void): void {
   const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'repo-harness-install-')));
   const prev = process.env.HOME;
+  const prevBunInstall = process.env.BUN_INSTALL;
   process.env.HOME = tmp;
+  process.env.BUN_INSTALL = path.join(tmp, '.bun');
   try {
     fn(tmp);
   } finally {
     if (prev === undefined) delete process.env.HOME;
     else process.env.HOME = prev;
+    if (prevBunInstall === undefined) delete process.env.BUN_INSTALL;
+    else process.env.BUN_INSTALL = prevBunInstall;
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 }
 
 describe('install command (Phase 1B)', () => {
+  test('install profiles bound host route inventory', () => {
+    withTempHome((home) => {
+      runInstall({ target: 'codex', location: 'global', profile: 'minimal' });
+      let hooks = JSON.parse(fs.readFileSync(path.join(home, '.codex/hooks.json'), 'utf-8')).hooks;
+      expect(Object.values(hooks as Record<string, unknown[]>).flat()).toHaveLength(7);
+      expect(hooks.UserPromptSubmit).toHaveLength(1);
+      expect(hooks.SubagentStart).toBeUndefined();
+
+      runInstall({ target: 'codex', location: 'global', profile: 'full' as never });
+      hooks = JSON.parse(fs.readFileSync(path.join(home, '.codex/hooks.json'), 'utf-8')).hooks;
+      expect(Object.values(hooks as Record<string, unknown[]>).flat()).toHaveLength(11);
+      expect(hooks.SubagentStart).toHaveLength(1);
+    });
+  });
+
+  test('adapter-only install rejects protocol-1 state before mutating host config', () => {
+    withTempHome((home) => {
+      const statePath = path.join(home, '.repo-harness', 'install-state.json');
+      const hooksPath = path.join(home, '.codex', 'hooks.json');
+      fs.mkdirSync(path.dirname(statePath), { recursive: true });
+      fs.mkdirSync(path.dirname(hooksPath), { recursive: true });
+      fs.writeFileSync(statePath, `${JSON.stringify({
+        protocol: 1,
+        profile: 'standard',
+        components: [
+          'cli',
+          'effective-state',
+          'scope-worktree-check-guards',
+          'handoff',
+          'host-adapters',
+          'adaptive-workflow',
+          'codegraph-conditional',
+        ],
+        transaction_id: 'legacy-standard',
+        applied_at: '2026-07-14T00:00:00.000Z',
+        ownership_manifest: [],
+        previous: null,
+      }, null, 2)}\n`);
+      fs.writeFileSync(hooksPath, `${JSON.stringify({
+        theme: 'user-owned',
+        hooks: {
+          PreToolUse: [{ hooks: [{ type: 'command', command: 'user hook' }] }],
+        },
+      }, null, 2)}\n`);
+      const stateBefore = fs.readFileSync(statePath);
+      const hooksBefore = fs.readFileSync(hooksPath);
+
+      const result = spawnSync(process.execPath, [
+        CLI,
+        'install',
+        '--target',
+        'codex',
+        '--location',
+        'global',
+      ], {
+        cwd: ROOT,
+        env: { ...process.env, HOME: home, BUN_INSTALL: path.join(home, '.bun') },
+        encoding: 'utf-8',
+      });
+
+      expect(result.status).not.toBe(0);
+      expect(`${result.stdout}\n${result.stderr}`).toContain('--migrate-profile-state');
+      expect(fs.readFileSync(statePath)).toEqual(stateBefore);
+      expect(fs.readFileSync(hooksPath)).toEqual(hooksBefore);
+    });
+  }, 30_000);
+
   test('codex --location local errors with exit 2 (no project-local hook concept)', () => {
     withTempHome(() => {
       const result = runInstall({ target: 'codex', location: 'local' });
@@ -71,19 +142,20 @@ describe('install command (Phase 1B)', () => {
       const data = JSON.parse(
         fs.readFileSync(path.join(home, '.codex/hooks.json'), 'utf-8'),
       );
-      for (const entries of Object.values(data.hooks) as { hooks: { command: string; timeout?: number }[] }[][]) {
+      for (const [event, entries] of Object.entries(data.hooks) as [string, { hooks: { command: string; timeout?: number }[] }[]][]) {
         for (const entry of entries) {
           const hook = entry.hooks[0];
           const cmd = hook.command;
           expect(cmd).toContain('git rev-parse --show-toplevel');
+          expect(cmd).toContain('repo-harness-managed-hook-v1');
           expect(cmd).toContain('export HOOK_REPO_ROOT="$repo"');
           expect(cmd).toContain('command -v repo-harness-hook');
-          expect(cmd).toContain('repo-harness-hook ');
-          expect(cmd).toContain('&& exit 0');
+          expect(cmd).toContain('exec repo-harness-hook ');
+          expect(cmd).not.toContain('&& exit 0');
           expect(cmd).toContain('command -v repo-harness');
           expect(cmd).toContain('HOOK_HOST=codex');
           expect(cmd).toContain('exec repo-harness hook ');
-          expect(hook.timeout).toBe(30);
+          expect(hook.timeout).toBe(event === 'Stop' ? 150 : 30);
         }
       }
     });
@@ -137,10 +209,10 @@ describe('install command (Phase 1B)', () => {
       expect(data.hooks.UserPromptSubmit.length).toBe(1);
       expect(data.hooks.SubagentStart).toBeUndefined();
       expect(data.hooks.SubagentStop).toBeUndefined();
-      for (const entries of Object.values(data.hooks) as { hooks: { command: string; timeout?: number }[] }[][]) {
+      for (const [event, entries] of Object.entries(data.hooks) as [string, { hooks: { command: string; timeout?: number }[] }[]][]) {
         for (const entry of entries) {
           expect(entry.hooks[0].command).toContain('HOOK_HOST=claude');
-          expect(entry.hooks[0].timeout).toBe(30);
+          expect(entry.hooks[0].timeout).toBe(event === 'Stop' ? 150 : 30);
         }
       }
     });
@@ -186,18 +258,22 @@ describe('install command (Phase 1B)', () => {
         filePath,
         `${JSON.stringify({
           hooks: {
-            PreToolUse: [{ hooks: [{ type: 'command', command: 'rtk hook claude' }] }],
+            PreToolUse: [
+              { hooks: [{ type: 'command', command: 'rtk hook claude' }] },
+              { hooks: [{ type: 'command', command: 'echo repo-harness hook is documented' }] },
+            ],
           },
         }, null, 2)}\n`,
       );
       runInstall({ target: 'claude', location: 'global' });
       const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
       const pre = data.hooks.PreToolUse as { hooks: { command: string }[] }[];
-      // 1 sibling + 2 managed
-      expect(pre.length).toBe(3);
+      // 2 siblings + 2 managed
+      expect(pre.length).toBe(4);
       expect(pre[0].hooks[0].command).toBe('rtk hook claude');
-      expect(pre[1].hooks[0].command).toContain('repo-harness hook PreToolUse');
+      expect(pre[1].hooks[0].command).toBe('echo repo-harness hook is documented');
       expect(pre[2].hooks[0].command).toContain('repo-harness hook PreToolUse');
+      expect(pre[3].hooks[0].command).toContain('repo-harness hook PreToolUse');
     });
   });
 
@@ -292,9 +368,9 @@ describe('install command (Phase 1B)', () => {
       expect(uninstall.status).toBe(0);
       expect(uninstall.stdout).toContain('[codex] removed');
     });
-  });
+  }, 30_000);
 
-  test('CLI install without --location runs the full runtime bootstrap path', () => {
+  test('CLI install without required profile components fails closed and compensates adapters', () => {
     withTempHome((home) => {
       const install = spawnSync(
         'bun',
@@ -314,10 +390,33 @@ describe('install command (Phase 1B)', () => {
           encoding: 'utf-8',
         },
       );
-      expect(install.status).toBe(0);
-      expect(install.stdout).toContain('[runtime] ok: install host adapters');
-      expect(install.stdout).toContain('[codex] created');
-      expect(fs.existsSync(path.join(home, '.codex/hooks.json'))).toBe(true);
+      expect(install.status).not.toBe(0);
+      expect(`${install.stdout}\n${install.stderr}`).toContain('install profile projection is incomplete');
+      expect(fs.existsSync(path.join(home, '.codex/hooks.json'))).toBe(false);
+      expect(fs.existsSync(path.join(home, '.repo-harness/install-state.json'))).toBe(false);
     });
-  });
+  }, 30_000);
+});
+
+describe('install native Codex delegation authority', () => {
+  test('adapter-only install exposes no delegation-mode compatibility option or config write', () => {
+    withTempHome((home) => {
+      const help = spawnSync('bun', [CLI, 'install', '--help'], {
+        cwd: ROOT,
+        env: { ...process.env, HOME: home },
+        encoding: 'utf-8',
+      });
+      expect(help.status).toBe(0);
+      expect(help.stdout).not.toContain('--delegation-mode');
+
+      const install = spawnSync('bun', [CLI, 'install', '--target', 'codex', '--location', 'global'], {
+        cwd: ROOT,
+        env: { ...process.env, HOME: home },
+        encoding: 'utf-8',
+      });
+      expect(install.status).toBe(0);
+      expect(fs.existsSync(path.join(home, '.codex/hooks.json'))).toBe(true);
+      expect(fs.existsSync(path.join(home, '.repo-harness', 'config.json'))).toBe(false);
+    });
+  }, 30_000);
 });

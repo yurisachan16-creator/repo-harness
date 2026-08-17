@@ -46,8 +46,17 @@ bun install --frozen-lockfile
 echo "[ci] typecheck"
 bun run check:type
 
+echo "[ci] state boundaries"
+bun run check:state-boundaries
+
 echo "[ci] hook projection"
 bun run check:hooks
+
+echo "[ci] helper projection"
+bun run check:helpers
+
+echo "[ci] reference-configs projection"
+bun run check:reference-configs
 
 echo "[ci] tests"
 run_bun_tests
@@ -67,7 +76,7 @@ bash scripts/check-task-workflow.sh --strict
 
 echo "[ci] repository inspection"
 bun scripts/inspect-project-state.ts --repo . --format text >/dev/null
-bash scripts/migrate-project-template.sh --repo . --dry-run >/dev/null
+bun src/cli/index.ts init --repo . --dry-run >/dev/null
 
 echo "[ci] package dry-run"
 npm pack --dry-run --json >/dev/null

@@ -3,12 +3,24 @@ import { createHash } from "crypto";
 import {
   existsSync,
   lstatSync,
+  mkdirSync,
+  mkdtempSync,
   readdirSync,
   readFileSync,
+  rmSync,
   statSync,
+  symlinkSync,
+  writeFileSync,
 } from "fs";
+import { tmpdir } from "os";
 import { join, relative } from "path";
 import { spawnSync } from "child_process";
+import {
+  collectProjectionFiles,
+  readProjectionFile,
+  writeProjectionFileAtomic,
+} from "../src/core/source-projection";
+import { workflowSurfaceParityErrors } from "../scripts/sync-hook-sources";
 
 const ROOT = join(import.meta.dir, "..");
 const ASSETS_HOOKS = join(ROOT, "assets/hooks");
@@ -76,7 +88,7 @@ describe("hook source projection", () => {
     expect(res.status).toBe(0);
     expect(res.stdout).toContain("projection OK");
     expect(res.stderr).toBe("");
-  });
+  }, 30_000);
 
   test("manifest classifies package-only files and no repo-only drift", () => {
     const manifest = readManifest();
@@ -84,11 +96,7 @@ describe("hook source projection", () => {
       version: 1,
       canonical_root: "assets/hooks",
       projection_target: ".ai/hooks",
-      package_only: [
-        "projection.json",
-        "codex.hooks.template.json",
-        "settings.template.json",
-      ],
+      package_only: ["projection.json"],
       repo_only: [],
     });
 
@@ -172,5 +180,120 @@ describe("hook source projection", () => {
       ]),
     );
     expect(after).toEqual(before);
+  }, 30_000);
+
+  test("projection reads reject symlinked roots and ancestor directories", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "source-projection-read-"));
+    const sourceRoot = join(tmp, "source");
+    const sourceLink = join(tmp, "source-link");
+    const outside = join(tmp, "outside");
+    try {
+      mkdirSync(sourceRoot);
+      mkdirSync(outside);
+      writeFileSync(join(sourceRoot, "local.sh"), "#!/bin/bash\n");
+      writeFileSync(join(outside, "escaped.sh"), "#!/bin/bash\n");
+      symlinkSync(sourceRoot, sourceLink);
+
+      expect(() => collectProjectionFiles(sourceLink)).toThrow("projection root must not be a symlink");
+
+      symlinkSync(outside, join(sourceRoot, "nested"));
+      expect(() => readProjectionFile(sourceRoot, "nested/escaped.sh")).toThrow(
+        "symlink is not allowed in projection path",
+      );
+      expect(() => collectProjectionFiles(sourceRoot)).toThrow("symlink is not allowed in source projection");
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // HRD-03 retired assets/hooks/pre-edit-guard.sh (the real file this test
+  // used to read to prove workflowSurfaceParityErrors "accepts the real
+  // checked-in shape") along with the hand-copied is_workflow_surface_path()
+  // bash predicate it carried -- mutation-guard.ts imports isWorkflowSurfacePath
+  // from diff-fingerprint.ts directly now, so there is no real bash file
+  // left with this shape to read. The synthetic-source tests below continue
+  // to prove workflowSurfaceParityErrors' own parsing/comparison logic
+  // (kept exported as general, reusable infrastructure -- see
+  // scripts/sync-hook-sources.ts) without depending on a real file.
+
+  function guardSourceWithCaseLines(caseLines: readonly string[]): string {
+    return [
+      "is_workflow_surface_path() {",
+      '  case "$1" in',
+      ...caseLines,
+      "    *) return 1 ;;",
+      "  esac",
+      "}",
+    ].join("\n");
+  }
+
+  test("workflowSurfaceParityErrors passes for exactly the two expected case pattern lines", () => {
+    const source = guardSourceWithCaseLines([
+      "    plans/*|tasks/*|docs/*|.ai/*|.claude/*|.codex/*) return 0 ;;",
+      "    *.md|*.markdown) return 0 ;;",
+    ]);
+    expect(workflowSurfaceParityErrors(source)).toEqual([]);
+  });
+
+  test("workflowSurfaceParityErrors catches an undeclared third case pattern appended after the two expected lines (regression: index-only comparison missed this)", () => {
+    // Before this fix, workflowSurfaceParityErrors (then inline in
+    // checkWorkflowSurfaceParity) only compared patternLines[0] and
+    // patternLines[1] against the expected directory/extension patterns.
+    // Both still match exactly here -- a third "return 0" arm appended after
+    // them was invisible to that comparison, so a hand-added shell-side
+    // exemption with no TS-side counterpart passed --check silently.
+    const source = guardSourceWithCaseLines([
+      "    plans/*|tasks/*|docs/*|.ai/*|.claude/*|.codex/*) return 0 ;;",
+      "    *.md|*.markdown) return 0 ;;",
+      "    bogus/*) return 0 ;;",
+    ]);
+    const errors = workflowSurfaceParityErrors(source);
+    expect(errors.length).toBeGreaterThan(0);
+    expect(errors.some((error) => error.includes("expected exactly 2"))).toBe(true);
+    expect(errors.some((error) => error.includes("found 3"))).toBe(true);
+  });
+
+  test("workflowSurfaceParityErrors still catches drift in either of the two expected lines", () => {
+    const source = guardSourceWithCaseLines([
+      "    plans/*|tasks/*) return 0 ;;",
+      "    *.md|*.markdown) return 0 ;;",
+    ]);
+    const errors = workflowSurfaceParityErrors(source);
+    expect(errors.some((error) => error.includes("directory prefixes expected"))).toBe(true);
+  });
+
+  test("workflowSurfaceParityErrors reports a missing function distinctly", () => {
+    expect(workflowSurfaceParityErrors("#!/bin/bash\necho no function here\n")).toEqual([
+      "assets/hooks/pre-edit-guard.sh: is_workflow_surface_path() function not found",
+    ]);
+  });
+
+  test("projection writes reject symlinked roots, symlinked parents, and repo escapes", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "source-projection-write-"));
+    const repoRoot = join(tmp, "repo");
+    const repoLink = join(tmp, "repo-link");
+    const outside = join(tmp, "outside");
+    try {
+      mkdirSync(join(repoRoot, ".ai"), { recursive: true });
+      mkdirSync(outside);
+      symlinkSync(repoRoot, repoLink);
+
+      expect(() =>
+        writeProjectionFileAtomic(repoLink, join(repoLink, ".ai", "hooks", "test.sh"), "safe\n", "100644"),
+      ).toThrow("projection root must not be a symlink");
+
+      symlinkSync(outside, join(repoRoot, ".ai", "hooks"));
+      expect(() =>
+        writeProjectionFileAtomic(repoRoot, join(repoRoot, ".ai", "hooks", "test.sh"), "safe\n", "100644"),
+      ).toThrow("symlink is not allowed in projection parent");
+      expect(existsSync(join(outside, "test.sh"))).toBe(false);
+
+      expect(() =>
+        writeProjectionFileAtomic(repoRoot, join(repoRoot, "..", "escaped.sh"), "safe\n", "100644"),
+      ).toThrow("projection path escapes root");
+      expect(existsSync(join(tmp, "escaped.sh"))).toBe(false);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
   });
 });

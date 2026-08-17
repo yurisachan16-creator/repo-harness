@@ -7,8 +7,8 @@ import {
   runCapabilityContextRequest,
   runCapabilityContextStatus,
   runCapabilityContextSync,
-  type Capability,
 } from '../../src/cli/commands/capability-context';
+import type { Capability } from '../../src/core/capabilities/registry';
 
 function tmpWorkspace(prefix: string): string {
   return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), `${prefix}-`)));
@@ -115,6 +115,18 @@ describe('capability-context command', () => {
       const queue = fs.readFileSync(path.join(cwd, '.ai/harness/capability-context/requests.jsonl'), 'utf-8');
       expect(queue.trim().split(/\r?\n/)).toHaveLength(1);
       expect(queue).toContain('"capability_id":"apps-web"');
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('request fails when no registered capability matches the path', () => {
+    const cwd = tmpWorkspace('capability-context-unmatched');
+    try {
+      writeRegistry(cwd, [rootCapability]);
+      expect(() => runCapabilityContextRequest({ repo: cwd, path: 'src/unowned.ts' })).toThrow(
+        'no capability matches path: src/unowned.ts',
+      );
     } finally {
       fs.rmSync(cwd, { recursive: true, force: true });
     }
@@ -239,5 +251,5 @@ describe('capability-context command', () => {
     } finally {
       fs.rmSync(cwd, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 });

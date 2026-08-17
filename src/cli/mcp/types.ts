@@ -1,4 +1,4 @@
-export type McpProfileName = 'planner' | 'executor' | 'orchestrator';
+export type McpProfileName = 'planner' | 'executor' | 'orchestrator' | 'coding';
 export type McpPathIntent = 'read' | 'write';
 export type McpAgentRunnerName = 'codex' | 'claude';
 
@@ -11,24 +11,18 @@ export interface McpPolicy {
     workflowPlanner: boolean;
     workflowExecutor: boolean;
     agentRunner: boolean;
+    workspaceCoder: boolean;
   };
   readGlobs: string[];
   writeGlobs: string[];
   denyGlobs: string[];
   allowAbsoluteRead?: boolean;
   maxFileBytes: number;
-  generalRepo: {
-    general_repo_read: boolean;
-    repo_write: boolean;
-    fs_fallback: boolean;
-    shadow_compare: boolean;
-    canary_repos: string[];
-    rollback_to_legacy_tools: boolean;
-  };
   execution: {
     fixedWorkflowCheck: boolean;
     codexRunner: boolean;
     agentRunner: boolean;
+    codingShell: boolean;
     allowedAgents: McpAgentRunnerName[];
     runnerTimeoutMs: number;
   };
@@ -64,4 +58,11 @@ export interface McpAuditEntry {
   targetPath?: string;
   inputHash?: string;
   error?: string;
+  sessionId?: number;
+  commandHash?: string;
+  relativeCwd?: string;
+  exitCode?: number;
+  signal?: string;
+  totalOutputBytes?: number;
+  droppedOutputBytes?: number;
 }

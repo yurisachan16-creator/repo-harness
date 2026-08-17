@@ -31,6 +31,9 @@ issues=0
 WORKFLOW_CONTRACT_PATH=".ai/harness/workflow-contract.json"
 policy_file=".ai/harness/policy.json"
 json_runtime=""
+plan_terminal_statuses=""
+plan_status_policy_loaded=0
+plan_status_policy_valid=0
 
 report_issue() {
   local message="$1"
@@ -103,8 +106,52 @@ if (Array.isArray(value)) {
   esac
 }
 
+CAPABILITY_REGISTRY_FILE=".ai/context/capabilities.json"
+CAPABILITY_NODES_DIR=".archcontext/model/nodes"
+
+# The workflow contract lists the capability artifacts of every supported
+# authority; .ai/harness/policy.json#context.capability_source selects which one
+# this repo actually owns. Repos on the registry default are unaffected.
+capability_source() {
+  local runtime
+  local policy_file=".ai/harness/policy.json"
+
+  [[ -f "$policy_file" ]] || { printf 'registry'; return 0; }
+  runtime="$(resolve_json_runtime || true)"
+  if [[ -z "$runtime" ]]; then
+    printf 'registry'
+    return 0
+  fi
+
+  case "$runtime" in
+    python3)
+      "$runtime" - "$policy_file" <<'PY_EOF'
+import json
+import sys
+
+try:
+    policy = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+    value = policy.get("context", {}).get("capability_source")
+except Exception:
+    value = None
+print(value if isinstance(value, str) and value else "registry", end="")
+PY_EOF
+      ;;
+    *)
+      "$runtime" -e '
+const fs = require("fs");
+let value;
+try {
+  const policy = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  value = policy && policy.context ? policy.context.capability_source : undefined;
+} catch {}
+process.stdout.write(typeof value === "string" && value ? value : "registry");
+' "$policy_file"
+      ;;
+  esac
+}
+
 ACTIVE_PLAN_MARKER=".ai/harness/active-plan"
-LEGACY_ACTIVE_PLAN_MARKER=".claude/.active-plan"
 ACTIVE_WORKTREE_MARKER=".ai/harness/active-worktree"
 
 read_active_plan_marker() {
@@ -123,8 +170,7 @@ read_active_plan_marker() {
 }
 
 get_active_plan() {
-  read_active_plan_marker "$ACTIVE_PLAN_MARKER" \
-    || read_active_plan_marker "$LEGACY_ACTIVE_PLAN_MARKER"
+  read_active_plan_marker "$ACTIVE_PLAN_MARKER"
 }
 
 extract_status() {
@@ -370,13 +416,47 @@ prd_known_status() {
   return 1
 }
 
+load_plan_status_policy() {
+  if [[ "$plan_status_policy_loaded" -eq 1 ]]; then
+    [[ "$plan_status_policy_valid" -eq 1 ]]
+    return
+  fi
+  plan_status_policy_loaded=1
+  plan_status_policy_valid=0
+  command -v jq >/dev/null 2>&1 || return 1
+  plan_terminal_statuses="$(jq -er '
+    .active_plan as $active
+    | $active.statuses as $statuses
+    | $active.lifecycle as $lifecycle
+    | select(($statuses | type) == "array" and ($statuses | length) > 0)
+    | select(all($statuses[]; type == "string" and length > 0))
+    | select(($statuses | unique | length) == ($statuses | length))
+    | select(($lifecycle | type) == "object")
+    | $lifecycle.annotation_end as $annotation_end
+    | $lifecycle.approved as $approved
+    | $lifecycle.executing as $executing
+    | $lifecycle.terminal_start as $terminal_start
+    | select([$annotation_end, $approved, $executing, $terminal_start] | all(.[]; type == "string"))
+    | ($statuses | index($annotation_end)) as $annotation_index
+    | ($statuses | index($approved)) as $approved_index
+    | ($statuses | index($executing)) as $executing_index
+    | ($statuses | index($terminal_start)) as $terminal_index
+    | select(
+        $annotation_index != null and $annotation_index >= 1
+        and $approved_index == ($annotation_index + 1)
+        and $executing_index == ($approved_index + 1)
+        and $terminal_index > $executing_index
+      )
+    | $statuses[$terminal_index:][]
+  ' "$policy_file" 2>/dev/null)" || return 1
+  [[ -n "$plan_terminal_statuses" ]] || return 1
+  plan_status_policy_valid=1
+}
+
 plan_terminal_status() {
-  case "$1" in
-    Complete|Completed|Done|Fulfilled|Archived|Abandoned|Superseded)
-      return 0
-      ;;
-  esac
-  return 1
+  local status="$1"
+  load_plan_status_policy || return 1
+  printf '%s\n' "$plan_terminal_statuses" | grep -Fqx -- "$status"
 }
 
 root_terminal_plan_count() {
@@ -402,7 +482,7 @@ root_terminal_plan_count() {
 markdown_section_has_content() {
   local file="$1"
   local section="$2"
-  awk -v section="$section" '
+  LC_ALL=C awk -v section="$section" '
     $0 ~ "^## " section "[[:space:]]*$" { in_section = 1; next }
     in_section && /^## / { exit }
     !in_section { next }
@@ -437,7 +517,7 @@ sprint_ready_error() {
     missing=1
   else
     local row_errors
-    row_errors="$(awk -F '|' '
+    row_errors="$(LC_ALL=C awk -F '|' '
       /^## Backlog[[:space:]]*$/ { in_section = 1; next }
       in_section && /^## / { exit }
       !in_section { next }
@@ -600,7 +680,7 @@ check_current_resume_freshness() {
   current_mtime="$(file_mtime "$current_file")"
   resume_mtime="$(file_mtime "$resume_file")"
   if [[ "$current_mtime" =~ ^[0-9]+$ && "$resume_mtime" =~ ^[0-9]+$ && "$resume_mtime" -lt "$current_mtime" ]]; then
-    report_issue "Resume packet is older than current status snapshot: $resume_file < $current_file. Run scripts/prepare-handoff.sh --reason <reason> or scripts/codex-handoff-resume.sh."
+    report_issue "Resume packet is older than current status snapshot: $resume_file < $current_file. Run repo-harness run prepare-handoff --reason <reason> or repo-harness run codex-handoff-resume."
   fi
 }
 
@@ -610,22 +690,12 @@ check_required_file() {
     return 0
   fi
 
-  if [[ "$path" == .ai/harness/scripts/* ]]; then
-    local helper_name="${path##*/}"
-    if [[ "${helper_source:-package}" == "package" && -f "scripts/$helper_name" ]]; then
-      return 0
-    fi
-    if [[ -f "assets/templates/helpers/$helper_name" && -f "scripts/$helper_name" ]]; then
-      return 0
-    fi
-  fi
-
   report_issue "Missing required file: $path"
 }
 
 package_helper_dir() {
   local source_path="${REPO_HARNESS_HELPER_SOURCE_PATH:-}"
-  if [[ -n "$source_path" ]]; then
+  if [[ -n "$source_path" && -f "$source_path" && "$(basename "$source_path")" == "$(basename "$0")" ]]; then
     dirname "$source_path"
     return 0
   fi
@@ -638,16 +708,21 @@ package_helper_dir() {
   return 1
 }
 
-check_package_helper_file() {
+package_helper_file() {
   local helper_name="$1"
   local package_dir
-
   package_dir="$(package_helper_dir || true)"
-  if [[ -n "$package_dir" && -f "$package_dir/$helper_name" ]]; then
-    return 0
-  fi
+  [[ -n "$package_dir" && -f "$package_dir/$helper_name" ]] || return 1
+  printf '%s\n' "$package_dir/$helper_name"
+}
 
-  report_issue "Missing packaged helper runtime: $helper_name"
+run_optional_helper() {
+  local helper_name="$1"
+  shift
+  local helper_file
+  helper_file="$(package_helper_file "$helper_name" || true)"
+  [[ -n "$helper_file" ]] || return 0
+  bash "$helper_file" "$@"
 }
 
 is_contract_helper_path() {
@@ -675,7 +750,7 @@ check-deploy-sql-order.sh|check-architecture-sync.sh|check-agent-tooling.sh|\
 check-context-files.sh|check-brain-manifest.sh|sync-brain-docs.sh|check-skill-version.ts|\
 select-agent-context-blocks.sh|ensure-task-workflow.sh|check-task-workflow.sh|\
 maintenance-triage.sh|heartbeat-triage.sh|switch-plan.sh|workflow-contract.ts|\
-inspect-project-state.ts|migrate-workflow-docs.ts|migrate-project-template.sh|\
+inspect-project-state.ts|\
 capability-resolver.ts|architecture-event.ts|capability-config.ts|architecture-queue.sh|\
 archive-architecture-request.sh|context-contract-sync.sh|workstream-sync.sh|\
 prepare-codex-handoff.sh|codex-handoff-resume.sh)
@@ -776,7 +851,7 @@ for key in ["run_id", "task_profile", "active_plan", "worktree", "branch", "fail
 for key in ["commands", "guards", "handoffs", "files_changed"]:
     if not isinstance(data.get(key), list):
         errors.append(f"field must be an array: {key}")
-for key in ["external_acceptance", "allowed_paths_check"]:
+for key in ["acceptance_receipt", "allowed_paths_check"]:
     if not isinstance(data.get(key), dict):
         errors.append(f"field must be an object: {key}")
 if data.get("status") not in ["pass", "fail"]:
@@ -811,7 +886,7 @@ for (const key of ["run_id", "task_profile", "active_plan", "worktree", "branch"
 for (const key of ["commands", "guards", "handoffs", "files_changed"]) {
   if (!Array.isArray(data[key])) errors.push(`field must be an array: ${key}`);
 }
-for (const key of ["external_acceptance", "allowed_paths_check"]) {
+for (const key of ["acceptance_receipt", "allowed_paths_check"]) {
   if (!data[key] || typeof data[key] !== "object" || Array.isArray(data[key])) {
     errors.push(`field must be an object: ${key}`);
   }
@@ -834,18 +909,7 @@ if (errors.length) {
 
 check_required_dir() {
   local path="$1"
-  if [[ -d "$path" ]]; then
-    return 0
-  fi
-
-  if [[ "$path" == ".ai/harness/scripts" && "${helper_source:-package}" == "package" && -d "scripts" ]]; then
-    return 0
-  fi
-
-  if [[ "$path" == ".ai/harness/scripts" && -d "assets/templates/helpers" && -d "scripts" ]]; then
-    return 0
-  fi
-
+  [[ -d "$path" ]] && return 0
   report_issue "Missing required directory: $path"
 }
 
@@ -870,33 +934,29 @@ check_helper_runtime_files() {
       new-spec.sh new-sprint.sh new-plan.sh capture-plan.sh plan-to-todo.sh
       contract-run.ts contract-worktree.sh ship-worktrees.sh archive-workflow.sh
       refresh-current-status.sh prepare-handoff.sh verify-contract.sh summarize-failures.sh
-      verify-sprint.sh harness-trace-grade.sh sprint-backlog.sh check-task-sync.sh check-deploy-sql-order.sh
+      verify-sprint.sh harness-trace-grade.sh sprint-backlog.sh factor-lab-new.sh factor-lab-promote.sh
+      factor-lab-reject.sh factor-lab-check.sh check-task-sync.sh check-deploy-sql-order.sh
       check-architecture-sync.sh check-agent-tooling.sh check-context-files.sh
       check-brain-manifest.sh sync-brain-docs.sh check-skill-version.ts
       select-agent-context-blocks.sh ensure-task-workflow.sh check-task-workflow.sh
       maintenance-triage.sh heartbeat-triage.sh switch-plan.sh workflow-contract.ts
-      inspect-project-state.ts migrate-workflow-docs.ts migrate-project-template.sh
+      inspect-project-state.ts
       capability-resolver.ts architecture-event.ts capability-config.ts architecture-queue.sh
       archive-architecture-request.sh context-contract-sync.sh workstream-sync.sh
       prepare-codex-handoff.sh codex-handoff-resume.sh
     )
   fi
 
-  if [[ "${helper_source:-package}" == "package" ]]; then
-    for helper_name in "${helper_names[@]}"; do
-      check_package_helper_file "$helper_name"
-    done
+  if [[ "${helper_source:-package}" != "package" ]]; then
+    report_issue "Unsupported repo-local helper_source=$helper_source. Use global/package helper runtime via repo-harness run."
     return
   fi
 
-  check_required_dir "$helper_compat_dir"
-  check_required_dir "$helper_runtime_dir"
-
+  local package_dir
+  package_dir="$(package_helper_dir || true)"
+  [[ -n "$package_dir" ]] || return 0
   for helper_name in "${helper_names[@]}"; do
-    check_required_file "$helper_compat_dir/$helper_name"
-    if [[ "$helper_runtime_dir" != "$helper_compat_dir" ]]; then
-      check_required_file "$helper_runtime_dir/$helper_name"
-    fi
+    [[ -f "$package_dir/$helper_name" ]] || report_issue "Missing packaged helper runtime: $helper_name"
   done
 }
 
@@ -955,8 +1015,7 @@ notes_dir="$(policy_get '.tasks.notes_dir' 'tasks/notes')"
 workstreams_dir="$(policy_get '.tasks.workstreams_dir' 'tasks/workstreams')"
 runs_dir="$(policy_get '.harness.runs_dir' '.ai/harness/runs')"
 checks_file="$(policy_get '.harness.checks_file' '.ai/harness/checks/latest.json')"
-helper_runtime_dir="$(policy_get '.harness.helper_runtime_dir' '.ai/harness/scripts')"
-helper_compat_dir="$(policy_get '.harness.helper_compat_dir' 'scripts')"
+helper_runtime_dir="$(policy_get '.harness.helper_runtime_dir' 'package:assets/templates/helpers')"
 helper_source="$(policy_get '.harness.helper_source' 'package')"
 context_map_file="$(policy_get '.context.map_file' '.ai/context/context-map.json')"
 handoff_file="$(policy_get '.harness.handoff_file' '.ai/harness/handoff/current.md')"
@@ -1006,8 +1065,9 @@ check_required_file "$lessons_file"
 check_required_dir "$research_dir"
 check_required_file "$context_map_file"
 check_required_file "$policy_file"
-check_required_file "$(policy_get '.information_lifecycle.external_knowledge.manifest_file' '.ai/harness/brain-manifest.json')"
-
+if ! load_plan_status_policy; then
+  report_issue "Harness policy has no valid active_plan lifecycle projection; statuses and lifecycle anchors must be present, unique, ordered, and internally consistent."
+fi
 if [[ -f ".claude/templates/plan.template.md" ]]; then
   check_plan_template_artifact_fields ".claude/templates/plan.template.md"
   check_plan_template_evidence_contract ".claude/templates/plan.template.md"
@@ -1042,9 +1102,17 @@ else
       check_required_dir "$rel_dir"
     done < <(contract_query_lines "artifacts.requiredDirectories")
 
+    active_capability_source="$(capability_source)"
+    if [[ "$active_capability_source" == "archcontext" ]]; then
+      check_required_dir "$CAPABILITY_NODES_DIR"
+    fi
+
     while IFS= read -r rel_file; do
       [[ -z "$rel_file" ]] && continue
       if [[ "${helper_source:-package}" == "package" ]] && is_contract_helper_path "$rel_file"; then
+        continue
+      fi
+      if [[ "$rel_file" == "$CAPABILITY_REGISTRY_FILE" && "$active_capability_source" != "registry" ]]; then
         continue
       fi
       check_required_file "$rel_file"
@@ -1070,22 +1138,8 @@ if [[ "$todo_file" != "tasks/todo.md" && -f "tasks/todo.md" ]]; then
   report_issue "Legacy tasks/todo.md detected; migrate it into ${todo_file}."
 fi
 
-if [[ -f "scripts/check-deploy-sql-order.sh" ]]; then
-  if ! bash "scripts/check-deploy-sql-order.sh" --quiet; then
-    report_issue "Deploy SQL order check failed."
-  fi
-fi
-
-if [[ -f "scripts/check-brain-manifest.sh" ]]; then
-  if ! bash "scripts/check-brain-manifest.sh"; then
-    report_issue "Brain manifest check failed."
-  fi
-fi
-
-if [[ -f "scripts/sync-brain-docs.sh" ]]; then
-  if ! bash "scripts/sync-brain-docs.sh" --check; then
-    report_issue "Brain doc sync check failed."
-  fi
+if ! run_optional_helper "check-deploy-sql-order.sh" --quiet; then
+  report_issue "Deploy SQL order check failed."
 fi
 
 todo_source="$(todo_source_plan || true)"

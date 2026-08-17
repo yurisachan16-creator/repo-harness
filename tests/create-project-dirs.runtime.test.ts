@@ -1,12 +1,26 @@
 import { describe, test, expect } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { spawnSync } from "child_process";
+import { defaultPolicy } from "../src/core/adoption/standard-plan";
 
 const ROOT = join(import.meta.dir, "..");
 const REFERENCE_STUB_MARKER = "<!-- repo-harness: reference-config-stub v1 -->";
 const RUNTIME_SMOKE_TIMEOUT_MS = 15000;
+
+/**
+ * scripts/ensure-task-workflow.sh embeds its policy fallback as a quoted
+ * `POLICY_EOF` heredoc, so the body is literal JSON with no shell expansion.
+ * Parsing it directly keeps this seeder in the cross-seeder parity assertions
+ * without having to scaffold a whole workspace.
+ */
+function ensureTaskWorkflowSeedPolicy(): Record<string, any> {
+  const source = readFileSync(join(ROOT, "scripts/ensure-task-workflow.sh"), "utf-8");
+  const match = source.match(/<<'POLICY_EOF'\n([\s\S]*?)\nPOLICY_EOF\n/);
+  if (!match) throw new Error("scripts/ensure-task-workflow.sh POLICY_EOF heredoc not found");
+  return JSON.parse(match[1]);
+}
 
 function expectReferenceConfigStub(cwd: string, docId: string): void {
   const content = readFileSync(join(cwd, "docs/reference-configs", `${docId}.md`), "utf-8");
@@ -38,6 +52,9 @@ describe("create-project-dirs runtime smoke", () => {
       expect(existsSync(join(cwd, "deploy/runbooks/.gitkeep"))).toBe(true);
       expect(existsSync(join(cwd, "deploy/release-checklists/.gitkeep"))).toBe(true);
       expect(existsSync(join(cwd, "deploy/sql/.gitkeep"))).toBe(true);
+      const deployReadme = readFileSync(join(cwd, "deploy/README.md"), "utf-8");
+      expect(deployReadme).toContain("operations.deploy_sql");
+      expect(deployReadme).toContain("direct children of `deploy/sql/`");
       expect(existsSync(join(cwd, "tasks/contracts"))).toBe(true);
       expect(existsSync(join(cwd, "tasks/notes"))).toBe(true);
       expect(existsSync(join(cwd, ".claude/templates/contract.template.md"))).toBe(true);
@@ -69,7 +86,7 @@ describe("create-project-dirs runtime smoke", () => {
       expect(existsSync(join(cwd, "docs/architecture/snapshots/.gitkeep"))).toBe(true);
       expect(existsSync(join(cwd, "docs/architecture/diagrams/.gitkeep"))).toBe(true);
       expect(existsSync(join(cwd, "docs/api"))).toBe(false);
-      expect(existsSync(join(cwd, "scripts/verify-contract.sh"))).toBe(true);
+      expect(existsSync(join(cwd, "scripts/verify-contract.sh"))).toBe(false);
       expect(existsSync(join(cwd, "docs/spec.md"))).toBe(true);
       expect(existsSync(join(cwd, "plans/prds"))).toBe(true);
       expect(existsSync(join(cwd, "plans/sprints"))).toBe(true);
@@ -81,19 +98,31 @@ describe("create-project-dirs runtime smoke", () => {
         readFileSync(join(cwd, "AGENTS.md"), "utf-8")
       );
       expect(readFileSync(join(cwd, "AGENTS.md"), "utf-8")).toContain("Repo Agent Context");
+      expect(readFileSync(join(cwd, "AGENTS.md"), "utf-8")).toContain("Rule 0: You may spend as much time as needed thinking.");
       expect(readFileSync(join(cwd, "AGENTS.md"), "utf-8")).toContain("tasks/todos.md");
       expect(readFileSync(join(cwd, "AGENTS.md"), "utf-8")).toContain(".ai/context/context-map.json");
+      expect(readFileSync(join(cwd, "AGENTS.md"), "utf-8")).toContain("## Agent Context Scaffolding");
+      expect(readFileSync(join(cwd, "AGENTS.md"), "utf-8")).toContain("Treat scanners as leads, not authority");
+      expect(readFileSync(join(cwd, "AGENTS.md"), "utf-8")).toContain("Choose the smallest instruction stack that changes behavior");
+      expect(readFileSync(join(cwd, "AGENTS.md"), "utf-8")).toContain("## Decision Protocol");
+      expect(readFileSync(join(cwd, "AGENTS.md"), "utf-8")).toContain("complete P1/P2/P3 before design decisions or code edits");
+      expect(readFileSync(join(cwd, "AGENTS.md"), "utf-8")).toContain("do not implement until the user approves");
+      expect(readFileSync(join(cwd, "AGENTS.md"), "utf-8")).toContain("If the user says `implement this plan`");
+      expect(readFileSync(join(cwd, "AGENTS.md"), "utf-8")).toContain("re-derives an authority's semantics");
       const gitignore = readFileSync(join(cwd, ".gitignore"), "utf-8");
       expect(gitignore).toContain("tasks/.current.md.tmp.*");
       expect(gitignore).toContain(".claude/.plan-state/");
       expect(gitignore).toContain(".ai/harness/checks/*.latest.json");
       expect(gitignore).toContain(".ai/harness/checks/*.latest.md");
+      expect(gitignore).toContain(".ai/harness/state/");
+      expect(gitignore).toContain(".archcontext/");
       expect(gitignore).not.toContain(".ai/harness/chatgpt/bridge-extension/");
-      expect(gitignore).toContain(".repo-harness/chatgpt-browser.local.json");
-      expect(gitignore).toContain("# repo-harness generated helper wrappers");
-      expect(gitignore).toContain("scripts/check-task-workflow.sh");
-      expect(gitignore).toContain("scripts/prepare-codex-handoff.sh");
-      expect(gitignore).toContain("scripts/repo-harness/");
+      expect(gitignore).toContain(".repo-harness/");
+      expect(gitignore).not.toContain(".repo-harness/chatgpt-browser.local.json");
+      expect(gitignore).not.toContain("# repo-harness generated helper wrappers");
+      expect(gitignore).not.toContain("scripts/check-task-workflow.sh");
+      expect(gitignore).not.toContain("scripts/prepare-codex-handoff.sh");
+      expect(gitignore).not.toContain("scripts/repo-harness/");
       expect(gitignore).not.toContain("tasks/notes");
       expect(gitignore).not.toContain("docs/researches");
       expect(existsSync(join(cwd, ".ai/context/context-map.json"))).toBe(true);
@@ -111,9 +140,9 @@ describe("create-project-dirs runtime smoke", () => {
       expect(existsSync(join(cwd, ".ai/harness/context-budget/latest.json"))).toBe(false);
       expect(existsSync(join(cwd, ".ai/harness/planning"))).toBe(true);
       expect(existsSync(join(cwd, ".ai/harness/runs/.gitkeep"))).toBe(true);
-      expect(existsSync(join(cwd, "scripts/sprint-backlog.sh"))).toBe(true);
-      expect(existsSync(join(cwd, "scripts/check-task-workflow.sh"))).toBe(true);
-      expect(existsSync(join(cwd, "scripts/capability-resolver.ts"))).toBe(true);
+      expect(existsSync(join(cwd, "scripts/sprint-backlog.sh"))).toBe(false);
+      expect(existsSync(join(cwd, "scripts/check-task-workflow.sh"))).toBe(false);
+      expect(existsSync(join(cwd, "scripts/capability-resolver.ts"))).toBe(false);
       expect(existsSync(join(cwd, ".ai/harness/worktrees/.gitkeep"))).toBe(true);
       expect(existsSync(join(cwd, ".ai/harness/triage/.gitkeep"))).toBe(true);
       for (const helper of [
@@ -144,23 +173,20 @@ describe("create-project-dirs runtime smoke", () => {
         "sprint-backlog.sh",
       ]) {
         expect(existsSync(join(cwd, ".ai/harness/scripts", helper))).toBe(false);
-        expect(existsSync(join(cwd, "scripts", helper))).toBe(true);
+        expect(existsSync(join(cwd, "scripts", helper))).toBe(false);
       }
 
       expect(existsSync(join(cwd, "scripts/architecture-drift.sh"))).toBe(false);
       expect(existsSync(join(cwd, "scripts/architecture-drift.sh"))).toBe(false);
-      expect(readFileSync(join(cwd, "scripts/sprint-backlog.sh"), "utf-8")).toContain(
-        "repo-harness run sprint-backlog"
-      );
       expect(existsSync(join(cwd, ".claude/templates/sprint.template.md"))).toBe(true);
       expect(existsSync(join(cwd, "scripts/context-budget.ts"))).toBe(false);
-      expect(existsSync(join(cwd, "scripts/prepare-codex-handoff.sh"))).toBe(true);
-      expect(existsSync(join(cwd, "scripts/codex-handoff-resume.sh"))).toBe(true);
+      expect(existsSync(join(cwd, "scripts/prepare-codex-handoff.sh"))).toBe(false);
+      expect(existsSync(join(cwd, "scripts/codex-handoff-resume.sh"))).toBe(false);
       expect(existsSync(join(cwd, "scripts/skill-factory-create.sh"))).toBe(false);
       expect(existsSync(join(cwd, "scripts/skill-factory-check.sh"))).toBe(false);
       expect(existsSync(join(cwd, ".ai/hooks/README.md"))).toBe(true);
       expect(existsSync(join(cwd, ".ai/hooks/lib/workflow-state.sh"))).toBe(true);
-      expect(existsSync(join(cwd, ".ai/hooks/lib/session-state.sh"))).toBe(true);
+      expect(existsSync(join(cwd, ".ai/hooks/lib/session-state.sh"))).toBe(false);
       expect(existsSync(join(cwd, ".ai/hooks/run-hook.sh"))).toBe(false);
       expect(existsSync(join(cwd, ".codex/hooks.json"))).toBe(false);
       expect(existsSync(join(cwd, ".claude/settings.json"))).toBe(false);
@@ -184,6 +210,27 @@ describe("create-project-dirs runtime smoke", () => {
       expect(existsSync(join(cwd, ".ai/hooks/post-tool-observer.sh"))).toBe(false);
       expect(existsSync(join(cwd, ".ai/hooks/session-start-context.sh"))).toBe(false);
       expect(existsSync(join(cwd, ".ai/hooks/post-edit-guard.sh"))).toBe(false);
+      for (const retired of [
+        ".ai/hooks/anti-simplification.sh",
+        ".ai/hooks/changelog-guard.sh",
+        ".ai/hooks/codex-delegation-advisor.sh",
+        ".ai/hooks/first-principles-guard.sh",
+        ".ai/hooks/hook-input.sh",
+        ".ai/hooks/post-bash.sh",
+        ".ai/hooks/post-tool-observer.sh",
+        ".ai/hooks/prompt-guard.sh",
+        ".ai/hooks/run-hook.sh",
+        ".ai/hooks/subagent-return-channel-guard.sh",
+        ".ai/hooks/subagent-start-context.sh",
+        ".ai/hooks/subagent-stop-quality.sh",
+        ".ai/hooks/lib/minimal-change.sh",
+        ".ai/hooks/lib/session-state.sh",
+        "scripts/hook-shim.sh",
+        "scripts/repo-harness.sh",
+      ]) {
+        expect(existsSync(join(cwd, retired))).toBe(false);
+      }
+      expect(readFileSync(join(cwd, ".ai/hooks/README.md"), "utf-8")).toContain("repo-harness-hook");
 
       const architectureIndex = readFileSync(join(cwd, "docs/architecture/index.md"), "utf-8");
       expect(architectureIndex).toContain("<!-- BEGIN ARCHITECTURE PENDING REQUESTS -->");
@@ -194,7 +241,7 @@ describe("create-project-dirs runtime smoke", () => {
       const workflowContract = JSON.parse(readFileSync(join(cwd, ".ai/harness/workflow-contract.json"), "utf-8"));
       expect(workflowContract.helpers.runtimeDirectory).toBe("package:assets/templates/helpers");
       expect(workflowContract.helpers.runtimeSource).toBe("package");
-      expect(workflowContract.helpers.compatibilityDirectory).toBe("scripts");
+      expect(Object.hasOwn(workflowContract.helpers, "compatibilityDirectory")).toBe(false);
       expect(workflowContract.documentation.referenceConfigs.source).toBe("user-level-runtime-docs");
       expect(workflowContract.documentation.referenceConfigs.repoStubDirectory).toBe("docs/reference-configs");
       expect(workflowContract.documentation.referenceConfigs.resolverCommand).toBe("repo-harness docs path <doc-id>");
@@ -234,10 +281,10 @@ describe("create-project-dirs runtime smoke", () => {
       expect(workflowContract.artifacts.requiredFiles).toContain("tasks/current.md");
       expect(workflowContract.artifacts.requiredDirectories).toContain("plans/prds");
       expect(workflowContract.artifacts.requiredDirectories).toContain("plans/sprints");
-      expect(workflowContract.artifacts.requiredFiles).toContain("scripts/refresh-current-status.sh");
+      expect(workflowContract.artifacts.requiredFiles).not.toContain("scripts/refresh-current-status.sh");
       expect(workflowContract.artifacts.requiredFiles).toContain(".ai/context/capabilities.json");
-      expect(workflowContract.artifacts.requiredFiles).toContain("scripts/capability-resolver.ts");
-      expect(workflowContract.artifacts.requiredFiles).toContain("scripts/architecture-event.ts");
+      expect(workflowContract.artifacts.requiredFiles).not.toContain("scripts/capability-resolver.ts");
+      expect(workflowContract.artifacts.requiredFiles).not.toContain("scripts/architecture-event.ts");
       expect(workflowContract.artifacts.requiredFiles).toContain("docs/reference-configs/agentic-development-flow.md");
       expect(workflowContract.artifacts.requiredFiles).toContain("docs/reference-configs/external-tooling.md");
       expect(workflowContract.artifacts.requiredFiles).toContain("docs/reference-configs/document-generation.md");
@@ -254,28 +301,28 @@ describe("create-project-dirs runtime smoke", () => {
       expect(workflowContract.artifacts.requiredDirectories).toContain(".ai/harness/triage");
       expect(workflowContract.artifacts.requiredDirectories).toContain(".ai/harness/planning");
       expect(workflowContract.artifacts.requiredDirectories).not.toContain(".ai/harness/scripts");
-      expect(workflowContract.artifacts.requiredDirectories).toContain("scripts");
+      expect(workflowContract.artifacts.requiredDirectories).not.toContain("scripts");
       expect(workflowContract.artifacts.requiredDirectories).toContain("docs/architecture/domains");
       expect(workflowContract.artifacts.requiredDirectories).toContain("docs/architecture/modules");
-      expect(workflowContract.agenticDevelopment.routing.complexEngineeringPlan).toBe("gstack:plan-eng-review");
+      expect(workflowContract.agenticDevelopment.routing.productDiscovery).toBe("parent-agent:geju");
+      expect(workflowContract.agenticDevelopment.routing.complexEngineeringPlan).toBe("parent-agent:geju");
+      expect(workflowContract.agenticDevelopment.routing.designPlan).toBe("parent-agent:geju");
       expect(workflowContract.agenticDevelopment.routing.smallOrMediumPlan).toBe("waza:think");
       const contextMap = JSON.parse(readFileSync(join(cwd, ".ai/context/context-map.json"), "utf-8"));
       expect(contextMap.root_context_files).not.toContain("docs/researches/");
       expect(contextMap.root_context_files).toContain(".ai/context/capabilities.json");
-      expect(contextMap.functional_block_selector.script).toBe("scripts/select-agent-context-blocks.sh");
+      expect(contextMap.functional_block_selector.script).toBe("repo-harness run select-agent-context-blocks");
       expect(contextMap.lsp_profiles.default).toBe("typescript-lsp");
       expect(contextMap.discoverable_contexts.map((entry: { path: string }) => entry.path)).not.toContain("apps/*/AGENTS.md");
       expect(contextMap.discoverable_contexts.map((entry: { path: string }) => entry.path)).toContain("tasks/workstreams/**/*.md");
       expect(contextMap.discoverable_contexts.find((entry: { path: string }) => entry.path === "tasks/workstreams/**/*.md").purpose).toBe("capability-workstream");
       const policy = JSON.parse(readFileSync(join(cwd, ".ai/harness/policy.json"), "utf-8"));
       expect(policy.harness.helper_source).toBe("package");
-      expect(policy.harness.helper_runtime_dir).toBe(".ai/harness/scripts");
-      expect(policy.harness.helper_compat_dir).toBe("scripts");
-      expect(policy.sprints.helper_script).toBe("scripts/sprint-backlog.sh");
+      expect(policy.harness.helper_runtime_dir).toBe("package:assets/templates/helpers");
+      expect(policy.harness.helper_compat_dir).toBeUndefined();
+      expect(policy.sprints.helper_script).toBe("repo-harness run sprint-backlog");
       expect(policy.external_tooling.routing).toEqual({
-        complex: "gstack",
         simple: "waza",
-        knowledge: "gbrain",
       });
       expect(policy.external_tooling.hosts).toEqual(["claude-code", "codex"]);
       expect(policy.external_tooling.mode).toBe("agent-readiness-required");
@@ -283,6 +330,14 @@ describe("create-project-dirs runtime smoke", () => {
       expect(policy.external_tooling.waza.primary_host).toBe("codex");
       expect(policy.external_tooling.waza.managed_skills).toEqual(["think", "hunt", "check", "health"]);
       expect(policy.external_tooling.waza.codex_primary_path).toBe("~/.codex/skills");
+      expect(policy.external_tooling.hai_stack.source_repo).toBe("hylarucoder/hai-stack");
+      expect(policy.external_tooling.hai_stack.source_url).toBe("https://github.com/hylarucoder/hai-stack.git");
+      expect(policy.external_tooling.hai_stack.managed_skills).toEqual(["geju"]);
+      expect(policy.external_tooling.hai_stack.primary_host).toBe("codex");
+      expect(policy.external_tooling.hai_stack.codex_primary_path).toBe("~/.codex/skills");
+      expect(policy.external_tooling.hai_stack.staging_cache_path).toBe("~/.agents/skills");
+      expect(policy.external_tooling.hai_stack.sync_mode).toBe("stage-upstream-then-copy-to-codex");
+      expect(policy.external_tooling.hai_stack.host_drift_policy).toBe("report-per-host-version-staging-and-upstream-drift");
       expect(policy.external_tooling.codex_automation_profile.required_skills).toEqual(["health", "check", "mermaid"]);
       expect(policy.external_tooling.codex_automation_profile.mode).toBe("codex-runtime-reference");
       expect(policy.external_tooling.codex_automation_profile.source).toBe("~/.codex/skills");
@@ -292,12 +347,48 @@ describe("create-project-dirs runtime smoke", () => {
         architecture_diagram: "mermaid",
       });
       expect(policy.external_tooling.codex_automation_profile.vendoring_policy).toBe("do-not-vendor-skill-body");
-      expect(policy.external_tooling.gbrain.mcp).toBe("candidate-disabled");
+      expect(policy.external_tooling).not.toHaveProperty("gbrain");
       expect(policy.external_tooling.codegraph.primary_host).toBe("both");
       expect(policy.external_tooling.codegraph.index_dir).toBe(".codegraph");
       expect(policy.external_tooling.codegraph.readiness).toBe("required-for-agent-code-navigation");
       expect(policy.external_tooling.codegraph.hook_policy).toBe("do-not-block-hooks");
       expect(policy.external_tooling.codegraph.vendoring_policy).toBe("do-not-add-package-dependency");
+      // archctx is an external optional CLI, never a runtime dependency: the entry
+      // must stay advisory and identical across every seeder that emits it.
+      const archctxEntry = {
+        cli_package: "archctx",
+        contracts_package: "archctx-contracts",
+        contracts_scope: "release-gated-packed-schema-authority",
+        install_mode: "release-gated-runtime-dependency-when-projection-enabled",
+        readiness: "advisory",
+        hook_policy: "do-not-block-hooks",
+        vendoring_policy: "do-not-vendor",
+        model_dir: ".archcontext/model",
+        nodes_dir: ".archcontext/model/nodes",
+        capability_source_key: ".ai/harness/policy.json#context.capability_source",
+      };
+      expect(policy.external_tooling.archctx).toEqual(archctxEntry);
+      expect(ensureTaskWorkflowSeedPolicy().external_tooling.archctx).toEqual(archctxEntry);
+      expect(
+        JSON.parse(readFileSync(join(ROOT, ".ai/harness/policy.json"), "utf-8")).external_tooling.archctx
+      ).toEqual(archctxEntry);
+      expect(policy.external_tooling.agent_fleet.source).toBe("package:agents/fleet");
+      expect(policy.external_tooling.agent_fleet.managed_agents).toEqual([
+        "explorer",
+        "deep-reasoner",
+        "fast-worker",
+        "gatekeeper",
+        "root-cause-prover",
+        "harness-evaluator",
+      ]);
+      expect(policy.external_tooling.agent_fleet.claude_target).toBe("~/.claude/agents");
+      expect(policy.external_tooling.agent_fleet.codex_target).toBe("~/.codex/agents");
+      expect(policy.external_tooling.agent_fleet.codex_generation).toBe("derive-toml-from-md");
+      expect(policy.external_tooling.agent_fleet.install_mode).toBe("advisory");
+      expect(policy.external_tooling.agent_fleet.conflict_policy).toBe("never-clobber-without-force");
+      expect(policy.external_tooling.agent_fleet.install_command).toBe("repo-harness run install-agent-fleet");
+      expect(policy.external_tooling.agent_fleet.source_policy).toBe("repo-owned-single-authority");
+      expect(policy.external_tooling.fable_agents).toBeUndefined();
       expect(policy.minimal_change).toMatchObject({
         version: 1,
         mode: "advice",
@@ -326,28 +417,67 @@ describe("create-project-dirs runtime smoke", () => {
       expect(policy.operations.tracked).toContain("deploy/scripts/");
       expect(policy.operations.tracked).toContain("deploy/sql/");
       expect(policy.operations.ignored).toContain("_ops/");
+      expect(policy.operations.deploy_sql).toBeUndefined();
+      expect(policy.operations.rule).toContain("operations.deploy_sql");
       expect(policy.information_lifecycle.notes.dir).toBe("tasks/notes");
       expect(policy.information_lifecycle.evidence.snapshots_dir).toBe(".ai/harness/runs");
+      expect(policy.information_lifecycle.external_knowledge.mode).toBe("manual-opt-in");
       expect(policy.information_lifecycle.external_knowledge.manifest_file).toBe(".ai/harness/brain-manifest.json");
-      expect(policy.information_lifecycle.external_knowledge.drift_check).toBe("scripts/check-brain-manifest.sh");
-      expect(policy.information_lifecycle.external_knowledge.sync_script).toBe("scripts/sync-brain-docs.sh");
+      expect(policy.information_lifecycle.external_knowledge.drift_check).toBeUndefined();
+      expect(policy.information_lifecycle.external_knowledge.hook_trigger).toBeUndefined();
+      expect(policy.information_lifecycle.external_knowledge.sync_script).toBe("repo-harness run sync-brain-docs");
       expect(policy.agentic_development.routing).toEqual({
-        product_discovery: "gstack:office-hours",
-        complex_engineering_plan: "gstack:plan-eng-review",
-        design_plan: "gstack:plan-design-review",
+        product_discovery: "parent-agent:geju",
+        complex_engineering_plan: "parent-agent:geju",
+        design_plan: "parent-agent:geju",
+        design_options_choice: "convention:design-options",
         small_or_medium_plan: "waza:think",
         bug_or_regression: "waza:hunt",
         post_implementation_review: "waza:check",
       });
+      // Parity guard: scripts/lib/project-init-lib.sh (pi_write_harness_policy, bash-generated
+      // above) and src/core/adoption/standard-plan.ts (defaultPolicy, TS-generated) are two
+      // independently hardcoded sources for the same agentic_development.routing map. Assert
+      // they stay identical so the maps cannot silently diverge again.
+      const tsDefaultPolicy = defaultPolicy("minimal-agentic") as Record<string, any>;
+      expect(policy.agentic_development.routing).toEqual(tsDefaultPolicy.agentic_development.routing);
       expect(policy.agentic_development.due_diligence.levels).toEqual([
         "P1_GLOBAL_ARCHITECTURE",
         "P2_DATA_FLOW_TRACE",
         "P3_DESIGN_DECISION",
       ]);
-      expect(policy.context.functional_block_selector.script).toBe("scripts/select-agent-context-blocks.sh");
+      expect(policy.agentic_development.due_diligence.explicit_report_required_for).toContain(
+        "complex_engineering_plan",
+      );
+      expect(policy.context.functional_block_selector.script).toBe("repo-harness run select-agent-context-blocks");
       expect(policy.context.capability_registry_file).toBe(".ai/context/capabilities.json");
-      expect(policy.context.capability_resolver).toBe("scripts/capability-resolver.ts");
-      expect(policy.context.capability_config).toBe("scripts/capability-config.ts");
+      expect(policy.context.capability_resolver).toBe("repo-harness run capability-resolver");
+      expect(policy.context.capability_config).toBe("repo-harness run capability-config");
+      // All three independently hardcoded policy seeders must agree on the capability
+      // authority switch; downstream repos stay on the JSON registry by default.
+      // Seeders: scripts/lib/project-init-lib.sh (bash `policy` above),
+      // src/core/adoption/standard-plan.ts (`tsDefaultPolicy`), and
+      // scripts/ensure-task-workflow.sh (its embedded POLICY_EOF fallback seed).
+      const fallbackSeedPolicy = ensureTaskWorkflowSeedPolicy();
+      const repoPolicy = JSON.parse(readFileSync(join(ROOT, ".ai/harness/policy.json"), "utf-8"));
+      for (const seeded of [policy, tsDefaultPolicy, fallbackSeedPolicy]) {
+        expect(seeded.context.capability_source).toBe("registry");
+      }
+      // This repo cut its own authority over to archcontext nodes (Stage 2); the
+      // seeded default above is what a newly generated repo gets, not what this repo
+      // runs on. Both shapes share the one selector and the one rule string.
+      expect(repoPolicy.context.capability_source).toBe("archcontext");
+      expect(existsSync(join(ROOT, ".archcontext/model/nodes"))).toBe(true);
+      expect(existsSync(join(ROOT, ".ai/context/capabilities.json"))).toBe(false);
+      for (const seeded of [policy, tsDefaultPolicy, fallbackSeedPolicy, repoPolicy]) {
+        expect(seeded.context.capability_source_rule).toBe(tsDefaultPolicy.context.capability_source_rule);
+        expect(seeded.context.capability_source_rule).toContain("no dual-read and no fallback");
+      }
+      // capability_config is seeded by the three file-writing seeders; standard-plan.ts
+      // does not carry it, so it is asserted separately from the switch itself.
+      for (const seeded of [policy, fallbackSeedPolicy, repoPolicy]) {
+        expect(seeded.context.capability_config).toBe("repo-harness run capability-config");
+      }
       expect(policy.documentation.profile).toBe("minimal-agentic");
       expect(policy.documentation.reference_source).toBe("user-level-runtime-docs");
       expect(policy.documentation.reference_stub_marker).toBe(REFERENCE_STUB_MARKER);
@@ -364,9 +494,9 @@ describe("create-project-dirs runtime smoke", () => {
       expect(policy.lsp_profiles.selection).toBe("functional-block-first");
       expect(policy.worktree_strategy.auto_on_conflict).toBe(true);
       expect(policy.worktree_strategy.auto_for_contract_tasks).toBe(true);
-      expect(policy.worktree_strategy.start_script).toBe("scripts/contract-worktree.sh start --plan <plan-file>");
-      expect(policy.worktree_strategy.finish_script).toBe("scripts/contract-worktree.sh finish");
-      expect(policy.worktree_strategy.cleanup_script).toBe("scripts/contract-worktree.sh cleanup --slug <slug>");
+      expect(policy.worktree_strategy.start_script).toBe("repo-harness run contract-worktree start --plan <plan-file>");
+      expect(policy.worktree_strategy.finish_script).toBe("repo-harness run contract-worktree finish");
+      expect(policy.worktree_strategy.cleanup_script).toBe("repo-harness run contract-worktree cleanup --slug <slug>");
       expect(policy.worktree_strategy.validation_route).toBe("waza:check");
       expect(policy.context_budget).toBeUndefined();
       expect(policy.handoff_resume.auto_start_new_session).toBe(false);
@@ -382,6 +512,16 @@ describe("create-project-dirs runtime smoke", () => {
       expect(policy.sidecar_research.spawn_decision).toContain("do not ask the user");
       expect(policy.sidecar_research.fallback_runner).toBe("main-thread trace");
       expect(policy.sidecar_research.main_thread_policy).toContain("if spawning is not worthwhile");
+      expect(policy.delegation.preferred_runners).toEqual(["subagent"]);
+      expect(policy.delegation.fallback_runner).toBeUndefined();
+      expect(policy.delegation.brief_source).toBe("tasks/contracts/<stem>.contract.md");
+      expect(policy.delegation.runner_rule).toContain(
+        "Codex uses native spawn_agent with the exact installed agent_type",
+      );
+      expect(policy.delegation.runner_rule).toContain(
+        "fails closed without an alternate fleet runner",
+      );
+      expect(policy.delegation.runner_rule).toContain("configured_unverified");
       expect(policy.documentation.reference_configs).toContain("global-working-rules.md");
       expect(policy.documentation.reference_configs).toContain("minimal-change-hooks.md");
       expect(policy.upgrade.strategy_version).toBe(1);
@@ -394,8 +534,8 @@ describe("create-project-dirs runtime smoke", () => {
       expect(pkg.scripts["check:task-sync"]).toBe("repo-harness run check-task-sync");
       expect(pkg.scripts["check:task-workflow"]).toBe("repo-harness run check-task-workflow --strict");
       expect(pkg.scripts["sync:brain-docs"]).toBe("repo-harness run sync-brain-docs --all");
-      expect(existsSync(join(cwd, "scripts/contract-worktree.sh"))).toBe(true);
-      expect(existsSync(join(cwd, "scripts/ship-worktrees.sh"))).toBe(true);
+      expect(existsSync(join(cwd, "scripts/contract-worktree.sh"))).toBe(false);
+      expect(existsSync(join(cwd, "scripts/ship-worktrees.sh"))).toBe(false);
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
@@ -439,7 +579,7 @@ describe("create-project-dirs runtime smoke", () => {
       const contextMap = JSON.parse(readFileSync(join(cwd, ".ai/context/context-map.json"), "utf-8"));
       const capabilities = JSON.parse(readFileSync(join(cwd, ".ai/context/capabilities.json"), "utf-8"));
       expect(capabilities.capabilities.map((entry: { id: string }) => entry.id)).toContain("apps-web");
-      expect(contextMap.functional_block_selector.script).toBe("scripts/select-agent-context-blocks.sh");
+      expect(contextMap.functional_block_selector.script).toBe("repo-harness run select-agent-context-blocks");
       const webClaudeEntry = contextMap.discoverable_contexts.find((entry: { path: string }) => entry.path === "apps/web/CLAUDE.md");
       expect(webClaudeEntry.lsp_profile).toBe("typescript-lsp");
       expect(webClaudeEntry.doc_scope).toBe("capability-contract");
@@ -498,10 +638,10 @@ describe("create-project-dirs runtime smoke", () => {
     const libPath = join(ROOT, "scripts/lib/project-init-lib.sh");
 
     try {
-      mkdirSync(join(cwd, "_ref/gbrain"), { recursive: true });
+      mkdirSync(join(cwd, "_ref/external-tool"), { recursive: true });
       mkdirSync(join(cwd, "_ops/scratch"), { recursive: true });
       mkdirSync(join(cwd, ".worktrees/codex/old"), { recursive: true });
-      writeFileSync(join(cwd, "_ref/gbrain/AGENTS.md"), "# External Reference\n");
+      writeFileSync(join(cwd, "_ref/external-tool/AGENTS.md"), "# External Reference\n");
       writeFileSync(join(cwd, "_ops/scratch/CLAUDE.md"), "# Local Operations\n");
       writeFileSync(join(cwd, ".worktrees/codex/old/AGENTS.md"), "# Old Worktree\n");
 
@@ -521,7 +661,7 @@ describe("create-project-dirs runtime smoke", () => {
       expect(res.status).toBe(0);
       expect(existsSync(join(cwd, "CLAUDE.md"))).toBe(true);
       expect(existsSync(join(cwd, "AGENTS.md"))).toBe(true);
-      expect(existsSync(join(cwd, "_ref/gbrain/CLAUDE.md"))).toBe(false);
+      expect(existsSync(join(cwd, "_ref/external-tool/CLAUDE.md"))).toBe(false);
       const capabilities = JSON.parse(readFileSync(join(cwd, ".ai/context/capabilities.json"), "utf-8"));
       expect(capabilities.capabilities).toEqual([]);
     } finally {
@@ -558,6 +698,11 @@ describe("create-project-dirs runtime smoke", () => {
         readFileSync(join(cwd, "AGENTS.md"), "utf-8")
       );
       expect(readFileSync(join(cwd, "AGENTS.md"), "utf-8")).toContain("Repo Agent Context");
+      expect(readFileSync(join(cwd, "AGENTS.md"), "utf-8")).toContain("Rule 0: You may spend as much time as needed thinking.");
+      expect(readFileSync(join(cwd, "AGENTS.md"), "utf-8")).toContain("## Agent Context Scaffolding");
+      expect(readFileSync(join(cwd, "AGENTS.md"), "utf-8")).toContain("Choose the smallest instruction stack that changes behavior");
+      expect(readFileSync(join(cwd, "AGENTS.md"), "utf-8")).toContain("## Decision Protocol");
+      expect(readFileSync(join(cwd, "AGENTS.md"), "utf-8")).toContain("do not implement until the user approves");
       expect(existsSync(join(cwd, "apps/web/CLAUDE.md"))).toBe(false);
       expect(existsSync(join(cwd, "apps/web/AGENTS.md"))).toBe(false);
       expect(existsSync(join(cwd, "packages/ui/CLAUDE.md"))).toBe(false);
@@ -567,7 +712,7 @@ describe("create-project-dirs runtime smoke", () => {
     }
   }, RUNTIME_SMOKE_TIMEOUT_MS);
 
-  test("should scaffold full hook runtime when hook_source repo is pinned", () => {
+  test("should ignore retired hook_source and install operator helper libraries only", () => {
     const cwd = mkdtempSync(join(tmpdir(), "create-project-dirs-hook-pin-"));
     try {
       mkdirSync(join(cwd, ".ai/harness"), { recursive: true });
@@ -579,13 +724,12 @@ describe("create-project-dirs runtime smoke", () => {
       });
 
       expect(res.status).toBe(0);
-      expect(existsSync(join(cwd, ".ai/hooks/run-hook.sh"))).toBe(true);
-      expect(existsSync(join(cwd, ".ai/hooks/post-edit-guard.sh"))).toBe(true);
-      expect(existsSync(join(cwd, ".ai/hooks/post-tool-observer.sh"))).toBe(true);
-      expect(existsSync(join(cwd, ".ai/hooks/session-start-context.sh"))).toBe(true);
+      expect(existsSync(join(cwd, ".ai/hooks/run-hook.sh"))).toBe(false);
+      expect(existsSync(join(cwd, ".ai/hooks/post-tool-observer.sh"))).toBe(false);
+      expect(existsSync(join(cwd, ".ai/hooks/post-bash.sh"))).toBe(false);
       expect(existsSync(join(cwd, ".ai/hooks/lib/workflow-state.sh"))).toBe(true);
-      expect(existsSync(join(cwd, ".ai/hooks/lib/session-state.sh"))).toBe(true);
-      expect(existsSync(join(cwd, ".ai/hooks/AGENTS.md"))).toBe(true);
+      expect(existsSync(join(cwd, ".ai/hooks/lib/session-state.sh"))).toBe(false);
+      expect(existsSync(join(cwd, ".ai/hooks/AGENTS.md"))).toBe(false);
       expect(existsSync(join(cwd, ".ai/hooks/projection.json"))).toBe(false);
       expect(existsSync(join(cwd, ".ai/hooks/codex.hooks.template.json"))).toBe(false);
     } finally {
@@ -593,14 +737,23 @@ describe("create-project-dirs runtime smoke", () => {
     }
   }, RUNTIME_SMOKE_TIMEOUT_MS);
 
-  test("should prune stale repo-local hook runtime when hook_source repo is not pinned", () => {
+  test("should preserve existing repo-local hooks and host adapter config outside canonical adoption", () => {
     const cwd = mkdtempSync(join(tmpdir(), "create-project-dirs-hook-prune-"));
     try {
       mkdirSync(join(cwd, ".ai/hooks/lib"), { recursive: true });
-      writeFileSync(join(cwd, ".ai/hooks/run-hook.sh"), "#!/bin/bash\necho stale\n");
-      writeFileSync(join(cwd, ".ai/hooks/prompt-guard.sh"), "#!/bin/bash\necho stale\n");
+      mkdirSync(join(cwd, ".claude"), { recursive: true });
+      mkdirSync(join(cwd, ".codex"), { recursive: true });
+      const staleRuntime = "#!/bin/bash\necho user-modified-stale\n";
+      const customHook = "#!/bin/bash\necho custom-owner\n";
+      const claudeConfig = '{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"custom-claude-hook"}]}]},"ownerField":true}\n';
+      const codexConfig = '{"hooks":{"UserPromptSubmit":[{"command":"custom-codex-hook"}]},"ownerField":true}\n';
+      writeFileSync(join(cwd, ".ai/hooks/run-hook.sh"), staleRuntime);
+      writeFileSync(join(cwd, ".ai/hooks/prompt-guard.sh"), staleRuntime);
+      writeFileSync(join(cwd, ".ai/hooks/custom-owner-hook.sh"), customHook);
       writeFileSync(join(cwd, ".ai/hooks/AGENTS.md"), "# Stale hook docs\n");
       writeFileSync(join(cwd, ".ai/hooks/settings.template.json"), "{}\n");
+      writeFileSync(join(cwd, ".claude/settings.json"), claudeConfig);
+      writeFileSync(join(cwd, ".codex/hooks.json"), codexConfig);
 
       const res = spawnSync("bash", [join(ROOT, "scripts/create-project-dirs.sh")], {
         cwd,
@@ -610,11 +763,14 @@ describe("create-project-dirs runtime smoke", () => {
       expect(res.status).toBe(0);
       expect(existsSync(join(cwd, ".ai/hooks/README.md"))).toBe(true);
       expect(existsSync(join(cwd, ".ai/hooks/lib/workflow-state.sh"))).toBe(true);
-      expect(existsSync(join(cwd, ".ai/hooks/lib/session-state.sh"))).toBe(true);
-      expect(existsSync(join(cwd, ".ai/hooks/run-hook.sh"))).toBe(false);
-      expect(existsSync(join(cwd, ".ai/hooks/prompt-guard.sh"))).toBe(false);
-      expect(existsSync(join(cwd, ".ai/hooks/AGENTS.md"))).toBe(false);
-      expect(existsSync(join(cwd, ".ai/hooks/settings.template.json"))).toBe(false);
+      expect(existsSync(join(cwd, ".ai/hooks/lib/session-state.sh"))).toBe(false);
+      expect(readFileSync(join(cwd, ".ai/hooks/run-hook.sh"), "utf-8")).toBe(staleRuntime);
+      expect(readFileSync(join(cwd, ".ai/hooks/prompt-guard.sh"), "utf-8")).toBe(staleRuntime);
+      expect(readFileSync(join(cwd, ".ai/hooks/custom-owner-hook.sh"), "utf-8")).toBe(customHook);
+      expect(readFileSync(join(cwd, ".ai/hooks/AGENTS.md"), "utf-8")).toBe("# Stale hook docs\n");
+      expect(readFileSync(join(cwd, ".ai/hooks/settings.template.json"), "utf-8")).toBe("{}\n");
+      expect(readFileSync(join(cwd, ".claude/settings.json"), "utf-8")).toBe(claudeConfig);
+      expect(readFileSync(join(cwd, ".codex/hooks.json"), "utf-8")).toBe(codexConfig);
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
@@ -652,6 +808,198 @@ describe("create-project-dirs runtime smoke", () => {
     }
   }, RUNTIME_SMOKE_TIMEOUT_MS);
 
+  test("project init directly replaces managed planning routes in an existing policy", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "stale-planning-policy-"));
+    const libPath = join(ROOT, "scripts/lib/project-init-lib.sh");
+
+    try {
+      mkdirSync(join(cwd, ".ai/harness"), { recursive: true });
+      writeFileSync(
+        join(cwd, ".ai/harness/policy.json"),
+        JSON.stringify(
+          {
+            external_tooling: {
+              gbrain: { mcp: "candidate-disabled" },
+              routing: { complex: "gstack", simple: "waza", knowledge: "gbrain" },
+            },
+            agentic_development: {
+              routing: {
+                product_discovery: "gstack:office-hours",
+                complex_engineering_plan: "gstack:plan-eng-review",
+                design_plan: "gstack:plan-design-review",
+              },
+              due_diligence: {
+                explicit_report_required_for: ["plan-eng-review", "shared_contract"],
+              },
+            },
+          },
+          null,
+          2,
+        ),
+      );
+
+      const res = spawnSync(
+        "bash",
+        ["-lc", [`source '${libPath}'`, 'pi_write_harness_policy "$PWD" apply'].join("\n")],
+        { cwd, encoding: "utf-8" },
+      );
+
+      expect(res.status).toBe(0);
+      const policy = JSON.parse(readFileSync(join(cwd, ".ai/harness/policy.json"), "utf-8"));
+      expect(policy.external_tooling.routing).toEqual({ simple: "waza" });
+      expect(policy.external_tooling).not.toHaveProperty("gbrain");
+      expect(policy.agentic_development.routing).toMatchObject({
+        product_discovery: "parent-agent:geju",
+        complex_engineering_plan: "parent-agent:geju",
+        design_plan: "parent-agent:geju",
+      });
+      expect(policy.agentic_development.due_diligence.explicit_report_required_for).toEqual([
+        "complex_engineering_plan",
+        "shared_contract",
+      ]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  }, RUNTIME_SMOKE_TIMEOUT_MS);
+
+  test("project init preserves mixed custom routes while cutting the declared legacy provider", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "custom-planning-policy-"));
+    const libPath = join(ROOT, "scripts/lib/project-init-lib.sh");
+
+    try {
+      mkdirSync(join(cwd, ".ai/harness"), { recursive: true });
+      writeFileSync(
+        join(cwd, ".ai/harness/policy.json"),
+        JSON.stringify(
+          {
+            external_tooling: {
+              routing: { complex: "retired-provider", simple: "waza", knowledge: "gbrain" },
+            },
+            agentic_development: {
+              routing: {
+                product_discovery: "custom:product-discovery",
+                complex_engineering_plan: "retired-provider:architecture-review",
+                design_plan: "custom:design-review",
+              },
+              due_diligence: {
+                explicit_report_required_for: ["architecture-review", "shared_contract", "database_migration"],
+              },
+            },
+          },
+          null,
+          2,
+        ),
+      );
+
+      const res = spawnSync(
+        "bash",
+        ["-lc", [`source '${libPath}'`, 'pi_write_harness_policy "$PWD" apply'].join("\n")],
+        { cwd, encoding: "utf-8" },
+      );
+
+      expect(res.status).toBe(0);
+      const policy = JSON.parse(readFileSync(join(cwd, ".ai/harness/policy.json"), "utf-8"));
+      expect(policy.external_tooling.routing).toEqual({ simple: "waza" });
+      expect(policy.agentic_development.routing).toMatchObject({
+        product_discovery: "custom:product-discovery",
+        complex_engineering_plan: "parent-agent:geju",
+        design_plan: "custom:design-review",
+      });
+      expect(policy.agentic_development.due_diligence.explicit_report_required_for).toEqual([
+        "complex_engineering_plan",
+        "shared_contract",
+        "database_migration",
+      ]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  }, RUNTIME_SMOKE_TIMEOUT_MS);
+
+  test("Python-only policy merge matches the primary runtime migration", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "python-policy-merge-"));
+    const libPath = join(ROOT, "scripts/lib/project-init-lib.sh");
+    const fakeBin = join(cwd, "bin");
+    const defaultsPath = join(cwd, "defaults.json");
+    const currentPath = join(cwd, "current.json");
+    const primaryOutput = join(cwd, "primary.json");
+    const pythonOutput = join(cwd, "python.json");
+
+    try {
+      const python = spawnSync("python3", ["-c", "import sys; print(sys.executable)"], { encoding: "utf-8" });
+      expect(python.status).toBe(0);
+      expect(python.stdout.trim()).not.toBe("");
+      mkdirSync(fakeBin, { recursive: true });
+      symlinkSync(python.stdout.trim(), join(fakeBin, "python3"));
+
+      writeFileSync(
+        defaultsPath,
+        JSON.stringify({
+          external_tooling: { routing: { simple: "waza", knowledge: "gbrain" } },
+          agentic_development: {
+            routing: {
+              product_discovery: "parent-agent:geju",
+              complex_engineering_plan: "parent-agent:geju",
+              design_plan: "parent-agent:geju",
+            },
+            due_diligence: { explicit_report_required_for: ["complex_engineering_plan"] },
+          },
+        }),
+      );
+      writeFileSync(
+        currentPath,
+        JSON.stringify({
+          external_tooling: {
+            routing: { complex: "retired-provider", simple: "waza", knowledge: "gbrain" },
+          },
+          agentic_development: {
+            routing: {
+              product_discovery: "retired-provider:discovery-review",
+              complex_engineering_plan: "retired-provider:architecture-review",
+              design_plan: "custom:design-review",
+            },
+            due_diligence: {
+              explicit_report_required_for: ["discovery-review", "architecture-review", "database_migration"],
+            },
+          },
+        }),
+      );
+
+      const primary = spawnSync(
+        "/bin/bash",
+        ["--noprofile", "--norc", "-c", `source '${libPath}'\npi_merge_json_defaults '${defaultsPath}' '${currentPath}' '${primaryOutput}'`],
+        { cwd, encoding: "utf-8" },
+      );
+      expect(primary.status).toBe(0);
+
+      const pythonOnly = spawnSync(
+        "/bin/bash",
+        ["--noprofile", "--norc", "-c", `source '${libPath}'\npi_merge_json_defaults '${defaultsPath}' '${currentPath}' '${pythonOutput}'`],
+        {
+          cwd,
+          encoding: "utf-8",
+          env: { HOME: cwd, PATH: fakeBin },
+        },
+      );
+      expect(pythonOnly.status).toBe(0);
+      expect(readFileSync(pythonOutput, "utf-8")).toBe(readFileSync(primaryOutput, "utf-8"));
+
+      const policy = JSON.parse(readFileSync(pythonOutput, "utf-8"));
+      expect(policy.external_tooling.routing).toEqual({ simple: "waza" });
+      expect(policy.agentic_development.routing).toMatchObject({
+        product_discovery: "parent-agent:geju",
+        complex_engineering_plan: "parent-agent:geju",
+        design_plan: "custom:design-review",
+      });
+      expect(policy.agentic_development.due_diligence.explicit_report_required_for).toEqual([
+        "product_discovery",
+        "complex_engineering_plan",
+        "database_migration",
+      ]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  }, RUNTIME_SMOKE_TIMEOUT_MS);
+
   test("should allow full documentation profile when explicitly requested", () => {
     const cwd = mkdtempSync(join(tmpdir(), "full-doc-profile-"));
     try {
@@ -676,6 +1024,92 @@ describe("create-project-dirs runtime smoke", () => {
       expect(policy.documentation.profile).toBe("full");
       expect(policy.documentation.reference_source).toBe("user-level-runtime-docs");
       expect(policy.documentation.reference_configs).toContain("spa-day-protocol.md");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  }, RUNTIME_SMOKE_TIMEOUT_MS);
+
+  test("pi_maybe_install_agent_fleet prints an advisory tip and never touches HOME when install_mode is advisory", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "fleet-install-advisory-"));
+    const libPath = join(ROOT, "scripts/lib/project-init-lib.sh");
+    const installerPath = join(ROOT, "scripts/install-agent-fleet.sh");
+    const home = join(cwd, "fakehome");
+    const repoDir = join(cwd, "repo");
+    try {
+      mkdirSync(join(repoDir, ".ai", "harness"), { recursive: true });
+      mkdirSync(home, { recursive: true });
+      writeFileSync(
+        join(repoDir, ".ai", "harness", "policy.json"),
+        JSON.stringify({ external_tooling: { agent_fleet: { install_mode: "advisory" } } }, null, 2)
+      );
+
+      const res = spawnSync(
+        "bash",
+        [
+          "-lc",
+          [
+            `source '${libPath}'`,
+            `pi_maybe_install_agent_fleet '${repoDir}' apply '${installerPath}'`,
+          ].join("\n"),
+        ],
+        { cwd, encoding: "utf-8", env: { ...process.env, HOME: home } }
+      );
+
+      expect(res.status).toBe(0);
+      expect(res.stdout).toContain("repo-harness run install-agent-fleet");
+      expect(existsSync(join(home, ".claude", "agents"))).toBe(false);
+      expect(existsSync(join(home, ".codex", "agents"))).toBe(false);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  }, RUNTIME_SMOKE_TIMEOUT_MS);
+
+  test("pi_maybe_install_agent_fleet installs the managed agent fleet into HOME when install_mode is auto-install-on-init and mode is apply", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "fleet-install-auto-"));
+    const libPath = join(ROOT, "scripts/lib/project-init-lib.sh");
+    const installerPath = join(ROOT, "scripts/install-agent-fleet.sh");
+    const home = join(cwd, "fakehome");
+    const repoDir = join(cwd, "repo");
+    const managedAgents = ["explorer", "deep-reasoner", "fast-worker", "gatekeeper", "root-cause-prover", "harness-evaluator"];
+    try {
+      mkdirSync(join(repoDir, ".ai", "harness"), { recursive: true });
+      mkdirSync(home, { recursive: true });
+      writeFileSync(
+        join(repoDir, ".ai", "harness", "policy.json"),
+        JSON.stringify(
+          {
+            external_tooling: {
+              agent_fleet: {
+                install_mode: "auto-install-on-init",
+                managed_agents: managedAgents,
+              },
+            },
+          },
+          null,
+          2
+        )
+      );
+      const res = spawnSync(
+        "bash",
+        [
+          "-lc",
+          [
+            `source '${libPath}'`,
+            `pi_maybe_install_agent_fleet '${repoDir}' apply '${installerPath}'`,
+          ].join("\n"),
+        ],
+        {
+          cwd,
+          encoding: "utf-8",
+          env: { ...process.env, HOME: home },
+        }
+      );
+
+      expect(res.status).toBe(0);
+      for (const agent of managedAgents) {
+        expect(existsSync(join(home, ".claude", "agents", `${agent}.md`))).toBe(true);
+        expect(existsSync(join(home, ".codex", "agents", `${agent}.toml`))).toBe(true);
+      }
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }

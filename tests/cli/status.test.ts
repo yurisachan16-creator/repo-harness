@@ -5,6 +5,13 @@ import * as os from 'os';
 import { execSync } from 'child_process';
 import { runStatus, formatStatus } from '../../src/cli/commands/status';
 import { runInstall } from '../../src/cli/commands/install';
+import {
+  installProfileStatePath,
+  PROFILE_COMPONENTS,
+  type InstallProfile,
+} from '../../src/cli/installer/install-profile';
+
+const ROOT = path.join(import.meta.dir, '..', '..');
 
 function withTempHome(fn: (home: string) => void): void {
   const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'repo-harness-status-')));
@@ -17,6 +24,20 @@ function withTempHome(fn: (home: string) => void): void {
     else process.env.HOME = prev;
     fs.rmSync(tmp, { recursive: true, force: true });
   }
+}
+
+function writeInstalledProfileFixture(profile: InstallProfile): void {
+  const statePath = installProfileStatePath(process.env);
+  fs.mkdirSync(path.dirname(statePath), { recursive: true });
+  fs.writeFileSync(statePath, JSON.stringify({
+    protocol: 2,
+    profile,
+    components: PROFILE_COMPONENTS[profile],
+    transaction_id: `test-${profile}`,
+    applied_at: '2026-01-01T00:00:00.000Z',
+    ownership_manifest: [],
+    previous: null,
+  }));
 }
 
 describe('status command (Phase 1C)', () => {
@@ -60,6 +81,26 @@ describe('status command (Phase 1C)', () => {
     });
   });
 
+  test('uses the recorded install profile for expected managed entry count', () => {
+    const cases: ReadonlyArray<readonly [InstallProfile, number]> = [
+      ['minimal', 7],
+      ['full', 11],
+    ];
+
+    for (const [profile, expectedCount] of cases) {
+      withTempHome(() => {
+        runInstall({ target: 'codex', location: 'global', profile });
+        writeInstalledProfileFixture(profile);
+
+        const report = runStatus();
+        const codex = report.targets.find((target) => target.id === 'codex')!;
+        expect(codex.managedEntryCount).toBe(expectedCount);
+        expect(codex.expectedEntryCount).toBe(expectedCount);
+        expect(report.installedProfile).toMatchObject({ recorded: true, profile });
+      });
+    }
+  });
+
   test('detects opt-in repo via .ai/harness/workflow-contract.json marker', () => {
     withTempHome(() => {
       const repo = fs.realpathSync(
@@ -73,6 +114,48 @@ describe('status command (Phase 1C)', () => {
         expect(r.repo.inGitRepo).toBe(true);
         expect(r.repo.optIn).toBe(true);
         expect(r.repo.repoRoot).toBe(repo);
+      } finally {
+        fs.rmSync(repo, { recursive: true, force: true });
+      }
+    });
+  }, 30_000);
+
+  test('reports model authority, projection provider, code facts, and apply independently', () => {
+    withTempHome(() => {
+      const repo = fs.realpathSync(
+        fs.mkdtempSync(path.join(os.tmpdir(), 'repo-harness-status-architecture-')),
+      );
+      try {
+        execSync('git init', { cwd: repo, stdio: 'ignore' });
+        fs.mkdirSync(path.join(repo, '.ai/harness'), { recursive: true });
+        fs.mkdirSync(path.join(repo, '.archcontext/model/nodes'), { recursive: true });
+        fs.writeFileSync(path.join(repo, '.ai/harness/workflow-contract.json'), '{}');
+        fs.writeFileSync(path.join(repo, '.archcontext/manifest.yaml'), 'schema_version: archcontext/v1\n');
+        fs.writeFileSync(path.join(repo, '.archcontext/product.yaml'), 'name: fixture\n');
+        fs.writeFileSync(
+          path.join(repo, '.ai/harness/policy.json'),
+          JSON.stringify({ context: { capability_source: 'archcontext' } }),
+        );
+
+        const report = runStatus(repo);
+        expect(report.architectureProjection).toEqual({
+          schemaVersion: 'repo-harness.architecture-projection-readiness/v1',
+          modelAuthority: { source: 'archcontext', ready: true },
+          projectionProvider: {
+            provider: 'disabled',
+            state: 'disabled',
+            binaryPath: null,
+            version: null,
+            reason: 'policy.architecture.projection_provider=disabled',
+          },
+          codeFacts: { requirement: 'required', state: 'not-evaluated' },
+          apply: { mode: 'disabled', enabled: false },
+        });
+        const text = formatStatus(report, false);
+        expect(text).toContain('model authority: archcontext (ready)');
+        expect(text).toContain('provider: disabled (disabled)');
+        expect(text).toContain('code facts: not-evaluated');
+        expect(text).toContain('apply: disabled');
       } finally {
         fs.rmSync(repo, { recursive: true, force: true });
       }
@@ -109,6 +192,149 @@ describe('status command (Phase 1C)', () => {
       const parsed = JSON.parse(json);
       expect(parsed.cli).toBeDefined();
       expect(parsed.routes.total).toBe(11);
+    });
+  });
+
+  test('installedProfile reports not recorded when install-state.json is absent', () => {
+    withTempHome(() => {
+      const r = runStatus();
+      expect(r.installedProfile).toEqual({ recorded: false });
+      expect(r.targets.find((target) => target.id === 'codex')?.expectedEntryCount).toBe(11);
+      const text = formatStatus(r, false);
+      expect(text).toContain('Installed profile:');
+      expect(text).toContain('(not recorded)');
+    });
+  });
+
+  test('installedProfile reads back profile + components from install-state.json', () => {
+    withTempHome(() => {
+      writeInstalledProfileFixture('minimal');
+
+      const r = runStatus();
+      expect(r.installedProfile).toEqual({
+        recorded: true,
+        profile: 'minimal',
+        components: PROFILE_COMPONENTS.minimal,
+      });
+
+      const text = formatStatus(r, false);
+      expect(text).toContain('profile: minimal');
+      expect(text).toContain(`components: ${PROFILE_COMPONENTS.minimal.join(', ')}`);
+    });
+  });
+
+  test('installedProfile reports invalid (not not-recorded) when install-state.json is corrupt JSON', () => {
+    // A corrupt install is a materially different diagnostic signal than
+    // "never installed" -- conflating them (as this test used to assert)
+    // hides a broken host install behind text that reads as "just run
+    // install", when actually something needs repairing.
+    withTempHome(() => {
+      const statePath = installProfileStatePath(process.env);
+      fs.mkdirSync(path.dirname(statePath), { recursive: true });
+      fs.writeFileSync(statePath, '{not valid json');
+
+      const r = runStatus();
+      expect(r.installedProfile.recorded).toBe('invalid');
+      expect(r.installedProfile).toMatchObject({ kind: 'corrupt_current' });
+      expect(r.installedProfile).not.toEqual({ recorded: false });
+      expect(r.targets.find((target) => target.id === 'codex')?.expectedEntryCount).toBe(11);
+      const text = formatStatus(r, false);
+      expect(text).toContain('(invalid)');
+      expect(text).not.toContain('(not recorded)');
+    });
+  });
+
+  test('installedProfile reports invalid when protocol/profile/ownership_manifest fails readInstalledProfile validation', () => {
+    withTempHome(() => {
+      const statePath = installProfileStatePath(process.env);
+      fs.mkdirSync(path.dirname(statePath), { recursive: true });
+      fs.writeFileSync(statePath, JSON.stringify({
+        protocol: 2,
+        profile: 'not-a-real-profile',
+        components: [],
+        transaction_id: 'test-txn',
+        applied_at: '2026-01-01T00:00:00.000Z',
+        ownership_manifest: [],
+        previous: null,
+      }));
+
+      const r = runStatus();
+      expect(r.installedProfile.recorded).toBe('invalid');
+      expect(r.installedProfile).toMatchObject({ kind: 'corrupt_current' });
+    });
+  });
+
+  test('installedProfile distinguishes a valid protocol-1 state as explicitly migratable', () => {
+    withTempHome(() => {
+      const statePath = installProfileStatePath(process.env);
+      fs.mkdirSync(path.dirname(statePath), { recursive: true });
+      fs.writeFileSync(statePath, JSON.stringify({
+        protocol: 1,
+        profile: 'standard',
+        components: [
+          'cli',
+          'effective-state',
+          'scope-worktree-check-guards',
+          'handoff',
+          'host-adapters',
+          'adaptive-workflow',
+          'codegraph-conditional',
+        ],
+        transaction_id: 'legacy-standard',
+        applied_at: '2026-07-14T00:00:00.000Z',
+        ownership_manifest: [],
+        previous: null,
+      }));
+
+      const r = runStatus();
+      expect(r.installedProfile).toMatchObject({
+        recorded: 'invalid',
+        kind: 'legacy_protocol',
+      });
+    });
+  });
+
+  test('installedProfile reports invalid instead of crashing when a syntactically valid install-state.json is missing components', () => {
+    // A syntactically valid state with missing components must remain
+    // diagnosable instead of reaching formatStatus's `.components.join()`.
+    withTempHome(() => {
+      const statePath = installProfileStatePath(process.env);
+      fs.mkdirSync(path.dirname(statePath), { recursive: true });
+      fs.writeFileSync(statePath, JSON.stringify({
+        protocol: 2,
+        profile: 'minimal',
+        transaction_id: 'test-txn',
+        applied_at: '2026-01-01T00:00:00.000Z',
+        ownership_manifest: [],
+        previous: null,
+      }));
+
+      const r = runStatus();
+      expect(r.installedProfile.recorded).toBe('invalid');
+      if (r.installedProfile.recorded === 'invalid') {
+        expect(r.installedProfile.error).toContain('components');
+      }
+      expect(() => formatStatus(r, false)).not.toThrow();
+    });
+  });
+
+  test('installedProfile reports invalid instead of crashing when components is a non-array value', () => {
+    withTempHome(() => {
+      const statePath = installProfileStatePath(process.env);
+      fs.mkdirSync(path.dirname(statePath), { recursive: true });
+      fs.writeFileSync(statePath, JSON.stringify({
+        protocol: 2,
+        profile: 'minimal',
+        components: 'cli,effective-state',
+        transaction_id: 'test-txn',
+        applied_at: '2026-01-01T00:00:00.000Z',
+        ownership_manifest: [],
+        previous: null,
+      }));
+
+      const r = runStatus();
+      expect(r.installedProfile.recorded).toBe('invalid');
+      expect(() => formatStatus(r, false)).not.toThrow();
     });
   });
 });

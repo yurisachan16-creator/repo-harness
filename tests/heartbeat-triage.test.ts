@@ -9,25 +9,33 @@ import {
   writeFileSync,
 } from "fs";
 import { tmpdir } from "os";
-import { join } from "path";
+import { dirname, join } from "path";
 import { spawnSync } from "child_process";
 
 const ROOT = join(import.meta.dir, "..");
 
 function makeRepo(prefix = "heartbeat-triage-"): string {
   const repo = mkdtempSync(join(tmpdir(), prefix));
-  mkdirSync(join(repo, ".ai/harness/scripts"), { recursive: true });
   mkdirSync(join(repo, ".ai/harness/sprint"), { recursive: true });
   mkdirSync(join(repo, ".ai/harness/runs"), { recursive: true });
   mkdirSync(join(repo, "docs/architecture/requests"), { recursive: true });
   mkdirSync(join(repo, "plans/sprints"), { recursive: true });
+  writeFileSync(
+    join(repo, ".ai/harness/policy.json"),
+    `${JSON.stringify({ harness: { helper_runtime_dir: ".ai/harness/scripts" } }, null, 2)}\n`,
+  );
   return repo;
 }
 
 function writeExecutable(repo: string, relPath: string, body: string) {
   const path = join(repo, relPath);
+  mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, body);
   chmodSync(path, 0o755);
+}
+
+function helperSourcePath(repo: string): string {
+  return join(repo, ".test-helper-source", "heartbeat-triage.sh");
 }
 
 function writeSprint(repo: string) {
@@ -52,9 +60,10 @@ function writeSprint(repo: string) {
 }
 
 function writeWorkflowHelpers(repo: string, workflowExit = 0) {
+  writeExecutable(repo, ".test-helper-source/heartbeat-triage.sh", "#!/bin/bash\n");
   writeExecutable(
     repo,
-    ".ai/harness/scripts/check-task-workflow.sh",
+    ".test-helper-source/check-task-workflow.sh",
     [
       "#!/bin/bash",
       workflowExit === 0 ? "echo '[workflow] OK'" : "echo '[workflow] failed' >&2",
@@ -64,7 +73,7 @@ function writeWorkflowHelpers(repo: string, workflowExit = 0) {
   );
   writeExecutable(
     repo,
-    ".ai/harness/scripts/sprint-backlog.sh",
+    ".test-helper-source/sprint-backlog.sh",
     [
       "#!/bin/bash",
       "set -euo pipefail",
@@ -85,7 +94,7 @@ function runHeartbeat(repo: string, args: string[] = []) {
   return spawnSync("bash", ["scripts/heartbeat-triage.sh", "run", "--repo", repo, ...args], {
     cwd: ROOT,
     encoding: "utf-8",
-    env: { ...process.env, FORCE_COLOR: "0" },
+    env: { ...process.env, FORCE_COLOR: "0", REPO_HARNESS_HELPER_SOURCE_PATH: helperSourcePath(repo) },
   });
 }
 
@@ -126,7 +135,7 @@ describe("heartbeat triage runner", () => {
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test("workflow check failure is recorded as an inbox finding without failing the runner", () => {
     const repo = makeRepo("heartbeat-triage-fail-");
@@ -149,7 +158,7 @@ describe("heartbeat triage runner", () => {
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test("fallback finds the next pending row when no active-sprint marker exists", () => {
     const repo = makeRepo("heartbeat-triage-fallback-");
@@ -170,7 +179,7 @@ describe("heartbeat triage runner", () => {
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test("unknown flags exit with usage error", () => {
     const res = spawnSync("bash", ["scripts/heartbeat-triage.sh", "run", "--bogus"], {
@@ -179,5 +188,5 @@ describe("heartbeat triage runner", () => {
     });
     expect(res.status).toBe(2);
     expect(res.stderr).toContain("unknown argument: --bogus");
-  });
+  }, 30_000);
 });

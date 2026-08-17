@@ -2,17 +2,19 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null)"; then
+if [[ -n "${REPO_HARNESS_TARGET_REPO_ROOT:-}" ]]; then
+  cd "$REPO_HARNESS_TARGET_REPO_ROOT"
+elif REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null)"; then
   cd "$REPO_ROOT"
-elif [[ "$SCRIPT_DIR" == */.ai/harness/scripts ]]; then
-  cd "$SCRIPT_DIR/../../.."
 else
   cd "$SCRIPT_DIR/.."
 fi
+REPO_ROOT="$(pwd)"
+helper_dir="$SCRIPT_DIR"
 
 usage() {
   cat <<'USAGE_EOF'
-Usage: scripts/plan-to-todo.sh --plan <plan-file>
+Usage: repo-harness run plan-to-todo --plan <plan-file>
 USAGE_EOF
 }
 
@@ -341,12 +343,12 @@ maybe_start_contract_worktree() {
 
   [[ "${REPO_HARNESS_CONTRACT_WORKTREE:-}" != "1" ]] || return 0
   [[ "${REPO_HARNESS_DISABLE_CONTRACT_WORKTREE:-}" != "1" ]] || return 0
-  [[ -x "scripts/contract-worktree.sh" ]] || return 0
+  [[ -x "$helper_dir/contract-worktree.sh" ]] || return 0
   git rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
   ! is_linked_worktree || return 0
   plan_requests_contract_worktree "$file" || return 0
 
-  bash "scripts/contract-worktree.sh" start --plan "$file"
+  REPO_HARNESS_TARGET_REPO_ROOT="$REPO_ROOT" bash "$helper_dir/contract-worktree.sh" start --plan "$file"
   exit $?
 }
 
@@ -423,14 +425,20 @@ render_contract_file() {
     cat > "$template_file" <<'CONTRACT_TEMPLATE_EOF'
 # Task Contract: {{TASK_SLUG}}
 
-> **Status**: Pending
+> **Status**: Active
 > **Plan**: {{PLAN_FILE}}
 > **Task Profile**: {{TASK_PROFILE}}
+> <!-- legal values: code-change | docs-only | ledger-closeout | migration | eval-only | delegated-run | bugfix (omit for legacy passthrough); see docs/reference-configs/sprint-contracts.md -->
 > **Owner**: {{OWNER}}
 > **Capability ID**: {{CAPABILITY_ID}}
 > **Last Updated**: {{TIMESTAMP}}
 > **Review File**: `{{REVIEW_FILE}}`
 > **Notes File**: `{{NOTES_FILE}}`
+> **Exemplar**: `docs/reference-configs/contract-brief-example.md`
+
+## Why
+
+Why this task matters and what breaks downstream if it ships wrong or is skipped.
 
 ## Goal
 
@@ -440,6 +448,26 @@ Describe the exact outcome this task must deliver.
 
 - In scope:
 - Out of scope:
+- Taste constraints: <!-- advisory only, no run gate; default style/taste lives in AGENTS.md and the minimal-change policy, use this to record a per-task override -->
+
+## Stop Conditions
+
+- Stop and hand back to the parent if the change would require editing a path outside Allowed Paths.
+- Stop if an Exit Criteria command cannot be run in this environment.
+- Stop if Goal, Scope, or Exit Criteria are internally contradictory.
+
+## Falsifier
+
+What observable evidence would prove this task's direction wrong, and the cheapest proof point to check first. Leave as-is if not applicable.
+
+## Root Cause Evidence
+
+Required when Task Profile is `bugfix`; leave as-is otherwise.
+
+- root_cause: one sentence naming file:line/condition (testable, not "a state issue").
+- repro: the command or UI path that reproduces the symptom.
+- regression_guard: path to a test that fails on the unfixed code and passes after the fix (must also appear under exit_criteria.tests_pass).
+- pre_fix_failure_artifact: path to a captured run of regression_guard on the UNFIXED code. Capture with `bun test <regression_guard> > <artifact> 2>&1; echo "PRE_FIX_EXIT=$?" >> <artifact>` (no pipes — pipes swallow the exit status). The gate requires a non-zero `PRE_FIX_EXIT=` line plus the regression_guard path string in the artifact (see the Root Cause Evidence Gate section in docs/reference-configs/sprint-contracts.md).
 
 ## Workflow Inventory
 
@@ -450,12 +478,25 @@ Describe the exact outcome this task must deliver.
 - Checks file: `.ai/harness/checks/latest.json`
 - Run snapshots: `.ai/harness/runs/`
 - Scope gate: edit only paths listed under `allowed_paths`; update this contract before widening scope.
-- Completion gate: `scripts/verify-sprint.sh` must see this contract pass, the review recommend pass, and `## External Acceptance Advice` pass or record a manual override.
+- Completion gate: run `verify-sprint --prepare-acceptance`, record one typed AcceptanceReceipt under the frozen policy below, then run `verify-sprint`; review Markdown is projection only.
+
+## Change Assessment
+
+```json
+{"protocol":1,"oracles":[]}
+```
+
+## Acceptance Policy
+
+```json
+{"protocol":1,"reviewer":"Claude","user_waiver":"allowed"}
+```
 
 ## Allowed Paths
 
 ```yaml
 allowed_paths:
+  - docs/spec.md
   - plans/
   - tasks/todos.md
   - {{CONTRACT_FILE}}
@@ -467,13 +508,21 @@ allowed_paths:
   - tests/
 ```
 
+## Evidence Requirements
+
+```yaml
+evidence_requirements:
+  # Set benchmark to required when this contract consumes the harness profile benchmark matrix.
+  benchmark: not_applicable
+```
+
 ## Delegation Contract
 
 ```yaml
 delegation:
   budget:
     tokens: null
-    tool_calls: null
+    runner_invocations: null
     wall_time_minutes: null
   permission_scope:
     mode: inherit_allowed_paths
@@ -492,6 +541,11 @@ delegation:
     verifier:
       mode: read_only
       purpose: exit_criteria_review
+  runner:
+    preferred:
+      - subagent
+    fallback: null
+    brief_is_authoritative: true
 ```
 
 ## Exit Criteria (Machine Verifiable)
@@ -499,15 +553,14 @@ delegation:
 ```yaml
 exit_criteria:
   files_exist:
-    - src/modules/{{TASK_SLUG}}/index.ts
+    - docs/spec.md
+  artifacts_exist:
+    - .ai/harness/checks/latest.json
     - {{NOTES_FILE}}
   tests_pass:
     - path: tests/unit/{{TASK_SLUG}}.test.ts
   commands_succeed:
-    - bun run typecheck
-  files_contain:
-    - path: src/modules/{{TASK_SLUG}}/index.ts
-      pattern: "export"
+    - bun run check:type
 ```
 
 ## Acceptance Notes (Human Review)
@@ -541,6 +594,95 @@ CONTRACT_TEMPLATE_EOF
       -e "s|tasks/notes/${slug}\\.notes\\.md|${notes_file}|g" \
       > "$tmp_file"
   mv "$tmp_file" "$contract_file"
+}
+
+# Recognizes only a standalone `Non-scope:` or `Out of scope:` label line in the plan
+# (colon immediately after the label word; an optional leading `-` bullet marker is
+# stripped first, so both a bare paragraph label and a bulleted label match). Copies the
+# label's own inline trailing text (if any) plus every following bulleted line verbatim
+# as one carried-forward bullet each, re-nested two spaces under the contract's
+# `Out of scope:` line; stops at the first non-bullet line. Emits nothing when the plan
+# has no such label, so callers must not synthesize a replacement.
+plan_negative_scope_bullets() {
+  local plan_file="$1"
+  awk '
+    BEGIN { collecting = 0 }
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      if (!collecting) {
+        label = line
+        sub(/^[[:space:]]*-[[:space:]]*/, "", label)
+        if (label ~ /^(Non-scope|Out of scope):/) {
+          collecting = 1
+          rest = label
+          sub(/^(Non-scope|Out of scope):[[:space:]]*/, "", rest)
+          if (rest != "") print "  - " rest
+        }
+        next
+      }
+      if (line ~ /^[[:space:]]*-[[:space:]]+/) {
+        item = line
+        sub(/^[[:space:]]*-[[:space:]]*/, "", item)
+        print "  - " item
+        next
+      }
+      exit
+    }
+  ' "$plan_file"
+}
+
+# Carries the plan's Non-scope / Out-of-scope bullets forward into the just-rendered
+# contract's `Out of scope:` line, so the negative boundary survives projection instead
+# of evaporating into an empty placeholder. Only replaces the bare, unfilled
+# `- Out of scope:` placeholder line and never overwrites already-authored content; never
+# invents bullets when the plan has no recognized label (the existing [BriefPreflight]
+# advisory already covers that case).
+carry_forward_plan_scope_boundary() {
+  local plan_file="$1"
+  local contract_file="$2"
+  local bullets
+  bullets="$(plan_negative_scope_bullets "$plan_file")"
+  [[ -n "$bullets" ]] || return 0
+
+  local line_no
+  line_no="$(grep -nE '^-[[:space:]]*Out of scope:[[:space:]]*$' "$contract_file" | head -1 | cut -d: -f1)"
+  [[ -n "$line_no" ]] || return 0
+
+  local tmp_file
+  tmp_file="$(mktemp)"
+  head -n "$line_no" "$contract_file" > "$tmp_file"
+  printf '%s\n' "$bullets" >> "$tmp_file"
+  tail -n "+$((line_no + 1))" "$contract_file" >> "$tmp_file"
+  mv "$tmp_file" "$contract_file"
+}
+
+# Advisory-only brief preflight at projection time. The contract just rendered by
+# render_contract_file is placeholder by design (see the embedded template's Goal
+# text above), so this MUST NOT fail-closed here or it would block every normal
+# projection. contract-run.ts already fails closed for the `run` mode; this only
+# surfaces a heads-up so the brief gets filled in before file-coupled dispatch.
+maybe_advise_contract_brief_preflight() {
+  local contract_path="$1"
+
+  command -v bun >/dev/null 2>&1 || return 0
+  [[ -f "$helper_dir/contract-run.ts" ]] || return 0
+
+  if ! bun "$helper_dir/contract-run.ts" preflight --contract "$contract_path" --repo "$REPO_ROOT" >/dev/null 2>&1; then
+    echo "[BriefPreflight] contract brief is not yet self-sufficient: $contract_path"
+    echo "[BriefPreflight] fill Goal, Scope, Allowed Paths, and Exit Criteria before file-coupled dispatch; contract-run run fails closed until then."
+  fi
+}
+
+# Advisory-only geju (格局) freeze reminder at projection time. geju judgment stays
+# live, pre-contract exploration; only its output (thesis/direction/falsifier)
+# belongs in the contract. This MUST NOT affect exit code -- callers append
+# `|| true` -- it only nudges the author to freeze geju output into the
+# just-rendered contract before delegating.
+maybe_advise_geju_freeze() {
+  echo "[Geju] If this task came from a 格局/geju pass, freeze its output into the contract before delegating:" >&2
+  echo "[Geju]   thesis + high-level direction -> ## Why ; falsifier + cheapest proof point -> ## Falsifier" >&2
+  echo "[Geju] Live geju is pre-contract exploration only; once frozen, the contract is authoritative." >&2
 }
 
 render_implementation_notes_file() {
@@ -587,6 +729,10 @@ render_implementation_notes_file() {
 
 - Checks: `.ai/harness/checks/latest.json`
 - Run snapshots: `.ai/harness/runs/`
+
+## Promotion Filter
+
+Promote a candidate to `tasks/lessons.md`, `docs/researches/`, or harness asset files only when all three hold: hard to reverse, surprising without local context, and a real trade-off existed. If any one is missing, keep it in this notes file instead.
 
 ## Promotion Candidates
 
@@ -843,9 +989,10 @@ else
 > **Checks File**: {{CHECKS_FILE}}
 > **Last Updated**: {{TIMESTAMP}}
 > **Recommendation**: fail
-> **Review Rubric Version**: 1
-> **Reviewed Diff Fingerprint**: pending
-> **Reviewed Scope**: branch+staged+unstaged+untracked
+> **Review Rubric Version**: 2
+> **Reviewed Subject SHA256**: pending
+> **Reviewed Subject Scope**: normalized-final-content
+> **Reviewed Target Revision**: pending
 
 ## Human Review Card
 
@@ -854,7 +1001,6 @@ else
 - Intended files changed:
 - Actual files changed:
 - Commands passed:
-- External acceptance: unavailable
 - Residual risks:
 - Reviewer action required: inspect diff and card
 - Rollback:
@@ -874,17 +1020,29 @@ else
 - Implementation notes reviewed:
 - Run snapshot:
 
-## External Acceptance Advice
+## Manual Check Evidence
 
-> **External Acceptance**: unavailable
-> **External Reviewer**:
-> **External Source**:
-> **External Started**:
-> **External Completed**:
+Copy each non-built-in contract `manual_checks` requirement exactly. Check it only after
+the observation is complete and replace the placeholder with concrete command output,
+screenshot/artifact path, or reviewer observation.
 
-- P1 blockers:
-- P2 advisories:
-- Acceptance checklist:
+- [ ] Exact manual_checks requirement
+  - Evidence: concrete observation, command output, screenshot path, or reviewer note
+
+## Acceptance Receipt Projection
+
+> **Disposition**: unavailable
+> **Reviewer**: unavailable
+> **Source**: unavailable
+> **Actor**: not-applicable
+> **Reviewed Subject SHA256**: pending
+> **Reviewed Subject Scope**: normalized-final-content
+> **Reviewed Target Revision**: pending
+> **Verification Evidence SHA256**: pending
+> **Issued At**: pending
+
+- Summary: No AcceptanceReceipt has been recorded.
+- Findings: none
 
 ## Behavior Diff Notes
 
@@ -919,6 +1077,9 @@ REVIEW_TEMPLATE_EOF
 fi
 
 render_contract_file "$plan_file" "$contract_file" "$review_file" "$notes_file" "$slug" "$timestamp_human" "$capability_id"
+maybe_advise_geju_freeze || true
+carry_forward_plan_scope_boundary "$plan_file" "$contract_file"
+maybe_advise_contract_brief_preflight "$contract_file"
 render_implementation_notes_file "$plan_file" "$contract_file" "$review_file" "$notes_file" "$slug" "$timestamp_human"
 sed \
   -e "s/{{TASK_SLUG}}/${slug}/g" \
@@ -937,9 +1098,8 @@ set_plan_status "$plan_file" "Executing"
 if declare -F set_active_plan >/dev/null 2>&1; then
   set_active_plan "$plan_file"
 else
-  mkdir -p .ai/harness .claude
+  mkdir -p .ai/harness
   printf '%s' "$plan_file" > .ai/harness/active-plan
-  printf '%s' "$plan_file" > .claude/.active-plan
   pwd -P > .ai/harness/active-worktree
 fi
 

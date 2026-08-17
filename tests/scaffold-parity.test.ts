@@ -50,16 +50,14 @@ describe("create-project-dirs scaffold parity", () => {
         "./.ai/harness/planning/.gitkeep",
         "./.ai/harness/policy.json",
         "./.ai/harness/runs/.gitkeep",
-        "./.ai/harness/scripts/.gitkeep",
         "./.ai/harness/security/.gitkeep",
         "./.ai/harness/triage/.gitkeep",
         "./.ai/harness/workflow-contract.json",
         "./.ai/harness/worktrees/.gitkeep",
         "./.ai/hooks/README.md",
-        "./.ai/hooks/lib/minimal-change.sh",
-        "./.ai/hooks/lib/session-state.sh",
         "./.ai/hooks/lib/workflow-state.sh",
         "./.claude/templates/contract.template.md",
+        "./.claude/templates/design-brief.template.md",
         "./.claude/templates/implementation-notes.template.md",
         "./.claude/templates/plan.template.md",
         "./.claude/templates/prd.template.md",
@@ -97,49 +95,6 @@ describe("create-project-dirs scaffold parity", () => {
         "./docs/spec.md",
         "./interfaces/types.ts",
         "./package.json",
-        "./scripts/architecture-event.ts",
-        "./scripts/architecture-queue.sh",
-        "./scripts/archive-architecture-request.sh",
-        "./scripts/archive-workflow.sh",
-        "./scripts/capability-config.ts",
-        "./scripts/capability-resolver.ts",
-        "./scripts/capture-plan.sh",
-        "./scripts/check-agent-tooling.sh",
-        "./scripts/check-architecture-sync.sh",
-        "./scripts/check-brain-manifest.sh",
-        "./scripts/check-context-files.sh",
-        "./scripts/check-deploy-sql-order.sh",
-        "./scripts/check-skill-version.ts",
-        "./scripts/check-task-sync.sh",
-        "./scripts/check-task-workflow.sh",
-        "./scripts/codex-handoff-resume.sh",
-        "./scripts/context-contract-sync.sh",
-        "./scripts/contract-run.ts",
-        "./scripts/contract-worktree.sh",
-        "./scripts/ensure-task-workflow.sh",
-        "./scripts/harness-trace-grade.sh",
-        "./scripts/heartbeat-triage.sh",
-        "./scripts/inspect-project-state.ts",
-        "./scripts/maintenance-triage.sh",
-        "./scripts/migrate-project-template.sh",
-        "./scripts/migrate-workflow-docs.ts",
-        "./scripts/new-plan.sh",
-        "./scripts/new-spec.sh",
-        "./scripts/new-sprint.sh",
-        "./scripts/plan-to-todo.sh",
-        "./scripts/prepare-codex-handoff.sh",
-        "./scripts/prepare-handoff.sh",
-        "./scripts/refresh-current-status.sh",
-        "./scripts/select-agent-context-blocks.sh",
-        "./scripts/ship-worktrees.sh",
-        "./scripts/sprint-backlog.sh",
-        "./scripts/summarize-failures.sh",
-        "./scripts/switch-plan.sh",
-        "./scripts/sync-brain-docs.sh",
-        "./scripts/verify-contract.sh",
-        "./scripts/verify-sprint.sh",
-        "./scripts/workflow-contract.ts",
-        "./scripts/workstream-sync.sh",
         "./tasks/current.md",
         "./tasks/lessons.md",
         "./tasks/todos.md",
@@ -153,7 +108,8 @@ describe("create-project-dirs scaffold parity", () => {
       expect(gitignore).toContain(".ai/harness/checks/*.latest.json");
       expect(gitignore).toContain(".ai/harness/checks/*.latest.md");
       expect(gitignore).not.toContain(".ai/harness/chatgpt/bridge-extension/");
-      expect(gitignore).toContain(".repo-harness/chatgpt-browser.local.json");
+      expect(gitignore).toContain(".repo-harness/");
+      expect(gitignore).not.toContain(".repo-harness/chatgpt-browser.local.json");
       expect(gitignore).toContain(".codex/*");
       expect(gitignore).not.toContain("!.codex/hooks.json");
       expect(gitignore).toContain("_ref/");
@@ -164,6 +120,14 @@ describe("create-project-dirs scaffold parity", () => {
 
       const agents = readFileSync(join(cwd, "AGENTS.md"), "utf-8");
       expect(agents).toContain("Repo Agent Context");
+      expect(agents).toContain("Rule 0: You may spend as much time as needed thinking.");
+      expect(agents).toContain("## Agent Context Scaffolding");
+      expect(agents).toContain("Treat scanners as leads, not authority");
+      expect(agents).toContain("Choose the smallest instruction stack that changes behavior");
+      expect(agents).toContain("## Decision Protocol");
+      expect(agents).toContain("complete P1/P2/P3 before design decisions or code edits");
+      expect(agents).toContain("do not implement until the user approves");
+      expect(agents).toContain("re-derives an authority's semantics");
       expect(agents).toBe(readFileSync(join(cwd, "CLAUDE.md"), "utf-8"));
 
       const template = readFileSync(join(cwd, ".claude/templates/plan.template.md"), "utf-8");
@@ -175,10 +139,13 @@ describe("create-project-dirs scaffold parity", () => {
 
       const contractTemplate = readFileSync(join(cwd, ".claude/templates/contract.template.md"), "utf-8");
       expect(contractTemplate).toContain("## Workflow Inventory");
-      expect(contractTemplate).toContain("Completion gate: `scripts/verify-sprint.sh` must see this contract pass");
+      expect(contractTemplate).toContain("Completion gate: run `verify-sprint --prepare-acceptance`");
+      expect(contractTemplate).toContain("## Acceptance Policy");
       expect(contractTemplate).toContain("## Delegation Contract");
       expect(contractTemplate).toContain("permission_scope:");
       expect(contractTemplate).toContain("roles:");
+      expect(contractTemplate).toContain("preferred:\n      - subagent\n    fallback: null");
+      expect(contractTemplate).toContain("## Falsifier");
 
       const runtimeConsole = readFileSync(
         join(ROOT, "assets/project-structures/ai-native-runtime-console.txt"),

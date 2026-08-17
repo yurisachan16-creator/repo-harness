@@ -61,26 +61,9 @@ function writeFakeCodeGraph(fakeBin: string, logFile: string) {
   );
 }
 
-function writeFakeGbrain(fakeBin: string) {
+function writeFakeBunx(fakeBin: string) {
   writeExecutable(
-    join(fakeBin, "gbrain"),
-    [
-      "#!/bin/bash",
-      "set -euo pipefail",
-      "case \"$1 ${2:-}\" in",
-      "  \"--version \") echo 'gbrain 0.12.0' ;;",
-      "  \"doctor --json\") echo '{\"status\":\"warnings\",\"health_score\":90}' ;;",
-      "  \"integrations list\") echo '{\"local\":[]}' ;;",
-      "  *) exit 1 ;;",
-      "esac",
-      "",
-    ].join("\n")
-  );
-}
-
-function writeFakeNpx(fakeBin: string) {
-  writeExecutable(
-    join(fakeBin, "npx"),
+    join(fakeBin, "bunx"),
     [
       "#!/bin/bash",
       "set -euo pipefail",
@@ -118,8 +101,7 @@ function runConfigure(target: string, options: RunConfigureOptions = {}) {
     }
 
     writeFakeCodeGraph(envRoot.fakeBin, logFile);
-    writeFakeGbrain(envRoot.fakeBin);
-    writeFakeNpx(envRoot.fakeBin);
+    writeFakeBunx(envRoot.fakeBin);
 
     const res = spawnSync("bun", [CLI, "tools", "configure", "codegraph", "--target", target, "--location", "global", "--json", "--repo", ROOT], {
       cwd: ROOT,

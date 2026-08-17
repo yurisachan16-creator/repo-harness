@@ -8,7 +8,7 @@
   "run_id": "fixture-migration",
   "run_file": ".ai/harness/runs/fixture-migration.json",
   "task_profile": "migration",
-  "active_plan": "plans/plan-20260616-HE-05-trace-eval-schema.md",
+  "active_plan": "plans/archive/plan-20260616-HE-05-trace-eval-schema.md",
   "contract": {
     "file": "tasks/contracts/fixture-migration.contract.md",
     "task_profile": "migration",
@@ -33,8 +33,8 @@
     {"name": "allowed_paths", "status": "pass"}
   ],
   "handoffs": [],
-  "external_acceptance": {
-    "status": "not_required"
+  "acceptance_receipt": {
+    "status": "pass", "disposition": "external_pass", "reviewer": "Claude", "source": "claude-review"
   },
   "files_changed": ["scripts/lib/project-init-lib.sh", "assets/workflow-contract.v1.json"],
   "allowed_paths_check": {

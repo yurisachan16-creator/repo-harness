@@ -1,6 +1,6 @@
 # Architecture Domain: Workflow Engine
 
-> **Source**: `.ai/context/capabilities.json`
+> **Source**: `repo-harness run capability-resolver`
 > **Owner**: Inspection, migration, contract, template, and policy generation.
 
 ## Purpose
@@ -26,5 +26,5 @@ verify without a live service.
 ## Verification Surface
 
 - `bun test tests/migration-script.test.ts tests/create-project-dirs.runtime.test.ts tests/workflow-contract.test.ts`
-- `bash scripts/migrate-project-template.sh --repo . --dry-run`
+- `repo-harness init --repo . --dry-run`
 - `bash scripts/check-task-workflow.sh --strict`

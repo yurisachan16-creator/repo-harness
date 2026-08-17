@@ -1,14 +1,12 @@
 /**
- * Prompt intent classifiers — TypeScript port of the prompt-guard.sh shell
- * regex layer.
+ * Prompt intent classifiers for the typed UserPromptSubmit handler.
  *
  * The shell hook used byte-oriented `grep -Ei` classifiers, which made
  * Chinese-language boundaries locale-dependent (UTF-8 continuation bytes can
  * fall inside `[[:punct:]]` under LC_ALL=C, so e.g. "里完成。" misclassified
  * as a done declaration on GNU grep but not BSD grep). This module owns the
- * full prompt-text classification with real Unicode semantics; the shell
- * layer keeps filesystem authority (plan/contract/worktree state) and side
- * effects, and consumes the JSON verdict from `prompt-guard-decide`.
+ * full prompt-text classification with real Unicode semantics. The typed
+ * prompt handler owns filesystem state, side effects, and verdict rendering.
  *
  * Porting conventions:
  * - `grep -qEi "<pat>"` over multi-line text → RegExp with `imu` flags so
@@ -82,12 +80,40 @@ const EXPLICIT_EXECUTION_LINE = re(
   String.raw`^${SP}*(please\s+)?(implement\s+(this|the)|execute\s+(this|the)|start\s+(implementation|executing|coding)|go ahead|proceed|ship it|开始(实现|执行|落实|写)|执行计划|落实计划|批准执行|批准|直接(改|做|实现|执行|落地)|动手|开干|可以(开始|执行|干)|可以干|干吧|做吧)(${SP}|$)`,
 );
 
+// Unlike the legacy execution verbs above, this newly supported phrase must
+// remain an actual command at the start of a line. A whitespace-only prefix
+// keeps quoted examples, questions, and negations out of the execution path.
+const DIRECT_MODIFICATION_LINE = re(
+  String.raw`^\s*(请\s*)?直接修改`,
+);
+const DIRECT_MODIFICATION_INLINE_PAYLOAD =
+  /“[^”\n]*”|「[^」\n]*」|『[^』\n]*』|"[^"\n]*"|`[^`\n]*`/gu;
+const DIRECT_MODIFICATION_QUESTION = re(
+  String.raw`([?？]|[吗么呢]${SP}*$|是不是|能不能|可不可以|要不要|应不应该|该不该|会不会|行不行|好不好|对不对|合不合适)`,
+);
+const DIRECT_MODIFICATION_NON_COMMAND = re(
+  String.raw`(不合适(?:吧|${SP}*($|[,，;；。]))|(?:是)?不(?:对|应该|行)(?:吧|的?${SP}*($|[,，;；。]))|不要这么做|不是(我|我们)?的?要求|只是(一个|个)?示例|仅作示例|作为示例)`,
+);
+
+function isDirectModificationCommandLine(line: string): boolean {
+  const topLevelText = line.replace(DIRECT_MODIFICATION_INLINE_PAYLOAD, '');
+  return (
+    DIRECT_MODIFICATION_LINE.test(line) &&
+    !DIRECT_MODIFICATION_QUESTION.test(topLevelText) &&
+    !DIRECT_MODIFICATION_NON_COMMAND.test(topLevelText)
+  );
+}
+
+function hasDirectModificationCommandLine(ctx: PromptIntentContext): boolean {
+  return isDirectModificationCommandLine(ctx.firstLine);
+}
+
 export function promptHasExplicitExecutionCommandLine(ctx: PromptIntentContext): boolean {
-  return EXPLICIT_EXECUTION_LINE.test(ctx.text);
+  return EXPLICIT_EXECUTION_LINE.test(ctx.text) || hasDirectModificationCommandLine(ctx);
 }
 
 export function isExplicitExecutionStartLine(ctx: PromptIntentContext): boolean {
-  return EXPLICIT_EXECUTION_LINE.test(ctx.firstLine);
+  return EXPLICIT_EXECUTION_LINE.test(ctx.firstLine) || hasDirectModificationCommandLine(ctx);
 }
 
 const PLAN_EXECUTION_PROJECTION_LINE = re(
@@ -104,6 +130,7 @@ const TRIGGER_QUESTION = re(
 );
 
 export function isTriggerQuestionPrompt(ctx: PromptIntentContext): boolean {
+  if (hasDirectModificationCommandLine(ctx)) return false;
   return TRIGGER_QUESTION.test(ctx.firstLine);
 }
 
@@ -130,6 +157,7 @@ const PLAN_REFINEMENT = re(
 );
 
 export function isPlanRefinementIntent(ctx: PromptIntentContext): boolean {
+  if (hasDirectModificationCommandLine(ctx)) return false;
   if (PLAN_REFINEMENT_EXEC.test(ctx.firstLine)) return false;
   return PLAN_REFINEMENT.test(ctx.firstLine);
 }
@@ -179,6 +207,7 @@ export function isDiagnosticQuestionIntent(ctx: PromptIntentContext): boolean {
   if (isExecutionApprovalIntent(ctx)) return false;
   if (isEmbeddedApprovedPlanIntent(ctx)) return false;
   if (isPlanShapedMarkdownIntent(ctx)) return false;
+  if (hasDirectModificationCommandLine(ctx)) return false;
   if (DIAGNOSTIC_DIRECT.test(ctx.text)) return true;
   return DIAGNOSTIC_TOPIC.test(ctx.text) && DIAGNOSTIC_QUESTION.test(ctx.text);
 }
@@ -198,6 +227,7 @@ export function isReviewReleaseAdvisoryIntent(ctx: PromptIntentContext): boolean
   if (isEmbeddedApprovedPlanIntent(ctx)) return false;
   if (isPlanShapedMarkdownIntent(ctx)) return false;
   if (isExecutionApprovalIntent(ctx)) return false;
+  if (hasDirectModificationCommandLine(ctx)) return false;
   // Review/check prompts often say "execute /check" or "执行 checklist". Those
   // route to evaluator evidence, not implementation.
   if (REVIEW_RELEASE_CODING_VERB.test(ctx.text)) return false;
@@ -266,7 +296,9 @@ export function isNextSliceOrStatusAdvisoryIntent(ctx: PromptIntentContext): boo
   return false;
 }
 
-const IMPLEMENT_VERB = re('(implement|execute|build it|do it|go ahead|proceed|ship it|实现|执行|开始写|动手|开干)');
+const IMPLEMENT_VERB = re(
+  '(implement|execute|build it|do it|go ahead|proceed|ship it|实现|执行|开始写|动手|开干)',
+);
 
 export function isImplementIntent(ctx: PromptIntentContext): boolean {
   if (isTriggerQuestionPrompt(ctx)) return false;
@@ -280,6 +312,7 @@ export function isImplementIntent(ctx: PromptIntentContext): boolean {
   if (isPassiveWorktreeStatusIntent(ctx)) return false;
   return (
     IMPLEMENT_VERB.test(ctx.text) ||
+    hasDirectModificationCommandLine(ctx) ||
     isExecutionApprovalIntent(ctx) ||
     isEmbeddedApprovedPlanIntent(ctx) ||
     isPlanShapedMarkdownIntent(ctx)
@@ -531,4 +564,17 @@ export function shouldEmitTddBugFixAdvice(ctx: PromptIntentContext): boolean {
 export function shouldEmitBddFeatureAdvice(ctx: PromptIntentContext): boolean {
   if (passiveOrAdvisoryExclusion(ctx)) return false;
   return BDD_FEATURE.test(ctx.raw);
+}
+
+const UX_FEATURE_NOUN_ZH = re(
+  '(页面|界面|前端|网页|落地页|组件|按钮|弹窗|表单|布局|排版|样式|交互|仪表盘)',
+);
+const UX_FEATURE_NOUN_EN = re(
+  String.raw`(^|[^A-Za-z0-9_])(ui|ux|user interface|frontend|front-?end|web ?page|landing page|screen|button|modal|dialog|form|layout|dashboard|css)([^A-Za-z0-9_]|$)`,
+);
+
+/** Frontend-scoped UX guard advisory: BDD feature intent AND a UI noun in the stripped prompt. */
+export function shouldEmitUxFeatureGuardAdvice(ctx: PromptIntentContext): boolean {
+  if (!shouldEmitBddFeatureAdvice(ctx)) return false;
+  return UX_FEATURE_NOUN_ZH.test(ctx.text) || UX_FEATURE_NOUN_EN.test(ctx.text);
 }

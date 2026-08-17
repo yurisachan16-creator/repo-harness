@@ -6,13 +6,13 @@
 
 ### 2. Annotation Cycle
 - Keep active plans in `plans/plan-*.md` and iterate with inline notes.
-- Treat `.ai/harness/active-plan` as authoritative for this worktree when present; `.ai/harness/active-worktree` records the owning worktree; `.claude/.active-plan` is a legacy fallback during transition.
+- Treat `.ai/harness/active-plan` as authoritative for this worktree when present; `.ai/harness/active-worktree` records the owning worktree.
 - Resolve annotations before implementation.
 
 ### 3. Plan Node Default
 - Enter plan mode for non-trivial tasks.
-- If `docs/spec.md` is missing, run `bash .ai/harness/scripts/new-spec.sh` first.
-- Capture decision-complete work-package output from Codex Plan mode or Waza `/think` with `bash .ai/harness/scripts/capture-plan.sh --slug <slug> --title <title> --artifact-level work-package --promotion-reason <merge_boundary|rollback_boundary|verification_boundary|risk_boundary|human_decision_boundary|worktree_boundary>`; if no captured active execution plan exists, use `new-plan.sh`; after approval, run `plan-to-todo.sh` or capture with `--artifact-level work-package --promotion-reason <reason> --status Approved --execute`.
+- If `docs/spec.md` is missing, run `repo-harness run new-spec` first.
+- Capture decision-complete work-package output from Codex Plan mode or Waza `/think` with `repo-harness run capture-plan --slug <slug> --title <title> --artifact-level work-package --promotion-reason <merge_boundary|rollback_boundary|verification_boundary|risk_boundary|human_decision_boundary|worktree_boundary>`; if no captured active execution plan exists, use `repo-harness run new-plan`; after approval, run `repo-harness run plan-to-todo` or capture with `--artifact-level work-package --promotion-reason <reason> --status Approved --execute`.
 - Use `new-sprint.sh` only for Sprint backlogs; it writes `plans/sprints/*.sprint.md`, while PRDs stay in `plans/prds/`.
 - Keep active checklist items in the active plan's `## Task Breakdown`; record only deferred goals in `tasks/todos.md`.
 

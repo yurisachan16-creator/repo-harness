@@ -1,17 +1,20 @@
 /**
  * Existing-repo harness bootstrap/update implementation.
  *
- * This backs the public `repo-harness adopt` command and the legacy
- * `repo-harness-init` skill facade: default the target repo to cwd,
- * install/refresh the machine runtime pieces, apply the repo-local workflow
- * migration, then verify the installed harness.
+ * This backs the public `repo-harness init` command and
+ * `repo-harness-setup`'s init mode (SSD-06: the former standalone
+ * `repo-harness-init` skill facade retired into this mode): default the
+ * target repo to cwd, install/refresh the machine runtime pieces, apply the
+ * repo-local workflow migration, then verify the installed harness.
  */
 
 import { createInterface } from "readline/promises";
 import { stdin, stdout } from "process";
-import { homedir } from "os";
+import { homedir, userInfo } from "os";
+import { spawnSync } from "child_process";
 import {
   cpSync,
+  copyFileSync,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -23,7 +26,14 @@ import { dirname, join, resolve } from "path";
 import { fileURLToPath } from "url";
 import { runInstall, type InstallTargetSpec } from "./install";
 import { runBrain } from "./brain";
-import { registerRepoHarnessRepo } from "../../effects/repo-registry";
+import {
+  externalSkillInstallGroups as catalogExternalSkillInstallGroups,
+  hostSkillPlacements as catalogHostSkillPlacements,
+  parseSkillSurfaceCatalog,
+  probeExpectations as catalogProbeExpectations,
+  type SkillSurfaceCatalog,
+} from "../../core/skill-surface/catalog";
+import { PROFILE_COMPONENTS } from "../installer/install-profile";
 import {
   defaultBrainRootChoice,
   discoverBrainRootChoices,
@@ -32,16 +42,20 @@ import {
 } from "./brain-root";
 import { configureCodegraph, ensureCodegraph } from "../tools/codegraph";
 import { runProcess as runBoundedProcess } from "../../effects/process-runner";
+import { askConfirm, writeLine } from "../tty-prompt";
+import { validateRepoAdoptionTarget } from "../repo-adoption/target";
+import { runAdoptionApply, runAdoptionPlan } from "./adoption-plan";
+import type { AdoptionMode } from "../../core/adoption/modes";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(SCRIPT_DIR, "..", "..", "..");
-const WAZA_SKILLS = ["think", "hunt", "check", "health"];
 const WAZA_SHARED_RULES = ["anti-patterns.md", "chinese.md", "durable-context.md", "english.md"];
-const GBRAIN_INSTALL_ARGS = ["install", "-g", "github:garrytan/gbrain"] as const;
 const GLOBAL_RULES_BEGIN = "<!-- BEGIN: repo-harness global-working-rules -->";
 const GLOBAL_RULES_END = "<!-- END: repo-harness global-working-rules -->";
+const GLOBAL_RULES_SELF_NOTE =
+  "<!-- repo-harness manages this block; edits inside are overwritten on sync. Keep personal rules outside the markers. -->";
 
-export type InitBrainMode = "manifest-only" | "install-gbrain-cli" | "skip";
+export type InitBrainMode = "manifest-only" | "skip";
 export type ReportingLanguagePreset = "follow" | "zh-CN" | "en" | "custom";
 
 export interface GlobalContextOptions {
@@ -49,17 +63,55 @@ export interface GlobalContextOptions {
 }
 
 /**
- * Cross-review skills bundled in this package under `assets/skills/<skill>` and
- * installed host-aware: `codex-review` (Claude host) lets a Claude session get an
- * independent Codex review; `claude-review` (Codex host) lets a Codex session get
- * an independent Claude review. They are self-contained (no gstack runtime), so
- * init bootstraps them as workflow-owned runtime skills alongside Waza and
- * Mermaid, not as an unrelated plugin marketplace stack.
+ * Host-scoped skills bundled under `assets/skills/<skill>`. Cross-model skills
+ * (repo-harness-cross-review's opposite-provider review, plus the claude-plan
+ * external-brain plan consult) install on the opposite host.
  */
-const CROSS_REVIEW_SKILLS: ReadonlyArray<{ skill: string; host: "claude" | "codex" }> = [
-  { skill: "codex-review", host: "claude" },
-  { skill: "claude-review", host: "codex" },
-];
+type BundledHostSkill = { skill: string; host: "claude" | "codex"; step: string };
+type BundledHostAgent = { source: string; agent: string; host: "claude" | "codex"; step: string };
+
+/**
+ * Reads and parses sourceRoot's skill-surface manifest. Parameterized by
+ * sourceRoot (not a fixed path) because this command backs `repo-harness
+ * init`, which can target a package tree other than the currently-running
+ * code (npx cache extraction, a different installed copy); tests routinely
+ * override sourceRoot to a synthetic fixture tree for hermetic runs. Does
+ * not pass an `exists` callback (pre-catalog behavior here never checked
+ * package source paths on disk either), so behavior stays byte-identical to
+ * the literals it replaces.
+ */
+function loadSkillSurfaceCatalog(sourceRoot: string): SkillSurfaceCatalog {
+  const manifestPath = join(sourceRoot, "assets", "skill-commands", "manifest.json");
+  const source = existsSync(manifestPath) ? readFileSync(manifestPath, "utf-8") : null;
+  const resolution = parseSkillSurfaceCatalog(source, { declared: true, profileComponents: PROFILE_COMPONENTS });
+  if (resolution.status !== "valid") {
+    const detail = resolution.diagnostics.map((d) => `${d.code} ${d.path}: ${d.message}`).join("; ");
+    throw new Error(`invalid skill-surface catalog at ${manifestPath}: ${detail}`);
+  }
+  return resolution.catalog;
+}
+
+/**
+ * The unconditional (no installed-profile concept in this init flow)
+ * cross-review/external-brain bundle: repo-harness-cross-review on both
+ * claude and codex (host-aware provider mode selection lives inside the
+ * package), plus claude-plan on codex only. Step-name prefix mirrors the
+ * catalog's cross-model-acceptance vs. adaptive-workflow component split
+ * (the same split that separates "cross-review skill" from "external-brain
+ * skill" naming below).
+ */
+function crossReviewSkillsFromCatalog(catalog: SkillSurfaceCatalog): ReadonlyArray<BundledHostSkill> {
+  const crossModel = new Set(catalogProbeExpectations(catalog).crossModel);
+  const placements = catalogHostSkillPlacements(catalog);
+  const entries: BundledHostSkill[] = [];
+  for (const host of ["claude", "codex"] as const) {
+    for (const skill of placements[host]) {
+      const step = crossModel.has(skill) ? `cross-review skill ${skill}` : `external-brain skill ${skill}`;
+      entries.push({ skill, host, step });
+    }
+  }
+  return entries;
+}
 
 export interface InitCommandOptions {
   repo?: string;
@@ -76,6 +128,7 @@ export interface InitCommandOptions {
   brainRoot?: string;
   brainMode?: InitBrainMode;
   target?: InstallTargetSpec;
+  mode?: AdoptionMode;
   env?: NodeJS.ProcessEnv;
 }
 
@@ -93,6 +146,11 @@ export interface InitCommandResult {
   repoRoot: string;
   steps: InitStep[];
   lines: string[];
+}
+
+/** Internal dependency seam for filesystem-isolated tests. CLI callers use the OS account resolver. */
+export interface InitRuntimeDependencies {
+  authorityHome: () => string | null;
 }
 
 export interface InteractiveInitOptions extends InitCommandOptions {
@@ -125,7 +183,7 @@ function isNpxCacheSource(sourceRoot: string): boolean {
 function initCommandEnv(sourceRoot: string, env?: NodeJS.ProcessEnv): NodeJS.ProcessEnv | undefined {
   if (!isNpxCacheSource(sourceRoot)) return env;
   if (env?.AGENTIC_DEV_LINK_INSTALLED_COPIES !== undefined) return env;
-  return { ...(env ?? {}), AGENTIC_DEV_LINK_INSTALLED_COPIES: "0" };
+  return { ...(env ?? process.env), AGENTIC_DEV_LINK_INSTALLED_COPIES: "0" };
 }
 
 function withStepName(step: InitStep, name: string, detail?: string): InitStep {
@@ -170,9 +228,40 @@ function hostIds(target: InstallTargetSpec): Array<"codex" | "claude"> {
   return ["claude", "codex"];
 }
 
+function targetFromHostIds(hosts: readonly ("codex" | "claude")[]): InstallTargetSpec {
+  return hosts.length === 2 ? "both" : hosts[0]!;
+}
+
 function homeDir(env?: NodeJS.ProcessEnv): string | null {
   return env?.HOME ?? env?.USERPROFILE ?? process.env.HOME ?? process.env.USERPROFILE ?? homedir() ?? null;
 }
+
+export function resolveOsAccountHome(): string | null {
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  if (process.platform === "darwin" && uid !== undefined) {
+    const identity = spawnSync("/usr/bin/id", ["-un", String(uid)], { encoding: "utf-8" });
+    const username = identity.status === 0 ? identity.stdout.trim() : "";
+    if (!/^[A-Za-z0-9._-]+$/.test(username)) return null;
+    const directory = spawnSync("/usr/bin/dscl", [".", "-read", `/Users/${username}`, "NFSHomeDirectory"], { encoding: "utf-8" });
+    const match = directory.status === 0 ? directory.stdout.match(/^NFSHomeDirectory:\s*(.+)$/m) : null;
+    return match?.[1]?.trim() || null;
+  }
+  if (process.platform === "linux" && uid !== undefined) {
+    for (const getent of ["/usr/bin/getent", "/bin/getent"]) {
+      if (!existsSync(getent)) continue;
+      const account = spawnSync(getent, ["passwd", String(uid)], { encoding: "utf-8" });
+      const accountHome = account.status === 0 ? account.stdout.trim().split(":")[5] : "";
+      if (accountHome) return accountHome;
+    }
+    const account = readFileSync("/etc/passwd", "utf-8")
+      .split("\n")
+      .find((line) => line.split(":")[2] === String(uid));
+    return account?.split(":")[5] || null;
+  }
+  return userInfo().homedir || null;
+}
+
+const DEFAULT_INIT_RUNTIME_DEPENDENCIES: InitRuntimeDependencies = { authorityHome: resolveOsAccountHome };
 
 function samePath(a: string, b: string): boolean {
   try {
@@ -182,37 +271,7 @@ function samePath(a: string, b: string): boolean {
   }
 }
 
-function isGitWorkTree(repoRoot: string, env?: NodeJS.ProcessEnv): boolean {
-  const result = runBoundedProcess("git", ["-C", repoRoot, "rev-parse", "--is-inside-work-tree"], { env });
-  return result.ok && result.stdout.trim() === "true";
-}
-
-export function validateRepoAdoptionTarget(
-  repoRoot: string,
-  explicitRepo: boolean,
-  env?: NodeJS.ProcessEnv,
-): InitStep | null {
-  const home = homeDir(env);
-  if (home && samePath(repoRoot, home)) {
-    return {
-      step: "validate repo target",
-      status: "failed",
-      detail:
-        `refusing to apply repo harness to HOME (${repoRoot}); run repo-harness adopt --repo <git-repo> from an intended project`,
-    };
-  }
-
-  if (!explicitRepo && !isGitWorkTree(repoRoot, env)) {
-    return {
-      step: "validate repo target",
-      status: "failed",
-      detail:
-        `cwd is not inside a git work tree (${repoRoot}); pass --repo <project-path> explicitly for non-git scaffolds`,
-    };
-  }
-
-  return null;
-}
+export { validateRepoAdoptionTarget } from "../repo-adoption/target";
 
 function languageInstruction(preset: ReportingLanguagePreset, custom?: string): string {
   if (preset === "zh-CN") return "Use Chinese to report to user.";
@@ -234,16 +293,42 @@ function renderGlobalRules(sourceRoot: string, instruction: string): string {
     /^- Use the user's language for reports; keep technical terms in English\.$/m,
     `- ${instruction}`,
   );
-  return `${GLOBAL_RULES_BEGIN}\n${rendered.trim()}\n${GLOBAL_RULES_END}\n`;
+  return `${GLOBAL_RULES_BEGIN}\n${GLOBAL_RULES_SELF_NOTE}\n${rendered.trim()}\n${GLOBAL_RULES_END}\n`;
 }
 
-function mergeManagedBlock(current: string, block: string): string {
-  const start = current.indexOf(GLOBAL_RULES_BEGIN);
-  const end = current.indexOf(GLOBAL_RULES_END);
-  if (start >= 0 && end >= start) {
-    const afterEnd = end + GLOBAL_RULES_END.length;
-    return `${current.slice(0, start)}${block.trimEnd()}${current.slice(afterEnd).replace(/^\n?/, "\n")}`;
+type ManagedBlockStatus = "written" | "blocked-unbalanced" | "skipped-legacy";
+
+interface MergedManagedBlock {
+  content: string;
+  status: ManagedBlockStatus;
+}
+
+function countOccurrences(haystack: string, needle: string): number {
+  let count = 0;
+  let index = haystack.indexOf(needle);
+  while (index !== -1) {
+    count += 1;
+    index = haystack.indexOf(needle, index + needle.length);
   }
+  return count;
+}
+
+function mergeManagedBlock(current: string, block: string): MergedManagedBlock {
+  const beginCount = countOccurrences(current, GLOBAL_RULES_BEGIN);
+  const endCount = countOccurrences(current, GLOBAL_RULES_END);
+
+  if (beginCount > 0 || endCount > 0) {
+    const start = current.indexOf(GLOBAL_RULES_BEGIN);
+    const end = current.indexOf(GLOBAL_RULES_END);
+    const balanced = beginCount === 1 && endCount === 1 && start >= 0 && end >= start;
+    if (!balanced) {
+      return { content: current, status: "blocked-unbalanced" };
+    }
+    const afterEnd = end + GLOBAL_RULES_END.length;
+    const merged = `${current.slice(0, start)}${block.trimEnd()}${current.slice(afterEnd).replace(/^\n?/, "\n")}`;
+    return { content: merged, status: "written" };
+  }
+
   if (
     /^# Global Working Rules\s*$/m.test(current) ||
     (
@@ -253,10 +338,10 @@ function mergeManagedBlock(current: string, block: string): string {
       current.includes("### P3: Design Decision")
     )
   ) {
-    return current;
+    return { content: current, status: "skipped-legacy" };
   }
   const trimmed = current.trimEnd();
-  return `${trimmed}${trimmed ? "\n\n" : ""}${block}`;
+  return { content: `${trimmed}${trimmed ? "\n\n" : ""}${block}`, status: "written" };
 }
 
 export function writeGlobalContextFiles(
@@ -276,37 +361,45 @@ export function writeGlobalContextFiles(
   if (target === "claude" || target === "both") targets.push(join(home, ".claude", "CLAUDE.md"));
 
   const changes: string[] = [];
+  let blocked = false;
   for (const filePath of targets) {
     mkdirSync(dirname(filePath), { recursive: true });
     const current = existsSync(filePath) ? readFileSync(filePath, "utf-8") : "";
-    const next = mergeManagedBlock(current, block);
-    if (next === current) {
+    const merged = mergeManagedBlock(current, block);
+    if (merged.status === "blocked-unbalanced") {
+      blocked = true;
+      changes.push(`blocked:${filePath} (unbalanced repo-harness markers; repair manually, then re-run)`);
+      continue;
+    }
+    if (merged.status === "skipped-legacy") {
+      changes.push(`skipped-legacy:${filePath} (unmanaged Global Working Rules present; add the repo-harness markers to enable managed sync)`);
+      continue;
+    }
+    if (merged.content === current) {
       changes.push(`unchanged:${filePath}`);
       continue;
     }
-    writeFileSync(filePath, next, "utf-8");
+    writeFileSync(filePath, merged.content, "utf-8");
     changes.push(`${current ? "updated" : "created"}:${filePath}`);
   }
 
-  return { step: "global working rules", status: "ok", detail: changes.join(", ") };
+  return { step: "global working rules", status: blocked ? "failed" : "ok", detail: changes.join(", ") };
 }
 
 /**
- * Install the bundled cross-review skills, each into the host where it is useful:
- * `codex-review` → `~/.claude/skills` (Claude calls Codex), `claude-review` →
- * `~/.codex/skills` (Codex calls Claude). Respects `target`, is idempotent
- * (identical SKILL.md → "already present"), and treats a missing bundled source
- * as `skipped` (never fails init).
+ * Install each bundled skill into its one declared host. Respects `target`, is
+ * idempotent (identical SKILL.md → "already present"), and treats a missing
+ * bundled source as `skipped` (never fails init).
  */
-export function syncCrossReviewSkills(
+function syncBundledItemsAtHome(
   sourceRoot: string,
   target: InstallTargetSpec,
-  env?: NodeJS.ProcessEnv,
+  home: string | null,
+  skills: ReadonlyArray<BundledHostSkill>,
+  agents: ReadonlyArray<BundledHostAgent>,
 ): InitStep[] {
-  const home = homeDir(env);
   const steps: InitStep[] = [];
-  for (const { skill, host } of CROSS_REVIEW_SKILLS) {
-    const step = `cross-review skill ${skill}`;
+  for (const { skill, host, step } of skills) {
     if (target !== "both" && target !== host) continue;
     if (!home) {
       steps.push({ step, status: "failed", detail: "HOME is required to resolve host skill roots" });
@@ -331,12 +424,51 @@ export function syncCrossReviewSkills(
       continue;
     }
     if (existsSync(dest)) {
-      rmSync(dest, { recursive: true, force: true });
+      steps.push({
+        step,
+        status: "failed",
+        detail: `refusing to overwrite unowned or modified skill at ${dest}`,
+      });
+      continue;
     }
     cpSync(source, dest, { recursive: true });
     steps.push({ step, status: "ok", detail: `synced ${dest}` });
   }
+  for (const { source, agent, host, step } of agents) {
+    if (target !== "both" && target !== host) continue;
+    if (!home) {
+      steps.push({ step, status: "failed", detail: "HOME is required to resolve host agent roots" });
+      continue;
+    }
+    const src = join(sourceRoot, source);
+    if (!existsSync(src)) {
+      steps.push({ step, status: "skipped", detail: `bundled source not found at ${src}` });
+      continue;
+    }
+    const root = join(home, host === "claude" ? ".claude" : ".codex", "agents");
+    const dest = join(root, agent);
+    mkdirSync(root, { recursive: true });
+    if (existsSync(dest)) {
+      if (readFileSync(dest, "utf-8") === readFileSync(src, "utf-8")) {
+        steps.push({ step, status: "ok", detail: "already present" });
+      } else {
+        steps.push({ step, status: "failed", detail: `refusing to overwrite modified agent at ${dest}` });
+      }
+      continue;
+    }
+    copyFileSync(src, dest);
+    steps.push({ step, status: "ok", detail: `synced ${dest}` });
+  }
   return steps;
+}
+
+export function syncCrossReviewSkills(
+  sourceRoot: string,
+  target: InstallTargetSpec,
+  env?: NodeJS.ProcessEnv,
+): InitStep[] {
+  const catalog = loadSkillSurfaceCatalog(sourceRoot);
+  return syncBundledItemsAtHome(sourceRoot, target, homeDir(env), crossReviewSkillsFromCatalog(catalog), []);
 }
 
 function syncWazaSharedRules(target: InstallTargetSpec, env?: NodeJS.ProcessEnv): InitStep {
@@ -379,51 +511,49 @@ function syncWazaSharedRules(target: InstallTargetSpec, env?: NodeJS.ProcessEnv)
 
 function installExternalSkills(sourceRoot: string, target: InstallTargetSpec, env?: NodeJS.ProcessEnv): InitStep[] {
   const steps: InitStep[] = [];
-  const agents = hostAgents(target);
-  const waza = runProcess(
-    "npx",
-    [
-      "-y",
-      "skills",
-      "add",
-      "tw93/Waza",
-      "-g",
-      "-a",
-      ...agents,
-      "-s",
-      ...WAZA_SKILLS,
-      "-y",
-    ],
-    sourceRoot,
-    env,
-  );
-  steps.push(withStepName(waza, "external skills Waza", `target=${target}`));
-  steps.push(waza.status === "ok"
-    ? syncWazaSharedRules(target, env)
-    : { step: "external skills Waza shared rules", status: "skipped", detail: "Waza install failed" });
-  const mermaid = runProcess(
-    "npx",
-    [
-      "-y",
-      "skills",
-      "add",
-      "BfdCampos/dotfiles",
-      "-g",
-      "-a",
-      ...agents,
-      "-s",
-      "mermaid",
-      "-y",
-    ],
-    sourceRoot,
-    env,
-  );
-  steps.push(withStepName(mermaid, "external skill mermaid", `target=${target}`));
+  const catalog = loadSkillSurfaceCatalog(sourceRoot);
+  const externalGroups = catalogExternalSkillInstallGroups(catalog, {
+    hosts: hostIds(target),
+    profileGate: "full",
+  });
+  for (const { provider, hosts, skills } of externalGroups) {
+    const groupTarget = targetFromHostIds(hosts);
+    const installed = runProcess(
+      "bunx",
+      [
+        "skills",
+        "add",
+        provider,
+        "-g",
+        "-a",
+        ...hostAgents(groupTarget),
+        "-s",
+        ...skills,
+        "-y",
+      ],
+      sourceRoot,
+      env,
+    );
+    const stepName = provider === "tw93/Waza"
+      ? "external skills Waza"
+      : provider === "BfdCampos/dotfiles"
+        ? "external skill mermaid"
+        : `external skills ${provider}`;
+    steps.push(withStepName(installed, stepName, `target=${groupTarget}`));
+    if (provider === "tw93/Waza") {
+      steps.push(installed.status === "ok"
+        ? syncWazaSharedRules(groupTarget, env)
+        : { step: "external skills Waza shared rules", status: "skipped", detail: "Waza install failed" });
+    }
+  }
   steps.push(...syncCrossReviewSkills(sourceRoot, target, env));
   return steps;
 }
 
-export function runInit(opts: InitCommandOptions = {}): InitCommandResult {
+export function runInit(
+  opts: InitCommandOptions = {},
+  dependencies: InitRuntimeDependencies = DEFAULT_INIT_RUNTIME_DEPENDENCIES,
+): InitCommandResult {
   const sourceRoot = resolve(opts.sourceRoot ?? REPO_ROOT);
   const repoRoot = resolve(opts.repo ?? process.cwd());
   let commandEnv = initCommandEnv(sourceRoot, opts.env);
@@ -437,10 +567,11 @@ export function runInit(opts: InitCommandOptions = {}): InitCommandResult {
   const syncCodegraph = opts.syncCodegraph === true;
   const brainMode = opts.brainMode ?? "skip";
   const target = opts.target ?? "both";
+  const mode = opts.mode ?? "standard";
   const steps: InitStep[] = [];
 
   if (opts.brainRoot) {
-    commandEnv = { ...(commandEnv ?? {}), REPO_HARNESS_BRAIN_ROOT: opts.brainRoot };
+    commandEnv = { ...(commandEnv ?? process.env), REPO_HARNESS_BRAIN_ROOT: opts.brainRoot };
   }
 
   const targetError = validateRepoAdoptionTarget(repoRoot, opts.repo !== undefined, commandEnv);
@@ -498,31 +629,30 @@ export function runInit(opts: InitCommandOptions = {}): InitCommandResult {
   );
   steps.push(withStepName(inspect, "inspect repo", repoRoot));
 
-  const migrate = runProcess(
-    "bash",
-    [
-      join(sourceRoot, "scripts", "migrate-project-template.sh"),
-      "--repo",
-      repoRoot,
-      apply ? "--apply" : "--dry-run",
-    ],
-    sourceRoot,
-    commandEnv,
-  );
-  steps.push(withStepName(migrate, apply ? "apply repo harness" : "plan repo harness", repoRoot));
+  const adoptionApply = apply
+    ? runAdoptionApply({ repo: repoRoot, mode, explicitRepo: true, env: commandEnv })
+    : undefined;
+  const adoption = adoptionApply ?? runAdoptionPlan({ repo: repoRoot, mode, explicitRepo: true, env: commandEnv });
+  const migrate: InitStep = {
+    step: apply ? "apply repo harness" : "plan repo harness",
+    status: adoption.exitCode === 0 ? "ok" : "failed",
+    detail: repoRoot,
+    stdout: adoption.output,
+  };
+  steps.push(migrate);
 
-  if (apply && migrate.status === "ok") {
-    const registered = registerRepoHarnessRepo(repoRoot, "init", { env: commandEnv });
+  const registration = adoptionApply?.report.registration;
+  if (apply && migrate.status === "ok" && registration) {
     steps.push({
       step: "register repo harness repo",
-      status: registered.registered ? "ok" : "skipped",
-      detail: registered.registered ? registered.path : registered.reason,
+      status: registration.registered ? "ok" : "skipped",
+      detail: registration.registered ? registration.path : registration.reason,
     });
   } else {
     steps.push({
       step: "register repo harness repo",
       status: "skipped",
-      detail: apply ? "repo harness did not apply cleanly" : "dry-run",
+      detail: apply ? "repo harness did not apply cleanly or registry effect was unavailable" : "dry-run",
     });
   }
 
@@ -600,10 +730,6 @@ export function runInit(opts: InitCommandOptions = {}): InitCommandResult {
       mkdirSync(root, { recursive: true });
       steps.push({ step: "ensure brain root", status: "ok", detail: root });
     }
-    if (brainMode === "install-gbrain-cli") {
-      const gbrain = runProcess("bun", [...GBRAIN_INSTALL_ARGS], sourceRoot, commandEnv);
-      steps.push(withStepName(gbrain, "install gbrain CLI"));
-    }
     try {
       const result = withProcessEnv(commandEnv, () => runBrain("sync", { repo: repoRoot }));
       const hasErrors = result.issues.some((entry) => entry.level === "error");
@@ -628,32 +754,24 @@ export function runInit(opts: InitCommandOptions = {}): InitCommandResult {
   }
 
   if (apply && verify) {
-    const verifyEnv = { ...(commandEnv ?? {}), REPO_HARNESS_SOURCE_ROOT: sourceRoot };
+    const verifyEnv = { ...(commandEnv ?? process.env), REPO_HARNESS_SOURCE_ROOT: sourceRoot };
     if (migrate.status === "ok") {
-      if (existsSync(join(repoRoot, "scripts", "prepare-codex-handoff.sh"))) {
-        const handoff = runProcess(
-          "bash",
-          ["scripts/prepare-codex-handoff.sh", "--reason", "repo-harness-adopt-verify"],
-          repoRoot,
-          verifyEnv,
-        );
-        steps.push(
-          withStepName(
-            handoff,
-            "refresh handoff packet",
-            "scripts/prepare-codex-handoff.sh --reason repo-harness-adopt-verify",
-          ),
-        );
-      } else {
-        steps.push({
-          step: "refresh handoff packet",
-          status: "skipped",
-          detail: "scripts/prepare-codex-handoff.sh missing",
-        });
-      }
+      const handoff = runProcess(
+        "bun",
+        [join(REPO_ROOT, "src/cli/index.ts"), "run", "prepare-codex-handoff", "--reason", "repo-harness-init-verify"],
+        repoRoot,
+        verifyEnv,
+      );
+      steps.push(
+        withStepName(
+          handoff,
+          "refresh handoff packet",
+          "repo-harness run prepare-codex-handoff --reason repo-harness-init-verify",
+        ),
+      );
     }
-    const verifyStep = runProcess("bash", ["scripts/check-task-workflow.sh", "--strict"], repoRoot, verifyEnv);
-    steps.push(withStepName(verifyStep, "verify repo harness", "scripts/check-task-workflow.sh --strict"));
+    const verifyStep = runProcess("bun", [join(REPO_ROOT, "src/cli/index.ts"), "run", "check-task-workflow", "--strict"], repoRoot, verifyEnv);
+    steps.push(withStepName(verifyStep, "verify repo harness", "repo-harness run check-task-workflow --strict"));
   } else {
     steps.push({ step: "verify repo harness", status: "skipped" });
   }
@@ -665,10 +783,6 @@ export function runInit(opts: InitCommandOptions = {}): InitCommandResult {
     steps,
     lines: steps.flatMap(renderStep),
   };
-}
-
-function writeLine(output: NodeJS.WritableStream, line = ""): void {
-  output.write(`${line}\n`);
 }
 
 function selectedIndex(answer: string, count: number, defaultIndex: number): number | null {
@@ -712,20 +826,6 @@ async function askText(
   const answer = await rl.question(`${question}${fallback ? ` [${fallback}]` : ""}: `);
   writeLine(output);
   return answer.trim() || fallback;
-}
-
-async function askConfirm(
-  rl: ReturnType<typeof createInterface>,
-  output: NodeJS.WritableStream,
-  question: string,
-): Promise<boolean> {
-  while (true) {
-    const answer = (await rl.question(`${question} [Y/n]: `)).trim().toLowerCase();
-    writeLine(output);
-    if (!answer || answer === "y" || answer === "yes") return true;
-    if (answer === "n" || answer === "no") return false;
-    writeLine(output, "Enter y or n.");
-  }
 }
 
 function brainChoiceLabel(choice: BrainRootChoice): string {
@@ -841,19 +941,26 @@ export async function runInteractiveInit(opts: InteractiveInitOptions = {}): Pro
       "Brain mode",
       [
         { label: "manifest only", value: "manifest-only", detail: "Use file-vault manifest/check/sync" },
-        { label: "install gbrain CLI", value: "install-gbrain-cli", detail: "Install GitHub GBrain CLI, but do not enable MCP" },
         { label: "skip brain sync", value: "skip", detail: "Do not create or sync a brain root" },
       ],
       0,
     );
 
+    const externalSkills = await askConfirm(
+      rl,
+      output,
+      "Install external skills (Waza /think /hunt /check /health, Mermaid, cross-review)?",
+    );
+    const codegraph = await askConfirm(rl, output, "Install CodeGraph CLI and configure its MCP server?");
+
     writeLine(output, renderInteractivePlan([
       `repo=${repoRoot}`,
       `target=${target}`,
       `reporting=${reportLanguageInstruction}`,
-      `brainRoot=${brainChoice.root}`,
+      `brainRoot=${(brainChoice as BrainRootChoice).root}`,
       `brainMode=${brainMode}`,
-      "CodeGraph=required ensure --init --sync plus global MCP configure",
+      `externalSkills=${externalSkills}`,
+      `CodeGraph=${codegraph ? "ensure --init --sync plus global MCP configure" : "skip"}`,
       `apply=${opts.apply === false ? "false" : "true"}`,
       `verify=${opts.verify === false ? "false" : "true"}`,
     ]));
@@ -875,11 +982,12 @@ export async function runInteractiveInit(opts: InteractiveInitOptions = {}): Pro
       repo: repoRoot,
       sourceRoot,
       target,
-      codegraph: true,
-      configureCodegraphMcp: true,
-      syncCodegraph: true,
+      externalSkills,
+      codegraph,
+      configureCodegraphMcp: codegraph,
+      syncCodegraph: codegraph,
       globalContext: { reportLanguageInstruction },
-      brainRoot: brainChoice.root,
+      brainRoot: (brainChoice as BrainRootChoice).root,
       brainMode,
     });
   } finally {

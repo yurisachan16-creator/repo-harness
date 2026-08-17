@@ -4,7 +4,7 @@ This repo uses a shared long-running harness. The durable workflow lives in repo
 
 ## Adoption Model
 
-Use this file as the first onboarding map after `repo-harness adopt` installs
+Use this file as the first onboarding map after `repo-harness init` installs
 or refreshes a repo. The harness gives agents three durable surfaces:
 
 - **Shared standards**: `docs/spec.md`, `docs/reference-configs/`, root
@@ -38,13 +38,13 @@ with the project.
 7. `tasks/reviews/<plan-stem>.review.md` records evaluator judgment.
 8. `.ai/harness/policy.json` is the machine-readable workflow contract.
 9. `information_lifecycle` inside `.ai/harness/policy.json` separates notes, raw evidence, reusable assets, advisory memory, and external knowledge.
-10. `agentic_development` inside `.ai/harness/policy.json` captures product, engineering, design, bug-hunt, and review routing.
-11. `external_tooling` inside `.ai/harness/policy.json` captures host install/update defaults for gstack, Waza, gbrain, and required CodeGraph readiness.
+10. `agentic_development` inside `.ai/harness/policy.json` keeps product, engineering, and design planning parent-owned with `geju` pre-contract framing, and captures the Waza bug-hunt/review routes.
+11. `external_tooling` inside `.ai/harness/policy.json` captures host install/update defaults for Waza, `geju`, and required CodeGraph readiness.
 12. `.ai/context/capabilities.json` declares capability prefixes, contract files, architecture modules, and workstream directories.
 13. `.ai/context/context-map.json` indexes stable root context and discoverable capability context derived from the registry.
 14. `documentation` inside `.ai/harness/policy.json` keeps generated docs minimal and moves optional docs to agent-created, evidence-backed output.
 15. `lsp_profiles` inside policy and context-map files select tooling hints per capability.
-16. `worktree_strategy` inside policy tells agents when to isolate contract-level work in `codex/<slug>` worktrees, start execution through `.ai/harness/scripts/contract-worktree.sh start --plan <plan>`, and finish with Waza `/check` plus `.ai/harness/scripts/contract-worktree.sh finish`.
+16. `worktree_strategy` inside policy tells agents when to isolate contract-level work in `codex/<slug>` worktrees, start execution through `repo-harness run contract-worktree start --plan <plan>`, and finish with Waza `/check` plus `repo-harness run contract-worktree finish`.
 17. `.ai/harness/handoff/current.md` preserves resumable state across sessions.
 18. `.ai/harness/events.jsonl` and `.ai/harness/runs/*.json` retain lightweight execution traces.
 
@@ -55,14 +55,17 @@ with the project.
 - Implementation should prefer `docs/spec.md`, an approved plan, and an active sprint contract.
 - Claiming completion should include contract verification evidence, a run snapshot, implementation notes, and a passing Waza `/check` review artifact.
 - Stopping a session should refresh `.ai/harness/handoff/current.md` for easier resume; while pending planning orchestration is open, Stop may block once to force a plan completeness self-review before execution.
-- Refresh `tasks/current.md` with `.ai/harness/scripts/refresh-current-status.sh --write --reason <reason>` only at explicit lifecycle boundaries or as a deliberate maintainer action; ordinary hooks should not dirty tracked files.
+- Refresh `tasks/current.md` with `repo-harness run refresh-current-status --write --reason <reason>` only at explicit lifecycle boundaries or as a deliberate maintainer action; ordinary hooks should not dirty tracked files.
 - In non-target worktrees, read the target branch snapshot with `git show <target>:tasks/current.md` and verify stale or surprising state against the source artifacts before acting.
 - Use `docs/reference-configs/agentic-development-flow.md` for skill routing and `docs/reference-configs/external-tooling.md` for install/update commands.
 - Use `docs/reference-configs/global-working-rules.md` as the user-level Claude/Codex rule template; keep repo-local workflow contracts in repo files.
-- Externalized reference docs are indexed by `.ai/harness/brain-manifest.json` and checked by `.ai/harness/scripts/check-brain-manifest.sh`. Valuable repo docs can opt into default-brain mirroring with `sync.direction=repo-to-brain`; `post-edit-guard.sh` then calls `.ai/harness/scripts/sync-brain-docs.sh --changed <path>` for that specific file.
+- Externalized reference docs may be indexed by `.ai/harness/brain-manifest.json`. Validation and export through `repo-harness run check-brain-manifest` / `sync-brain-docs` are explicit operator actions and never part of hook or workflow correctness.
 - Contract-level execution should run in an isolated `codex/<task-slug>` worktree. Merge back only after the contract is fulfilled, `tasks/reviews/<plan-stem>.review.md` recommends pass, and the target worktree is clean.
-- Architecture-sensitive work also runs `scripts/check-architecture-sync.sh`: the check keeps the request index derived from `docs/architecture/requests/` and, when policy is strict, blocks finish if the current diff touches a capability with a pending architecture request at or above `architecture.gate_min_severity`.
-- Migration cleans legacy root `scripts/<repo-harness-helper>` files only when content is identifiable as generated repo-harness runtime; ambiguous app-owned root scripts are reported and preserved.
+- Architecture-sensitive work also runs `repo-harness run check-architecture-sync`: the check keeps the request index derived from `docs/architecture/requests/` and, when policy is strict, blocks finish if the current diff touches a capability with a pending architecture request at or above `architecture.gate_min_severity`.
+- Adoption retires legacy hook/runtime assets only inside the canonical
+  `FsTransaction`: declared paths require an exact SHA-256 match, while
+  mismatches, ambiguous app-owned files, and custom adapter siblings are
+  preserved and reported.
 
 ## Documentation Profile
 
@@ -79,13 +82,13 @@ with the project.
 - Evidence: `.ai/harness/checks/latest.json` is the current gate, while `.ai/harness/runs/*.json` keeps ignored local verification snapshots for the current workflow audit. Task-specific `.ai/harness/checks/*.latest.{json,md}` reports are ignored runtime cache; promote durable conclusions into reviews, contracts, notes, or research.
 - Human reading surface: `docs/spec.md`, `docs/architecture/`, and durable `docs/researches/` conclusions are the default entrypoint. Root workflow artifacts should describe active work only; completed plan/contract/review/notes/todo artifacts move to `plans/archive/` or `tasks/archive/`, and `.rgignore` keeps those archives plus runtime evidence out of default `rg` results.
 - Closeout order: promote durable truth first, then archive the workflow artifacts. If a fact only lives in a review/contract/checks file, the workflow is not ready to disappear from the active reading surface.
-- Memory: `docs/researches/`, `tasks/lessons.md`, and gbrain are advisory. Current repo state and evidence override summaries.
-- External knowledge: `brain/<project>/*` stores long-form explanations, runbooks, decisions, and patterns. Hooks may write only explicitly opted-in `repo-to-brain` manifest entries; checks must not require gbrain or MCP.
+- Memory: `docs/researches/` and `tasks/lessons.md` are advisory. Current repo state and evidence override summaries.
+- External knowledge: `brain/<project>/*` is an optional operator-managed export surface for long-form explanations, runbooks, decisions, and patterns. Hooks and workflow checks never read, write, or gate on its state.
 - Assets: policies, hooks, scripts, templates, and reference configs only change when a pattern has evidence across tasks or fixtures.
 
 ## Trace Evidence
 
-`scripts/verify-sprint.sh` writes `.ai/harness/checks/latest.json` and an ignored `.ai/harness/runs/*.json` snapshot using `schema: repo-harness-run-trace.v1`. The trace is local evidence for workflow grading, not a cloud tracing dependency or a committed durable artifact.
+`repo-harness run verify-sprint` writes `.ai/harness/checks/latest.json` and an ignored `.ai/harness/runs/*.json` snapshot using `schema: repo-harness-run-trace.v1`. The trace is local evidence for workflow grading, not a cloud tracing dependency or a committed durable artifact.
 
 Required v1 fields:
 
@@ -94,19 +97,111 @@ Required v1 fields:
 - `commands`, `guards`, `handoffs`, `files_changed`, and `allowed_paths_check`
 - `external_acceptance`, `failure_class`, and `next_step`
 
-`scripts/check-task-workflow.sh --strict` validates the latest trace shape when a non-empty latest checks file exists. `scripts/harness-trace-grade.sh --run <trace> --strict` applies the local graders used for workflow regression checks: active plan resolves, contract profile is valid, Human Review Card passes, command evidence exists, and changed files stay inside allowed paths.
+`repo-harness run check-task-workflow --strict` validates the latest trace shape when a non-empty latest checks file exists. `repo-harness run harness-trace-grade --run <trace> --strict` applies the local graders used for workflow regression checks: active plan resolves, contract profile is valid, Human Review Card passes, command evidence exists, and changed files stay inside allowed paths.
+
+## Harness Cost Evidence and SLOs
+
+Harness cost reports separate measured values from unavailable telemetry. A
+metric is authoritative only when its named source exposes that value directly;
+missing or incomplete event metrics keep `runtime_evidence.available: false`.
+Reports must not derive model calls from turns, subagents from tool-name text,
+billing tokens from byte counts, or hidden legacy-script I/O from local
+heuristics.
+
+The two current evidence owners are:
+
+- `.ai/harness/runs/hook-events.jsonl` is the sole hook runtime telemetry
+  authority. `src/cli/hook/runtime.ts` appends exactly one
+  `loop-engine-hook-event/v1` record per eligible handled host event. Typed
+  dispatch evidence contains one `in_process` handler step, direct
+  `child_processes: 0`, and no opaque steps. File/write metrics are only
+  authoritative at explicit observer boundaries; consumers inspect
+  `complete_metrics` and `incomplete_metrics` instead of treating zero as
+  proof of complete filesystem coverage. The telemetry append itself is
+  excluded from write amplification metrics and is non-authoritative: append
+  failure never changes hook safety.
+- `scripts/hook-dispatch-diet-report.ts` combines that event authority with
+  static route topology and synthetic subprocess probes. Runtime distributions
+  and route coverage include sample count, p50, and p95; missing, malformed,
+  mixed-protocol, duplicate, or target-incomplete records fail closed. Synthetic
+  probe distributions retain total, p50, p95, p99, and max latency. The
+  SessionStart token estimate remains labeled `utf8_bytes_div_4`; it is a
+  context-budget indicator, not provider billing usage.
+- `scripts/run-skill-evals.ts` for end-to-end benchmark duration, changed-file
+  evidence, graders, and provider-structured usage. Claude single-result JSON
+  and Codex JSONL are parsed independently. Raw output remains an artifact, and
+  absent or malformed usage makes only the usage fields unavailable; it does
+  not rewrite agent exit or grader status.
+
+Current SLOs:
+
+- Runtime entry: exactly one per eligible host event.
+- Direct runtime-dispatch child processes: at most one per event. This does not
+  claim to count internal `git`/`bun` plumbing or OS process syscalls.
+- Effective State resolution: exactly one for the measured PreEdit and Stop
+  target routes.
+- PreEdit event p95: target at most 150 ms, initial hard budget 250 ms.
+- PostEdit: zero full recovery-projection writes and at most one journal event
+  write.
+- Stop: at most one recovery-projection write transaction.
+- Synthetic hook phase p95: at most 250 ms per probe.
+- Estimated actionable SessionStart context: at most 1,500 tokens using the
+  explicitly labeled byte heuristic.
+- Inert SessionStart: zero additional context bytes.
+- Full, non-dry-run benchmark on a supported structured CLI: token usage should
+  have `structured_cli` authority. A CLI that does not expose structured usage
+  is reported as unavailable rather than silently passing with zero tokens.
+
+The SessionStart budget is global across the aggregated context payload, not a
+per-hook allowance. Duplicate sections are identified from both content and
+behavioral metadata (`priority`, `mandatory`, `actionable`, and `reference`).
+When the budget is pressured, structured harness-state fields are compacted in
+a deterministic priority order while preserving the critical workflow state.
+If all mandatory critical state cannot fit, aggregation returns a structured
+fail-closed overflow result naming every affected section instead of silently
+discarding an earlier mandatory section.
+
+Claude cache reads and cache creation tokens remain separate provider fields;
+neither is folded into input tokens. Codex cached input remains its own field,
+while cache creation stays `null` because the Codex JSONL contract does not
+expose it.
+
+`scripts/run-skill-evals.ts` owns the isolated 3-by-9 matrix: **No Harness**,
+**Adaptive Lite**, and **Strict**, each across nine scenarios and three runs.
+No Harness uses a disposable host home with repo-harness adapters and managed
+Skills absent; the harness profiles install into separate disposable homes.
+Every authoritative run binds the report to the tested source commit, requires
+structured provider usage, records actual hook invocation count and cumulative
+hook wall time from hot-path spans, and grades changed files plus the explicit
+workflow-artifact path contract. The checked-in report is
+`evals/harness/reports/profile-comparison.{json,md}`; it is replaced only by a
+complete authoritative matrix, never by a partial or dry-run result.
+The two generated comparison files are verification evidence, so regenerating
+them is excluded from implementation review freshness just like checks and run
+cache; their own source commit, input hashes, provider authority, graders, and
+external acceptance remain the evidence-integrity boundary. `verify-sprint`
+also records a separate hash of the actual JSON and Markdown bytes in structured
+checks; later report edits stale checks without staling the implementation review.
+
+Provider request/model-call count, native subagent count, and true
+time-to-first-edit remain unavailable when the provider CLI does not expose
+them as structured fields. Reports retain `null` plus the authority reason
+rather than inferring those values from turns, tool names, or timestamps.
 
 ## Capability Context
 
 - Do not infer agent context boundaries from physical layout globs such as `apps/*`, `packages/*`, or `services/*`.
 - Declare capabilities in `.ai/context/capabilities.json`; each capability owns prefixes, paired contract files, an architecture module, a workstream directory, and local verification hints.
-- Add selected capabilities with `repo-harness-capability` or `bun .ai/harness/scripts/capability-config.ts add --prefix <path>` when the harness already exists and a full init/migrate/upgrade pass would be too broad.
-- Resolve edited paths through `.ai/harness/scripts/capability-resolver.ts match --path <path>`; longest prefix wins and equal-length ambiguity fails.
-- Treat `.ai/context/agent-context-blocks.txt`, `REPO_HARNESS_CONTEXT_BLOCKS`, and existing nested `CLAUDE.md`/`AGENTS.md` files as migration inputs or compatibility fallbacks only.
+- Add selected capabilities with `repo-harness-setup` (capability mode) or `repo-harness run capability-config add --prefix <path>` when the harness already exists and a full init/migrate/upgrade pass would be too broad.
+- Resolve edited paths through `repo-harness run capability-resolver match --path <path>`; longest prefix wins and equal-length ambiguity fails.
+- Treat `.ai/context/agent-context-blocks.txt`,
+  `REPO_HARNESS_CONTEXT_BLOCKS`, and existing nested `CLAUDE.md`/`AGENTS.md`
+  files as migration inputs only; the capability registry is runtime authority.
 - Selected capabilities receive paired `CLAUDE.md` and `AGENTS.md` files so Claude Code and Codex share the same local contract.
 - Use `repo-harness capability-context status|request|sync` to keep paired local context files aligned with the registry. The command writes only the controlled `CAPABILITY CONTEXT` block and preserves hand-authored content plus the separate architecture contract block.
 - `.ai/context/capability-source-map.json` is the optional human-edited source-map manifest for capability positioning and source pointers. Missing entries fall back to registry/architecture/workstream metadata; `--auto-fill-positioning` writes deterministic draft entries explicitly, not from hooks.
 - `.ai/harness/capability-context/` is ignored runtime queue state. Post-edit hooks may enqueue requests, and `SessionStart` only reminds the current agent to run `repo-harness capability-context sync --pending --apply`.
+- `.ai/harness/architecture-projection/` is ignored durable projection runtime state. It owns one running provider job per repository, pending jobs, typed receipts, refresh receipts, and dead letters; source observations are acknowledged only after a terminal receipt. SessionStart exposes the exact oldest dead-letter id for the explicit `architecture-projection retry-dead-letter` recovery command.
 - `SessionStart` also summarizes pending architecture request cards so a resumed agent can see drift debt before claiming finish.
 
 ## Initializer and Runtime Model
@@ -115,12 +210,54 @@ Maintainer-facing detail on how the initializer and runtime defaults are wired.
 
 - Question flow uses **12 grouped decision points** with harness defaults inferred first.
 - Plan menu is tiered: **Core Plans (A-F)** first, **Custom Presets (G-K)** only when needed.
-- Skill routing is inspection-first: `scripts/inspect-project-state.ts`, `scripts/migrate-workflow-docs.ts`, `assets/workflow-contract.v1.json`.
+- Skill routing is inspection-first: `scripts/inspect-project-state.ts`, `src/core/adoption/standard-plan.ts`, `assets/workflow-contract.v1.json`.
 - Runtime mode is configurable with template vars: `{{RUNTIME_MODE}}`, `{{RUNTIME_PROFILE}}`, `{{RECOVERY_PROFILE}}`, `{{STATE_PROFILE}}`.
 - Question-pack source of truth: `assets/initializer-question-pack.v4.json`.
 - Generated repos default to the repo-local harness flow: `docs/spec.md -> plans/ -> tasks/contracts/ -> tasks/reviews/ -> .ai/context/context-map.json -> .ai/harness/*`.
 - Generated and self-hosted repos install `.ai/harness/workflow-contract.json` and `.ai/harness/policy.json`.
-- Generated and migrated repos default `external_tooling` to: `complex -> gstack`; `simple -> Waza` with Codex-first runtime copies in `~/.codex/skills`; `knowledge -> gbrain`.
-- `repo-harness install` bootstraps the Codex/Claude runtime pieces for the default workflow: refreshes `repo-harness` skill aliases, installs global Codex/Claude hook adapters, installs Waza skills (`think`, `hunt`, `check`, `health`) and Mermaid through the skills CLI, persists the brain root in `~/.repo-harness/config.json`, and configures CodeGraph MCP for selected host agents. `repo-harness init` remains a compatibility alias for existing automation.
-- Other external tooling stays advisory-only: `bash scripts/check-agent-tooling.sh --host both --check-updates`; Waza update checks compare upstream `tw93/Waza` `SKILL.md` hashes without running `npx skills check`; no automatic gstack, gbrain MCP, CodeGraph daemon, or provider setup.
+- Host events use the user-level managed adapter projection, the 11-tuple
+  `route-registry.ts`, and exactly one typed in-process handler per tuple.
+  `.ai/hooks/lib/workflow-state.sh` is an operator helper projection, not a
+  second host-event runtime.
+- Generated and migrated repos keep discovery and complex/design planning in the parent agent: `geju` opens the pre-contract frame, then the parent completes P1/P2/P3 and freezes the accepted direction. Daily small/medium work uses Waza with Codex-first runtime copies in `~/.codex/skills`; durable knowledge stays in repo-authored research and lessons.
+- `repo-harness install` bootstraps the package-owned Codex/Claude runtime pieces for the default workflow: refreshes `repo-harness` skill aliases, installs global Codex/Claude hook adapters, persists the brain root in `~/.repo-harness/config.json`, and configures CodeGraph MCP for selected host agents. Mutable Waza and Mermaid providers are installed only after explicit selection. `repo-harness init` remains a compatibility alias for existing automation.
+- The recommended `reverse-skill-router` remains explicit-only through `--with-reverse-skill` because its upstream authorization assumption cannot replace independently verified scope; the pinned selected tree is integrity-checked before host projection.
+- Read-only external-tooling audit stays advisory: `repo-harness run check-agent-tooling --host both --check-updates`. The explicit mutating boundary is `repo-harness update`, which reconciles mandatory ArchContext packages and runtime and updates the global CodeGraph CLI/MCP; mutable Waza/Mermaid providers require `--with-external-skills`. It does not initialize or sync a repository CodeGraph index.
 - Manual distillation stays repo-local: repeated corrections -> `tasks/lessons.md`; deep findings and hidden contracts -> topic-scoped `docs/researches/*.md`; sprint verification evidence -> `tasks/reviews/*.review.md`; durable capability progress -> `tasks/workstreams/`; release history -> `docs/CHANGELOG.md`.
+
+### Package Manager Defaults
+
+- General default priority: `bun > pnpm > npm`.
+- **Plan G/H** (Python-centric) default to **`uv`** as the primary package manager.
+
+### Runtime Profiles
+
+The initializer offers exactly three runtime profiles:
+
+- `Plan-only (recommended)` (default)
+- `Plan + Permissionless`
+- `Standard (ask before each action)`
+
+They are configured in `assets/initializer-question-pack.v4.json` and consumed by
+`scripts/initializer-question-pack.ts`.
+
+### Package Authority Files
+
+Maintainer-facing map of which package file owns which contract:
+
+| File | Owns |
+|---|---|
+| `SKILL.md` | Root Skill spec |
+| `CLAUDE.md`, `AGENTS.md` | Root routing docs |
+| `assets/plan-map.json` | Plan catalog mapping |
+| `assets/initializer-question-pack.v4.json` | Question pack |
+| `assets/hooks/` | Canonical hook asset source |
+| `assets/reference-configs/` | Runtime reference docs, resolved through `repo-harness docs` |
+| `assets/workflow-contract.v1.json` | Workflow contract manifest |
+| `docs/reference-configs/*.md` | Source-repo projection of the runtime reference docs |
+| `scripts/assemble-template.ts` | Explicit template assembly |
+| `scripts/initializer-question-pack.ts` | Question inference helper |
+| `scripts/inspect-project-state.ts` | State inspector |
+| `src/core/adoption/standard-plan.ts` | Canonical adoption planner |
+| `scripts/check-agent-tooling.sh` | External tooling detector |
+| `scripts/init-project.sh`, `scripts/create-project-dirs.sh` | Scaffolding steps |

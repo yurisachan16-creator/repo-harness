@@ -1,20 +1,28 @@
 import { describe, test, expect, setDefaultTimeout } from "bun:test";
 import {
+  cpSync,
   existsSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "fs";
-import { tmpdir } from "os";
-import { join } from "path";
+import { homedir, tmpdir } from "os";
+import { dirname, join } from "path";
 import { spawnSync } from "child_process";
 import {
+  assertDisposableEvaluationBoundary,
+  assertDisposableRootBoundary,
   buildBenchmarkSummary,
   captureGitArtifacts,
   formatIterationName,
   initBenchmarkGitRepo,
+  runDisposableAdoptionProfile,
+  parseClaudeStructuredOutput,
+  parseCodexStructuredOutput,
   runSkillEvals,
 } from "../scripts/run-skill-evals";
 
@@ -50,10 +58,10 @@ for arg in "$@"; do
 done
 if [[ "$disable" -eq 0 && -L ".claude/skills/repo-harness" ]]; then
   printf "\\n- claude with skill\\n" >> AGENTS.md
-  echo "claude with skill: $prompt"
+  printf '{"type":"result","result":"claude with skill: %s","session_id":"claude-session","model":"claude-test","num_turns":2,"total_cost_usd":0.125,"usage":{"input_tokens":101,"cache_read_input_tokens":11,"cache_creation_input_tokens":7,"output_tokens":23}}\\n' "$prompt"
 else
   printf "\\n- claude baseline\\n" >> AGENTS.md
-  echo "claude without skill: $prompt"
+  printf '{"type":"result","result":"claude without skill: %s","session_id":"claude-session","model":"claude-test","num_turns":2,"total_cost_usd":0.125,"usage":{"input_tokens":101,"cache_read_input_tokens":11,"cache_creation_input_tokens":7,"output_tokens":23}}\\n' "$prompt"
 fi
 `
   );
@@ -79,7 +87,10 @@ else
   printf "\\n- codex baseline\\n" >> tasks/todos.md
   echo "codex without skill: $prompt" > "$output"
 fi
-echo "codex executed"
+printf "%s\\n" "$HOME" > .observed-home
+printf "%s\\n" "\${REPO_HARNESS_SOURCE_ROOT:-}" > .observed-source-root
+printf '{"type":"thread.started","thread_id":"codex-thread"}\\n'
+printf '{"type":"turn.completed","usage":{"input_tokens":201,"cached_input_tokens":21,"output_tokens":34}}\\n'
 `
   );
 
@@ -145,10 +156,369 @@ describe("run-skill-evals helpers", () => {
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
+  }, 30_000);
+
+  test("disposable boundary rejects the real HOME before evaluator writes", () => {
+    const boundary = tempPath("benchmark-real-home-guard");
+    const repo = join(boundary, "repo");
+    mkdirSync(repo, { recursive: true });
+    try {
+      expect(() => assertDisposableEvaluationBoundary({
+        repoRoot: repo,
+        home: process.env.HOME,
+        evalsPath: join(repo, "evals", "evals.json"),
+        configPath: join(repo, "evals", "benchmark.config.json"),
+        workspaceRoot: join(repo, "workspace"),
+        summaryPath: join(repo, "reports", "benchmark.md"),
+      })).toThrow("refuses the real HOME");
+    } finally {
+      rmSync(boundary, { recursive: true, force: true });
+    }
+  });
+
+  test("parses provider-authoritative Claude single-result usage", () => {
+    const evidence = parseClaudeStructuredOutput(
+      JSON.stringify({
+        type: "result",
+        result: "done",
+        session_id: "session-1",
+        model: "claude-test",
+        num_turns: 3,
+        total_cost_usd: 0.25,
+        usage: {
+          input_tokens: 120,
+          cache_read_input_tokens: 20,
+          cache_creation_input_tokens: 9,
+          output_tokens: 30,
+        },
+      })
+    );
+
+    expect(evidence).toMatchObject({
+      usageAuthority: "structured_cli",
+      usageUnavailableReason: null,
+      inputTokens: 120,
+      cachedInputTokens: 20,
+      cacheCreationInputTokens: 9,
+      outputTokens: 30,
+      totalCostUsd: 0.25,
+      turnCount: 3,
+      model: "claude-test",
+      sessionId: "session-1",
+      finalResponse: "done",
+    });
+  });
+
+  test("parses provider-authoritative Codex JSONL usage", () => {
+    const evidence = parseCodexStructuredOutput(
+      [
+        JSON.stringify({ type: "thread.started", thread_id: "thread-1" }),
+        JSON.stringify({
+          type: "turn.completed",
+          usage: { input_tokens: 220, cached_input_tokens: 40, output_tokens: 50 },
+        }),
+      ].join("\n")
+    );
+
+    expect(evidence).toMatchObject({
+      usageAuthority: "structured_cli",
+      usageUnavailableReason: null,
+      inputTokens: 220,
+      cachedInputTokens: 40,
+      cacheCreationInputTokens: null,
+      outputTokens: 50,
+      totalCostUsd: null,
+      turnCount: null,
+      sessionId: "thread-1",
+    });
+  });
+
+  test("fails closed on missing or malformed structured usage", () => {
+    const missing = parseClaudeStructuredOutput(
+      JSON.stringify({ type: "result", result: "still captured" })
+    );
+    const malformed = parseCodexStructuredOutput(
+      '{"type":"thread.started","thread_id":"thread-1"}\nnot-json\n'
+    );
+
+    expect(missing).toMatchObject({
+      usageAuthority: "unavailable",
+      usageUnavailableReason: "missing_structured_usage",
+      inputTokens: null,
+      cachedInputTokens: null,
+      cacheCreationInputTokens: null,
+      outputTokens: null,
+      finalResponse: "still captured",
+    });
+    expect(malformed).toMatchObject({
+      usageAuthority: "unavailable",
+      usageUnavailableReason: "malformed_structured_output",
+      inputTokens: null,
+      cachedInputTokens: null,
+      outputTokens: null,
+    });
   });
 });
 
 describe("run-skill-evals execution", () => {
+  test("keeps a writable skills profile inside a complete disposable repository", () => {
+    const disposableBoundary = tempPath("benchmark-disposable-boundary");
+    const disposableRepo = join(disposableBoundary, "repo");
+    const disposableHome = join(disposableBoundary, "home");
+    const ambientHome = join(disposableBoundary, "ambient-home");
+    const stubDir = join(disposableRepo, "bin");
+    const configPath = join(disposableRepo, "evals", "benchmark.config.json");
+    const evalsPath = join(disposableRepo, "evals", "evals.json");
+    const workspaceRoot = join(disposableRepo, ".ai", "harness", "evals", "workspace");
+    const summaryPath = join(disposableRepo, "reports", "benchmark.md");
+    mkdirSync(stubDir, { recursive: true });
+    mkdirSync(disposableHome, { recursive: true });
+    mkdirSync(ambientHome, { recursive: true });
+    mkdirSync(join(disposableRepo, "evals", "fixtures"), { recursive: true });
+    mkdirSync(join(disposableRepo, "assets", "templates"), { recursive: true });
+    cpSync(join(ROOT, "evals", "fixtures", "fix-agents"), join(disposableRepo, "evals", "fixtures", "fix-agents"), {
+      recursive: true,
+    });
+    cpSync(join(ROOT, "assets", "templates", "helpers"), join(disposableRepo, "assets", "templates", "helpers"), {
+      recursive: true,
+    });
+    const verifyScript = join(disposableRepo, "assets", "templates", "helpers", "verify-contract.sh");
+    const realVerifyScript = join(disposableRepo, "assets", "templates", "helpers", "verify-contract-real.sh");
+    cpSync(verifyScript, realVerifyScript);
+    writeExecutable(
+      verifyScript,
+      `#!/usr/bin/env bash\nset -euo pipefail\nprintf "%s|%s\\n" "$HOME" "\${REPO_HARNESS_SOURCE_ROOT:-}" > "$EVAL_GRADER_ENV_PROOF"\nexec "$(dirname "$0")/verify-contract-real.sh" "$@"\n`,
+    );
+    const hooksDir = join(disposableBoundary, "git-hooks");
+    mkdirSync(hooksDir, { recursive: true });
+    writeExecutable(
+      join(hooksDir, "pre-commit"),
+      `#!/usr/bin/env bash\nset -euo pipefail\nprintf "%s|%s\\n" "$HOME" "\${REPO_HARNESS_SOURCE_ROOT:-}" > "$EVAL_GIT_ENV_PROOF"\n`,
+    );
+    writeFileSync(join(disposableHome, ".gitconfig"), `[core]\n\thooksPath = ${hooksDir}\n`, "utf-8");
+    cpSync(join(ROOT, "SKILL.md"), join(disposableRepo, "SKILL.md"));
+    cpSync(join(ROOT, "package.json"), join(disposableRepo, "package.json"));
+    expect(spawnSync("git", ["init"], { cwd: disposableRepo, encoding: "utf-8" }).status).toBe(0);
+    const stubs = createStubCommands(stubDir);
+    writeEvalManifest(evalsPath);
+    writeFileSync(
+      configPath,
+      `${JSON.stringify({
+        workspaceRoot: "../repo-harness-workspace",
+        summaryPath: "reports/benchmark.md",
+        agents: {
+          claude: { command: stubs.claude, args: [] },
+          codex: {
+            command: stubs.codex,
+            args: [],
+            env: { REPO_HARNESS_SOURCE_ROOT: "/malicious/config/source-root" },
+          },
+        },
+        profiles: { with_skill: { skillPath: "." }, without_skill: {} },
+      }, null, 2)}\n`,
+      "utf-8",
+    );
+
+    const originalSourceRoot = process.env.REPO_HARNESS_SOURCE_ROOT;
+    const originalHome = process.env.HOME;
+    const originalGitProof = process.env.EVAL_GIT_ENV_PROOF;
+    const originalGraderProof = process.env.EVAL_GRADER_ENV_PROOF;
+    const gitProof = join(disposableBoundary, "git-env-proof.txt");
+    const graderProof = join(disposableBoundary, "grader-env-proof.txt");
+    process.env.HOME = ambientHome;
+    process.env.REPO_HARNESS_SOURCE_ROOT = ROOT;
+    process.env.EVAL_GIT_ENV_PROOF = gitProof;
+    process.env.EVAL_GRADER_ENV_PROOF = graderProof;
+    try {
+      const report = runSkillEvals({
+        repoRoot: disposableRepo,
+        home: disposableHome,
+        requireDisposableBoundary: true,
+        configPath,
+        evalsPath,
+        agent: "codex",
+        profile: "with_skill",
+        evalFilters: ["repair-agents-task-sync"],
+        now: new Date("2026-07-12T22:30:00Z"),
+      });
+
+      const canonicalRepo = realpathSync(disposableRepo);
+      expect(report.workspaceRoot.startsWith(canonicalRepo)).toBe(true);
+      expect(report.summaryPath).toBe(join(canonicalRepo, "reports", "benchmark.md"));
+      expect(report.manifestPath.startsWith(join(canonicalRepo, ".ai", "harness", "evals", "workspace"))).toBe(true);
+      expect(existsSync(report.summaryPath)).toBe(true);
+      expect(existsSync(report.manifestPath)).toBe(true);
+      expect(report.records).toHaveLength(1);
+      expect(readFileSync(join(report.records[0].workspacePath, ".observed-home"), "utf-8").trim()).toBe(realpathSync(disposableHome));
+      expect(readFileSync(join(report.records[0].workspacePath, ".observed-source-root"), "utf-8").trim()).toBe("");
+      expect(readFileSync(gitProof, "utf-8").trim()).toBe(`${realpathSync(disposableHome)}|`);
+      expect(readFileSync(graderProof, "utf-8").trim()).toBe(`${realpathSync(disposableHome)}|`);
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (originalSourceRoot === undefined) delete process.env.REPO_HARNESS_SOURCE_ROOT;
+      else process.env.REPO_HARNESS_SOURCE_ROOT = originalSourceRoot;
+      if (originalGitProof === undefined) delete process.env.EVAL_GIT_ENV_PROOF;
+      else process.env.EVAL_GIT_ENV_PROOF = originalGitProof;
+      if (originalGraderProof === undefined) delete process.env.EVAL_GRADER_ENV_PROOF;
+      else process.env.EVAL_GRADER_ENV_PROOF = originalGraderProof;
+      rmSync(disposableBoundary, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("blocks disposable mode against the source checkout before writing", () => {
+    const disposableHome = tempPath("benchmark-disposable-home");
+    try {
+      expect(() => runSkillEvals({
+        repoRoot: ROOT,
+        home: disposableHome,
+        requireDisposableBoundary: true,
+        agent: "codex",
+        profile: "with_skill",
+        evalFilters: ["repair-agents-task-sync"],
+      })).toThrow("refuses the source checkout");
+    } finally {
+      rmSync(disposableHome, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("blocks swapped source-checkout HOME and real-HOME repo inputs", () => {
+    const boundary = tempPath("benchmark-swapped-boundary");
+    const repo = join(boundary, "repo");
+    const home = join(boundary, "home");
+    mkdirSync(repo, { recursive: true });
+    mkdirSync(home, { recursive: true });
+    try {
+      expect(() => assertDisposableRootBoundary({ repoRoot: repo, home: ROOT }))
+        .toThrow("refuses the source checkout as HOME");
+      expect(() => assertDisposableRootBoundary({ repoRoot: process.env.HOME!, home }))
+        .toThrow("refuses the real HOME as repo");
+    } finally {
+      rmSync(boundary, { recursive: true, force: true });
+    }
+  });
+
+  test("blocks a disposable repo/HOME pair nested inside the real HOME tree", () => {
+    const boundary = mkdtempSync(join(homedir(), ".repo-harness-real-home-boundary-"));
+    const repo = join(boundary, "repo");
+    const home = join(boundary, "home");
+    mkdirSync(repo, { recursive: true });
+    mkdirSync(home, { recursive: true });
+    try {
+      expect(() => assertDisposableRootBoundary({ repoRoot: repo, home }))
+        .toThrow("refuses the real HOME as repo");
+    } finally {
+      rmSync(boundary, { recursive: true, force: true });
+    }
+  });
+
+  test("blocks a disposable HOME that is an ancestor containing the real HOME", () => {
+    const realHome = realpathSync(process.env.HOME!);
+    const ancestorHome = dirname(realHome);
+    const repo = tempPath("benchmark-ancestor-repo");
+    try {
+      expect(() => assertDisposableRootBoundary({ repoRoot: repo, home: ancestorHome }))
+        .toThrow("refuses the real HOME");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test("blocks a not-yet-created workspace beneath a symlinked ancestor", () => {
+    const boundary = tempPath("benchmark-symlink-boundary");
+    const repo = join(boundary, "repo");
+    const home = join(boundary, "home");
+    const outside = join(boundary, "outside");
+    mkdirSync(join(repo, "evals"), { recursive: true });
+    mkdirSync(join(repo, "assets", "templates", "helpers"), { recursive: true });
+    mkdirSync(home, { recursive: true });
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(join(repo, "package.json"), "{}\n", "utf-8");
+    writeFileSync(join(repo, "evals", "evals.json"), "{}\n", "utf-8");
+    writeFileSync(join(repo, "evals", "benchmark.config.json"), "{}\n", "utf-8");
+    expect(spawnSync("git", ["init"], { cwd: repo, encoding: "utf-8" }).status).toBe(0);
+    symlinkSync(outside, join(repo, ".ai"), "dir");
+    try {
+      expect(() => assertDisposableEvaluationBoundary({
+        repoRoot: repo,
+        home,
+        evalsPath: join(repo, "evals", "evals.json"),
+        configPath: join(repo, "evals", "benchmark.config.json"),
+        workspaceRoot: join(repo, ".ai", "harness", "evals", "workspace"),
+        summaryPath: join(repo, "evals", "benchmark.md"),
+      })).toThrow("workspace root escapes the disposable repo");
+
+      const evalsPath = join(repo, "evals", "evals.json");
+      const escapedManifest = join(outside, "escaped-evals.json");
+      rmSync(evalsPath);
+      writeFileSync(
+        escapedManifest,
+        `${JSON.stringify({
+          skill_name: "repo-harness",
+          evals: [{
+            id: 1,
+            slug: "escaped",
+            prompt: "escaped",
+            expected_output: "escaped",
+            files: [],
+            graders: {},
+            expectations: [],
+          }],
+        })}\n`,
+        "utf-8",
+      );
+      symlinkSync(escapedManifest, evalsPath);
+      expect(() => runSkillEvals({
+        repoRoot: repo,
+        home,
+        requireDisposableBoundary: true,
+        dryRun: true,
+      })).toThrow("eval manifest escapes the disposable repo");
+    } finally {
+      rmSync(boundary, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("adoption profile injects one validated repo and HOME into both existing commands", () => {
+    const boundary = tempPath("benchmark-adoption-boundary");
+    const repo = join(boundary, "repo");
+    const home = join(boundary, "home");
+    mkdirSync(join(repo, "scripts"), { recursive: true });
+    mkdirSync(join(repo, "src", "cli"), { recursive: true });
+    mkdirSync(home, { recursive: true });
+    writeFileSync(join(repo, "package.json"), "{}\n", "utf-8");
+    expect(spawnSync("git", ["init"], { cwd: repo, encoding: "utf-8" }).status).toBe(0);
+    writeFileSync(
+      join(repo, "scripts", "inspect-project-state.ts"),
+      `import { writeFileSync } from "fs";\nwriteFileSync("inspector-proof.json", JSON.stringify({ home: process.env.HOME, sourceRoot: process.env.REPO_HARNESS_SOURCE_ROOT ?? null, args: process.argv.slice(2) }));\nconsole.log("inspector-ok");\n`,
+      "utf-8",
+    );
+    writeFileSync(
+      join(repo, "src", "cli", "index.ts"),
+      `import { writeFileSync } from "fs";\nwriteFileSync("init-proof.json", JSON.stringify({ home: process.env.HOME, sourceRoot: process.env.REPO_HARNESS_SOURCE_ROOT ?? null, args: process.argv.slice(2) }));\nconsole.log("init-ok");\n`,
+      "utf-8",
+    );
+
+    const originalSourceRoot = process.env.REPO_HARNESS_SOURCE_ROOT;
+    process.env.REPO_HARNESS_SOURCE_ROOT = ROOT;
+    try {
+      const report = runDisposableAdoptionProfile({ repoRoot: repo, home });
+      const canonicalRepo = realpathSync(repo);
+      const canonicalHome = realpathSync(home);
+      const inspector = JSON.parse(readFileSync(join(repo, "inspector-proof.json"), "utf-8"));
+      const init = JSON.parse(readFileSync(join(repo, "init-proof.json"), "utf-8"));
+
+      expect(report.repoRoot).toBe(canonicalRepo);
+      expect(report.home).toBe(canonicalHome);
+      expect(inspector).toEqual({ home: canonicalHome, sourceRoot: null, args: ["--repo", canonicalRepo, "--format", "json"] });
+      expect(init).toEqual({ home: canonicalHome, sourceRoot: null, args: ["init", "--repo", canonicalRepo, "--dry-run", "--json"] });
+    } finally {
+      if (originalSourceRoot === undefined) delete process.env.REPO_HARNESS_SOURCE_ROOT;
+      else process.env.REPO_HARNESS_SOURCE_ROOT = originalSourceRoot;
+      rmSync(boundary, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("runs a filtered benchmark matrix with grader metadata", () => {
     const tempDir = tempPath("benchmark-run");
     const stubDir = join(tempDir, "bin");
@@ -203,6 +573,8 @@ describe("run-skill-evals execution", () => {
       expect(summary).toContain("effectiveness_authority | authoritative");
       expect(summary).toContain("## claude / with_skill");
       expect(summary).toContain("## codex / without_skill");
+      expect(summary).toContain("without_skill` is a skill-disabled baseline");
+      expect(summary).toContain("it is not a host-isolated No Harness profile");
       expect(summary).toContain("repair-agents-task-sync");
       expect(summary).toContain("graders pass");
 
@@ -214,6 +586,20 @@ describe("run-skill-evals execution", () => {
       expect(claudeWithSkill?.graderStatus).toBe("passed");
       expect(claudeWithSkill?.graderSummary.total).toBeGreaterThan(0);
       expect(claudeWithSkill?.graderReportPath).not.toBeNull();
+      expect(claudeWithSkill?.usageAuthority).toBe("structured_cli");
+      expect(claudeWithSkill?.inputTokens).toBe(101);
+      expect(claudeWithSkill?.cachedInputTokens).toBe(11);
+      expect(claudeWithSkill?.cacheCreationInputTokens).toBe(7);
+      expect(claudeWithSkill?.outputTokens).toBe(23);
+      expect(claudeWithSkill?.totalCostUsd).toBe(0.125);
+      expect(claudeWithSkill?.turnCount).toBe(2);
+      expect(claudeWithSkill?.sessionId).toBe("claude-session");
+      expect(claudeWithSkill?.changedFileCount).toBe(claudeWithSkill?.changedFiles.length);
+      expect(claudeWithSkill?.artifactCount).toBeNull();
+      expect(readFileSync(claudeWithSkill!.stdoutPath, "utf-8")).toContain('"type":"result"');
+      expect(readFileSync(claudeWithSkill!.finalResponsePath, "utf-8")).toContain(
+        "claude with skill"
+      );
       expect(existsSync(join(claudeWithSkill!.workspacePath, ".claude/skills/repo-harness"))).toBe(
         true
       );
@@ -222,6 +608,17 @@ describe("run-skill-evals execution", () => {
         (record) => record.agent === "codex" && record.profile === "with_skill"
       );
       expect(codexWithSkill).toBeDefined();
+      expect(codexWithSkill?.usageAuthority).toBe("structured_cli");
+      expect(codexWithSkill?.inputTokens).toBe(201);
+      expect(codexWithSkill?.cachedInputTokens).toBe(21);
+      expect(codexWithSkill?.cacheCreationInputTokens).toBeNull();
+      expect(codexWithSkill?.outputTokens).toBe(34);
+      expect(codexWithSkill?.totalCostUsd).toBeNull();
+      expect(codexWithSkill?.turnCount).toBeNull();
+      expect(codexWithSkill?.sessionId).toBe("codex-thread");
+      expect(readFileSync(codexWithSkill!.stdoutPath, "utf-8")).toContain(
+        '"type":"turn.completed"'
+      );
       expect(readFileSync(join(codexWithSkill!.workspacePath, "AGENTS.md"), "utf-8")).toContain(
         "Benchmark Skill Wrapper"
       );
@@ -229,7 +626,81 @@ describe("run-skill-evals execution", () => {
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
+
+  test("keeps agent and grader status when structured usage is malformed", () => {
+    const tempDir = tempPath("benchmark-malformed-usage");
+    const stubDir = join(tempDir, "bin");
+    mkdirSync(stubDir, { recursive: true });
+    const commandPath = join(stubDir, "codex-malformed-stub.sh");
+    const summaryPath = join(tempDir, "benchmark.md");
+    const workspaceRoot = join(tempDir, "workspace");
+    const configPath = join(tempDir, "benchmark.config.json");
+    const evalsPath = join(tempDir, "evals.json");
+
+    writeExecutable(
+      commandPath,
+      `#!/usr/bin/env bash
+set -euo pipefail
+output=""
+prev=""
+for arg in "$@"; do
+  if [[ "$prev" == "-o" ]]; then
+    output="$arg"
+  fi
+  prev="$arg"
+done
+printf "skill response survives malformed usage\\n" > "$output"
+printf '{"type":"thread.started","thread_id":"thread-malformed"}\\n'
+printf 'not-json\\n'
+`
+    );
+    writeEvalManifest(evalsPath);
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        workspaceRoot,
+        summaryPath,
+        agents: {
+          claude: { command: commandPath, args: [] },
+          codex: { command: commandPath, args: [] },
+        },
+        profiles: { with_skill: { skillPath: ROOT }, without_skill: {} },
+      }) + "\n",
+      "utf-8"
+    );
+
+    try {
+      const report = runSkillEvals({
+        repoRoot: ROOT,
+        configPath,
+        evalsPath,
+        agent: "codex",
+        profile: "without_skill",
+        evalFilters: ["repair-agents-task-sync"],
+        now: new Date("2026-03-06T01:02:03Z"),
+      });
+
+      expect(report.records).toHaveLength(1);
+      expect(report.records[0]).toMatchObject({
+        status: "success",
+        agentStatus: "success",
+        graderStatus: "passed",
+        usageAuthority: "unavailable",
+        usageUnavailableReason: "malformed_structured_output",
+        inputTokens: null,
+        cachedInputTokens: null,
+        cacheCreationInputTokens: null,
+        outputTokens: null,
+      });
+      expect(readFileSync(report.records[0].stdoutPath, "utf-8")).toContain("not-json");
+      expect(readFileSync(report.records[0].finalResponsePath, "utf-8")).toContain(
+        "skill response survives malformed usage"
+      );
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   test("records failures when graders fail even if agent exits 0", () => {
     const tempDir = tempPath("benchmark-grader-fail");
@@ -288,7 +759,7 @@ describe("run-skill-evals execution", () => {
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test("records agent process failures without crashing the full report generation", () => {
     const tempDir = tempPath("benchmark-fail");
@@ -346,7 +817,7 @@ describe("run-skill-evals execution", () => {
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test("marks all-dry-run benchmark summaries as non-authoritative", () => {
     const tempDir = tempPath("benchmark-dry-run");
@@ -402,5 +873,5 @@ describe("run-skill-evals execution", () => {
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 });

@@ -2,14 +2,15 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { fileURLToPath } from 'url';
 import { execSync, spawnSync } from 'child_process';
 import {
   clearRegisteredChecks,
   formatDoctor,
+  readLatestPackageVersion,
   registerCheck,
   runDoctor,
 } from '../../src/cli/commands/doctor';
-import { ROUTES } from '../../src/cli/hook/route-registry';
 
 const DOCTOR_CHECK_TIMEOUT_MS = 15000;
 
@@ -49,7 +50,7 @@ function writeExecutable(filePath: string, content: string): void {
 }
 
 function withTempRepo(
-  opts: { optIn: boolean; scripts?: readonly string[]; pinRepoHooks?: boolean },
+  opts: { optIn: boolean; scripts?: readonly string[] },
   fn: (repoRoot: string) => void,
 ): void {
   const repoRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'repo-harness-doctor-repo-')));
@@ -59,9 +60,6 @@ function withTempRepo(
     fs.mkdirSync(path.join(repoRoot, '.ai/harness'), { recursive: true });
     if (opts.optIn) {
       fs.writeFileSync(path.join(repoRoot, '.ai/harness/workflow-contract.json'), '{}\n');
-    }
-    if (opts.pinRepoHooks) {
-      fs.writeFileSync(path.join(repoRoot, '.ai/harness/policy.json'), '{ "hook_source": "repo" }\n');
     }
     for (const script of opts.scripts ?? []) {
       writeExecutable(path.join(repoRoot, '.ai/hooks', script), '#!/bin/bash\nexit 0\n');
@@ -99,26 +97,9 @@ function writeFakeCodeGraph(fakeBin: string, logFile: string): void {
   );
 }
 
-function writeFakeGbrain(fakeBin: string): void {
+function writeFakeBunx(fakeBin: string): void {
   writeExecutable(
-    path.join(fakeBin, 'gbrain'),
-    [
-      '#!/bin/bash',
-      'set -euo pipefail',
-      'case "$1 ${2:-}" in',
-      '  "--version ") echo "gbrain 0.12.0" ;;',
-      '  "doctor --json") echo "{\\"status\\":\\"warnings\\",\\"health_score\\":90}" ;;',
-      '  "integrations list") echo "{\\"local\\":[]}" ;;',
-      '  *) exit 1 ;;',
-      'esac',
-      '',
-    ].join('\n'),
-  );
-}
-
-function writeFakeNpx(fakeBin: string): void {
-  writeExecutable(
-    path.join(fakeBin, 'npx'),
+    path.join(fakeBin, 'bunx'),
     [
       '#!/bin/bash',
       'set -euo pipefail',
@@ -140,6 +121,7 @@ describe('doctor command (Phase 1C)', () => {
       const ids = r.checks.map((c) => c.id);
       expect(ids).toContain('cli-on-path');
       expect(ids).toContain('cli-version');
+      expect(ids).toContain('codex-cli-version');
       expect(ids).toContain('cli-update');
       expect(ids).toContain('codex-adapter');
       expect(ids).toContain('claude-adapter');
@@ -149,7 +131,7 @@ describe('doctor command (Phase 1C)', () => {
       expect(ids).toContain('claude-codegraph-mcp');
       expect(ids).toContain('codegraph-index');
       expect(ids).toContain('security-config');
-      expect(ids).toContain('repo-hook-scripts');
+      expect(ids).toContain('typed-hook-routes');
     });
   }, DOCTOR_CHECK_TIMEOUT_MS);
 
@@ -174,44 +156,64 @@ describe('doctor command (Phase 1C)', () => {
     });
   }, DOCTOR_CHECK_TIMEOUT_MS);
 
-  test('repo-hook-scripts reports n/a for non-opt-in repos', () => {
+  test('codex-cli-version reports n/a when codex is absent from PATH', () => {
+    const envRoot = setupFakeEnvironment('repo-harness-doctor-codex-absent');
+    try {
+      withEnv({ HOME: envRoot.home, PATH: envRoot.fakeBin }, () => {
+        const r = runDoctor(envRoot.root);
+        const codex = r.checks.find((c) => c.id === 'codex-cli-version')!;
+        expect(codex.status).toBe('na');
+        expect(codex.detail).toBe('codex not found on PATH');
+      });
+    } finally {
+      fs.rmSync(envRoot.root, { recursive: true, force: true });
+    }
+  }, DOCTOR_CHECK_TIMEOUT_MS);
+
+  for (const expected of [
+    { version: '0.143.0', status: 'warn', stable: true },
+    { version: '0.144.0', status: 'ok', stable: true },
+    { version: '0.144.0-alpha.4', status: 'warn', stable: false },
+  ] as const) {
+    test(`codex-cli-version reports ${expected.status} for Codex ${expected.version}`, () => {
+      const envRoot = setupFakeEnvironment(`repo-harness-doctor-codex-${expected.version}`);
+      const fakeCodex = path.join(envRoot.fakeBin, 'codex');
+      try {
+        writeExecutable(fakeCodex, `#!/bin/bash\nprintf 'codex-cli ${expected.version}\\n'\n`);
+        withEnv({ HOME: envRoot.home, PATH: envRoot.fakeBin }, () => {
+          const r = runDoctor(envRoot.root);
+          const codex = r.checks.find((c) => c.id === 'codex-cli-version')!;
+          expect(codex.status).toBe(expected.status);
+          expect(codex.detail).toContain(`path=${fakeCodex}`);
+          if (expected.stable) {
+            expect(codex.detail).toContain(`current=${expected.version}`);
+            expect(codex.detail).toContain('minimum=0.144.0');
+          } else {
+            expect(codex.detail).toContain(`unable to parse version from "codex-cli ${expected.version}"`);
+          }
+        });
+      } finally {
+        fs.rmSync(envRoot.root, { recursive: true, force: true });
+      }
+    }, DOCTOR_CHECK_TIMEOUT_MS);
+  }
+
+  test('typed-hook-routes reports n/a for non-opt-in repos', () => {
     withTempRepo({ optIn: false }, (repoRoot) => {
       const r = runDoctor(repoRoot);
-      const hooks = r.checks.find((c) => c.id === 'repo-hook-scripts')!;
+      const hooks = r.checks.find((c) => c.id === 'typed-hook-routes')!;
       expect(hooks.status).toBe('na');
       expect(hooks.detail).toContain('not opted in');
     });
   }, DOCTOR_CHECK_TIMEOUT_MS);
 
-  test('repo-hook-scripts warns when pinned repo route scripts are missing', () => {
-    withTempRepo({ optIn: true, pinRepoHooks: true }, (repoRoot) => {
-      const r = runDoctor(repoRoot);
-      const hooks = r.checks.find((c) => c.id === 'repo-hook-scripts')!;
-      expect(hooks.status).toBe('warn');
-      expect(hooks.detail).toContain('source=repo-pin');
-      expect(hooks.detail).toContain('security-sentinel.sh');
-      expect(hooks.detail).toContain(`repo-harness adopt --repo ${repoRoot}`);
-    });
-  }, DOCTOR_CHECK_TIMEOUT_MS);
-
-  test('repo-hook-scripts passes when all pinned route scripts are present', () => {
-    const scripts = [...new Set(ROUTES.flatMap((route) => [...route.scripts]))];
-    withTempRepo({ optIn: true, scripts, pinRepoHooks: true }, (repoRoot) => {
-      const r = runDoctor(repoRoot);
-      const hooks = r.checks.find((c) => c.id === 'repo-hook-scripts')!;
-      expect(hooks.status).toBe('ok');
-      expect(hooks.detail).toContain('route scripts present');
-      expect(hooks.detail).toContain('source=repo-pin');
-    });
-  }, DOCTOR_CHECK_TIMEOUT_MS);
-
-  test('repo-hook-scripts resolves the packaged runtime when the repo is not pinned', () => {
+  test('typed-hook-routes verifies the exhaustive in-process binding', () => {
     withTempRepo({ optIn: true }, (repoRoot) => {
       const r = runDoctor(repoRoot);
-      const hooks = r.checks.find((c) => c.id === 'repo-hook-scripts')!;
+      const hooks = r.checks.find((c) => c.id === 'typed-hook-routes')!;
       expect(hooks.status).toBe('ok');
-      expect(hooks.detail).toContain('source=packaged');
-      expect(hooks.detail).toContain(path.join('assets', 'hooks'));
+      expect(hooks.detail).toContain('all 11 public routes');
+      expect(hooks.detail).toContain('typed in-process handler');
     });
   }, DOCTOR_CHECK_TIMEOUT_MS);
 
@@ -246,6 +248,53 @@ describe('doctor command (Phase 1C)', () => {
       });
     });
   }, DOCTOR_CHECK_TIMEOUT_MS);
+
+  test('registry version lookup uses the running Bun and ignores repo PATH package-manager shims', () => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'repo-harness-version-lookup-')));
+    const fakeBin = path.join(root, 'bin');
+    const probe = path.join(root, 'bun-probe');
+    const probeLog = path.join(root, 'probe.log');
+    const fakeNpmLog = path.join(root, 'fake-npm.log');
+    const previousExecPath = process.execPath;
+    try {
+      fs.mkdirSync(fakeBin, { recursive: true });
+      writeExecutable(
+        probe,
+        [
+          '#!/bin/bash',
+          'set -euo pipefail',
+          `printf '%s\\n%s\\n' "$PWD" "$*" > "${probeLog}"`,
+          'if [[ ! -f "$PWD/package.json" ]]; then echo "missing package.json in cwd" >&2; exit 43; fi',
+          'printf \'"99.0.0"\\n\'',
+          '',
+        ].join('\n'),
+      );
+      writeExecutable(
+        path.join(fakeBin, 'npm'),
+        `#!/bin/bash\nprintf '%s\\n' "$*" > "${fakeNpmLog}"\nexit 42\n`,
+      );
+      Object.defineProperty(process, 'execPath', { value: probe, configurable: true });
+
+      const env: NodeJS.ProcessEnv = {
+        ...process.env,
+        PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+      };
+      delete env.REPO_HARNESS_LATEST_VERSION;
+      const result = readLatestPackageVersion(env);
+
+      expect(result).toEqual({ version: '99.0.0' });
+      const [cwd, args] = fs.readFileSync(probeLog, 'utf-8').trim().split('\n');
+      const packageRoot = path.dirname(fileURLToPath(new URL('../../package.json', import.meta.url)));
+      expect(fs.realpathSync(cwd)).toBe(fs.realpathSync(packageRoot));
+      expect(args).toBe(
+        'pm view repo-harness version --json --registry=https://registry.npmjs.org',
+      );
+      expect(fs.existsSync(fakeNpmLog)).toBe(false);
+    } finally {
+      Object.defineProperty(process, 'execPath', { value: previousExecPath, configurable: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 
   test('codex-trust-state counts user-level [hooks.state] lines when present', () => {
     withTempHome((home) => {
@@ -370,8 +419,7 @@ describe('doctor command (Phase 1C)', () => {
         JSON.stringify({ mcpServers: { codegraph: { type: 'stdio', command: 'codegraph', args: ['serve', '--mcp'] } } }),
       );
       writeFakeCodeGraph(envRoot.fakeBin, logFile);
-      writeFakeGbrain(envRoot.fakeBin);
-      writeFakeNpx(envRoot.fakeBin);
+      writeFakeBunx(envRoot.fakeBin);
 
       const root = path.join(import.meta.dir, '..', '..');
       const res = spawnSync('bun', [path.join(root, 'src/cli/index.ts'), 'doctor', '--json'], {

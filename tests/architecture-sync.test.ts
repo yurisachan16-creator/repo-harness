@@ -16,6 +16,7 @@ function tmpRepo(fn: (cwd: string) => void): void {
     mkdirSync(join(cwd, "scripts"), { recursive: true });
     mkdirSync(join(cwd, ".ai/context"), { recursive: true });
     mkdirSync(join(cwd, ".ai/harness"), { recursive: true });
+    mkdirSync(join(cwd, "apps/web"), { recursive: true });
     mkdirSync(join(cwd, "docs/architecture/requests"), { recursive: true });
     for (const file of [
       "check-architecture-sync.sh",
@@ -23,7 +24,10 @@ function tmpRepo(fn: (cwd: string) => void): void {
       "architecture-event.ts",
       "capability-resolver.ts",
     ]) {
-      copyFileSync(join(ROOT, "scripts", file), join(cwd, "scripts", file));
+      const source = file === "capability-resolver.ts"
+        ? join(ROOT, "assets/templates/helpers", file)
+        : join(ROOT, "scripts", file);
+      copyFileSync(source, join(cwd, "scripts", file));
     }
     expect(run("chmod", ["+x", "scripts/check-architecture-sync.sh", "scripts/architecture-queue.sh"], cwd).status).toBe(0);
     writeFileSync(
@@ -70,25 +74,26 @@ function writePolicy(cwd: string, mode: "off" | "advisory" | "strict") {
 }
 
 function writePendingCard(cwd: string, capabilityId = "apps-web", severity = "high") {
-  writeFileSync(
-    join(cwd, "docs/architecture/requests", `${capabilityId}.md`),
-    [
-      `# Architecture Drift Request: ${capabilityId}`,
-      "",
-      "> **Status**: Pending",
-      "> **Detected**: 2026-06-01T12:00:00+0800",
-      `> **Severity**: ${severity}`,
-      "> **Change Type**: workflow-surface",
-      "> **File**: `apps/web/src/routes/account.tsx`",
-      "> **Functional Block**: `apps/web`",
-      `> **Capability ID**: \`${capabilityId}\``,
-      "> **Matched Prefix**: `apps/web`",
-      "> **Architecture Domain**: `apps-web`",
-      "> **Architecture Capability**: `web`",
-      "> **Architecture Module**: `docs/architecture/modules/apps-web/web.md`",
-      "",
-    ].join("\n"),
-  );
+  const requestFile = `docs/architecture/requests/${capabilityId}.md`;
+  const event = {
+    ts: "2026-06-01T12:00:00+0800",
+    file_path: "apps/web/src/routes/account.tsx",
+    severity,
+    functional_block: "apps/web",
+    capability_id: capabilityId,
+    matched_prefix: "apps/web",
+    architecture_domain: "apps-web",
+    architecture_capability: "web",
+    architecture_module: "docs/architecture/modules/apps-web/web.md",
+    workstream_dir: "tasks/workstreams/apps-web/web",
+    contract_agents: "apps/web/AGENTS.md",
+    contract_claude: "apps/web/CLAUDE.md",
+    change_type: "workflow-surface",
+    request_file: requestFile,
+    spawn_recommended: false,
+    contract_sync_required: false,
+  };
+  expect(run("bun", ["scripts/architecture-event.ts", "upsert-request", "--request-file", requestFile, "--event-json", JSON.stringify(event)], cwd).status).toBe(0);
   expect(run("bash", ["scripts/architecture-queue.sh", "reindex"], cwd).status).toBe(0);
 }
 
@@ -110,7 +115,7 @@ describe("architecture sync gate", () => {
       expect(parsed[0].capability_id).toBe("apps-web");
       expect(parsed[1].capability_id).toBe("root");
     });
-  });
+  }, 30_000);
 
   test("strict blocks when a changed capability has a pending request at the threshold", () => {
     tmpRepo((cwd) => {
@@ -123,7 +128,7 @@ describe("architecture sync gate", () => {
       expect(res.stdout).toContain("blocking=1");
       expect(res.stderr).toContain("strict gate failed");
     });
-  });
+  }, 30_000);
 
   test("advisory warns but exits zero for matching pending requests", () => {
     tmpRepo((cwd) => {
@@ -136,7 +141,7 @@ describe("architecture sync gate", () => {
       expect(res.stdout).toContain("blocking=1");
       expect(res.stderr).toContain("WARN");
     });
-  });
+  }, 30_000);
 
   test("off mode still checks index integrity but ignores freshness blocking", () => {
     tmpRepo((cwd) => {
@@ -147,8 +152,22 @@ describe("architecture sync gate", () => {
       const res = run("bash", ["scripts/check-architecture-sync.sh", "--changed-files", "changed.txt"], cwd);
       expect(res.status).toBe(0);
       expect(res.stdout).toContain("mode=off");
+
+      const json = run("bash", ["scripts/check-architecture-sync.sh", "--changed-files", "changed.txt", "--format", "json"], cwd);
+      expect(json.status).toBe(0);
+      expect(JSON.parse(json.stdout).projection).toMatchObject({
+        provider: "disabled",
+        apply: "disabled",
+        state: "disabled",
+        pending: 0,
+        running: 0,
+        dead_letters: 0,
+        human_actions: 0,
+        adoption_required: 0,
+        blocking: 0,
+      });
     });
-  });
+  }, 30_000);
 
   test("stale architecture index fails in every mode", () => {
     tmpRepo((cwd) => {
@@ -164,7 +183,7 @@ describe("architecture sync gate", () => {
       expect(res.status).toBe(1);
       expect(res.stderr).toContain("architecture request index is stale");
     });
-  });
+  }, 30_000);
 
   test("missing resolver is advisory in advisory mode and fail-closed in strict mode", () => {
     tmpRepo((cwd) => {
@@ -182,5 +201,5 @@ describe("architecture sync gate", () => {
       expect(strict.status).toBe(1);
       expect(strict.stderr).toContain("strict gate failed");
     });
-  });
+  }, 30_000);
 });

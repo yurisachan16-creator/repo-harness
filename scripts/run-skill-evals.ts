@@ -6,6 +6,7 @@ import {
   lstatSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   readdirSync,
   rmSync,
   symlinkSync,
@@ -67,7 +68,17 @@ export interface RunSkillEvalsOptions {
   repoRoot?: string;
   evalsPath?: string;
   configPath?: string;
+  home?: string;
+  requireDisposableBoundary?: boolean;
+  runAdoptionProfile?: boolean;
   now?: Date;
+}
+
+export interface AdoptionProfileReport {
+  repoRoot: string;
+  home: string;
+  inspector: { stdout: string; stderr: string };
+  initDryRun: { stdout: string; stderr: string };
 }
 
 export interface RunMetadata {
@@ -103,9 +114,38 @@ export interface RunMetadata {
   gitDiffPath: string;
   diffStat: string;
   changedFiles: string[];
+  changedFileCount: number;
   finalResponseExcerpt: string;
-  model?: string | null;
-  sessionId?: string | null;
+  usageAuthority: "structured_cli" | "unavailable";
+  usageUnavailableReason:
+    | "dry_run"
+    | "malformed_structured_output"
+    | "missing_structured_usage"
+    | "malformed_structured_usage"
+    | null;
+  inputTokens: number | null;
+  cachedInputTokens: number | null;
+  cacheCreationInputTokens: number | null;
+  outputTokens: number | null;
+  totalCostUsd: number | null;
+  turnCount: number | null;
+  artifactCount: number | null;
+  model: string | null;
+  sessionId: string | null;
+}
+
+export interface ProviderStructuredEvidence {
+  usageAuthority: RunMetadata["usageAuthority"];
+  usageUnavailableReason: RunMetadata["usageUnavailableReason"];
+  inputTokens: number | null;
+  cachedInputTokens: number | null;
+  cacheCreationInputTokens: number | null;
+  outputTokens: number | null;
+  totalCostUsd: number | null;
+  turnCount: number | null;
+  model: string | null;
+  sessionId: string | null;
+  finalResponse: string | null;
 }
 
 export interface IterationReport {
@@ -189,6 +229,108 @@ function ensureDir(path: string): void {
 
 function resolveRepoPath(repoRoot: string, maybeRelative: string): string {
   return isAbsolute(maybeRelative) ? maybeRelative : resolve(repoRoot, maybeRelative);
+}
+
+function canonicalExistingPath(path: string, label: string): string {
+  const resolved = resolve(path);
+  if (!existsSync(resolved)) {
+    throw new Error(`Disposable evaluation ${label} does not exist: ${resolved}`);
+  }
+  return realpathSync(resolved);
+}
+
+function isInside(root: string, candidate: string): boolean {
+  const rel = relative(root, candidate);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+function nearestExistingAncestor(path: string): string {
+  let current = resolve(path);
+  while (!existsSync(current)) {
+    const parent = dirname(current);
+    if (parent === current) return current;
+    current = parent;
+  }
+  return realpathSync(current);
+}
+
+function assertDisposablePaths(params: {
+  repoRoot: string;
+  declaredRepoRoot: string;
+  paths: ReadonlyArray<readonly [label: string, path: string]>;
+}): void {
+  for (const [label, path] of params.paths) {
+    const declaredPath = resolve(path);
+    const existingAncestorEscapes = !isInside(params.repoRoot, nearestExistingAncestor(declaredPath));
+    if (!isInside(params.declaredRepoRoot, declaredPath) || existingAncestorEscapes) {
+      throw new Error(`Disposable evaluation ${label} escapes the disposable repo: ${path}`);
+    }
+  }
+}
+
+export function assertDisposableRootBoundary(params: {
+  repoRoot: string;
+  home?: string;
+}): { repoRoot: string; home: string } {
+  const sourceRoot = canonicalExistingPath(REPO_ROOT, "source checkout");
+  const repoRoot = canonicalExistingPath(params.repoRoot, "repo");
+  if (!params.home) {
+    throw new Error("Disposable evaluation requires an explicit --home path");
+  }
+  const home = canonicalExistingPath(params.home, "HOME");
+  const realHome = process.env.HOME && existsSync(process.env.HOME)
+    ? realpathSync(process.env.HOME)
+    : null;
+
+  if (repoRoot === sourceRoot || isInside(sourceRoot, repoRoot)) {
+    throw new Error("Disposable evaluation refuses the source checkout as repo");
+  }
+  if (realHome && (repoRoot === realHome || isInside(realHome, repoRoot) || isInside(repoRoot, realHome))) {
+    throw new Error("Disposable evaluation refuses the real HOME as repo");
+  }
+  if (home === sourceRoot || isInside(sourceRoot, home)) {
+    throw new Error("Disposable evaluation refuses the source checkout as HOME");
+  }
+  if (realHome && (home === realHome || isInside(realHome, home) || isInside(home, realHome))) {
+    throw new Error("Disposable evaluation refuses the real HOME");
+  }
+  if (dirname(repoRoot) !== dirname(home) || repoRoot === home) {
+    throw new Error("Disposable evaluation requires sibling repo and HOME directories under one disposable parent");
+  }
+  for (const required of [".git", "package.json"]) {
+    if (!existsSync(join(repoRoot, required))) {
+      throw new Error(`Disposable evaluation repo is incomplete: missing ${required}`);
+    }
+  }
+  return { repoRoot, home };
+}
+
+export function assertDisposableEvaluationBoundary(params: {
+  repoRoot: string;
+  home?: string;
+  evalsPath: string;
+  configPath: string;
+  workspaceRoot: string;
+  summaryPath: string;
+}): { repoRoot: string; home: string } {
+  const declaredRepoRoot = resolve(params.repoRoot);
+  const { repoRoot, home } = assertDisposableRootBoundary(params);
+  assertDisposablePaths({
+    repoRoot,
+    declaredRepoRoot,
+    paths: [
+      ["eval manifest", params.evalsPath],
+      ["benchmark config", params.configPath],
+      ["workspace root", params.workspaceRoot],
+      ["summary path", params.summaryPath],
+    ],
+  });
+  for (const required of ["evals/evals.json", "evals/benchmark.config.json", "assets/templates/helpers"]) {
+    if (!existsSync(join(repoRoot, required))) {
+      throw new Error(`Disposable evaluation repo is incomplete: missing ${required}`);
+    }
+  }
+  return { repoRoot, home };
 }
 
 function quoteShellArg(value: string): string {
@@ -305,6 +447,10 @@ function formatRatio(value: number | null): string {
   return `${(value * 100).toFixed(1)}%`;
 }
 
+function formatNullableNumber(value: number | null): string {
+  return value === null ? "n/a" : String(value);
+}
+
 function copyPathIntoWorkspace(sourcePath: string, destinationRoot: string): void {
   if (!existsSync(sourcePath)) {
     throw new Error(`Fixture path does not exist: ${sourcePath}`);
@@ -400,14 +546,27 @@ function runProcess(
   command: string,
   args: string[],
   cwd: string,
-  env: Record<string, string>
+  env: Record<string, string>,
+  scrubHarnessOverrides = false,
 ): { exitCode: number | null; stdout: string; stderr: string } {
+  const inheritedEnv = { ...process.env };
+  const childEnv = { ...env };
+  if (scrubHarnessOverrides) {
+    for (const key of [
+      "REPO_HARNESS_SOURCE_ROOT",
+      "REPO_HARNESS_HELPER_SOURCE_PATH",
+      "REPO_HARNESS_TARGET_REPO_ROOT",
+    ] as const) {
+      delete inheritedEnv[key];
+      delete childEnv[key];
+    }
+  }
   const result = spawnSync(command, args, {
     cwd,
     encoding: "utf-8",
     env: {
-      ...process.env,
-      ...env,
+      ...inheritedEnv,
+      ...childEnv,
     },
   });
 
@@ -418,26 +577,58 @@ function runProcess(
   };
 }
 
+export function runDisposableAdoptionProfile(params: {
+  repoRoot: string;
+  home?: string;
+}): AdoptionProfileReport {
+  const boundary = assertDisposableRootBoundary(params);
+  const commands = [
+    {
+      label: "project-state inspector",
+      args: [join(boundary.repoRoot, "scripts", "inspect-project-state.ts"), "--repo", boundary.repoRoot, "--format", "json"],
+    },
+    {
+      label: "init dry-run",
+      args: [join(boundary.repoRoot, "src", "cli", "index.ts"), "init", "--repo", boundary.repoRoot, "--dry-run", "--json"],
+    },
+  ] as const;
+  const results = commands.map((command) => {
+    const result = runProcess(process.execPath, [...command.args], boundary.repoRoot, { HOME: boundary.home }, true);
+    if (result.exitCode !== 0) {
+      throw new Error(`${command.label} failed (${result.exitCode ?? "spawn error"}): ${result.stderr || result.stdout}`);
+    }
+    return result;
+  });
+  return {
+    repoRoot: boundary.repoRoot,
+    home: boundary.home,
+    inspector: { stdout: results[0].stdout, stderr: results[0].stderr },
+    initDryRun: { stdout: results[1].stdout, stderr: results[1].stderr },
+  };
+}
+
 function assertCommandSucceeded(result: { exitCode: number | null; stderr: string }, command: string): void {
   if (result.exitCode !== 0) {
     throw new Error(`Command failed (${command}): ${result.stderr.trim()}`);
   }
 }
 
-export function initBenchmarkGitRepo(workspacePath: string): void {
-  const initResult = runProcess("git", ["init"], workspacePath, {});
+export function initBenchmarkGitRepo(workspacePath: string, home?: string): void {
+  const env: Record<string, string> = home ? { HOME: home } : {};
+  const scrub = Boolean(home);
+  const initResult = runProcess("git", ["init"], workspacePath, env, scrub);
   assertCommandSucceeded(initResult, "git init");
   assertCommandSucceeded(
-    runProcess("git", ["config", "user.name", "Skill Benchmark"], workspacePath, {}),
+    runProcess("git", ["config", "user.name", "Skill Benchmark"], workspacePath, env, scrub),
     "git config user.name"
   );
   assertCommandSucceeded(
-    runProcess("git", ["config", "user.email", "skill-benchmark@example.com"], workspacePath, {}),
+    runProcess("git", ["config", "user.email", "skill-benchmark@example.com"], workspacePath, env, scrub),
     "git config user.email"
   );
-  assertCommandSucceeded(runProcess("git", ["add", "."], workspacePath, {}), "git add");
+  assertCommandSucceeded(runProcess("git", ["add", "."], workspacePath, env, scrub), "git add");
   assertCommandSucceeded(
-    runProcess("git", ["commit", "-m", "benchmark baseline"], workspacePath, {}),
+    runProcess("git", ["commit", "-m", "benchmark baseline"], workspacePath, env, scrub),
     "git commit"
   );
 
@@ -449,20 +640,22 @@ export function initBenchmarkGitRepo(workspacePath: string): void {
   writeFileSync(excludePath, readFileSync(excludePath, "utf-8") + content, "utf-8");
 }
 
-function stageWorkspaceChanges(workspacePath: string): void {
-  runProcess("git", ["add", "-A"], workspacePath, {});
+function stageWorkspaceChanges(workspacePath: string, home?: string): void {
+  runProcess("git", ["add", "-A"], workspacePath, home ? { HOME: home } : {}, Boolean(home));
 }
 
-export function captureGitArtifacts(workspacePath: string): {
+export function captureGitArtifacts(workspacePath: string, home?: string): {
   changedFiles: string[];
   diffPatch: string;
   diffStat: string;
 } {
-  stageWorkspaceChanges(workspacePath);
+  const env: Record<string, string> = home ? { HOME: home } : {};
+  const scrub = Boolean(home);
+  stageWorkspaceChanges(workspacePath, home);
 
-  const changed = runProcess("git", ["diff", "--cached", "--name-only", "HEAD"], workspacePath, {});
-  const patch = runProcess("git", ["diff", "--cached", "--binary", "HEAD"], workspacePath, {});
-  const stat = runProcess("git", ["diff", "--cached", "--stat", "HEAD"], workspacePath, {});
+  const changed = runProcess("git", ["diff", "--cached", "--name-only", "HEAD"], workspacePath, env, scrub);
+  const patch = runProcess("git", ["diff", "--cached", "--binary", "HEAD"], workspacePath, env, scrub);
+  const stat = runProcess("git", ["diff", "--cached", "--stat", "HEAD"], workspacePath, env, scrub);
 
   return {
     changedFiles: changed.stdout
@@ -480,7 +673,7 @@ function buildClaudeCommand(
   repoRoot: string,
   profile: ProfileName
 ): CommandSpec {
-  const args = [...(config.args ?? []), "-p", "--output-format", "text", "--no-session-persistence"];
+  const args = [...(config.args ?? []), "-p", "--output-format", "json", "--no-session-persistence"];
   if (profile === "with_skill") {
     args.push("--permission-mode", "bypassPermissions", "--add-dir", repoRoot);
   } else {
@@ -511,6 +704,7 @@ function buildCodexCommand(
     "--dangerously-bypass-approvals-and-sandbox",
     "-o",
     finalResponsePath,
+    "--json",
   ];
   if (profile === "with_skill") {
     args.push("--add-dir", repoRoot);
@@ -542,6 +736,163 @@ export function buildAgentCommand(
 function writeTextFile(path: string, content: string): void {
   ensureDir(dirname(path));
   writeFileSync(path, content, "utf-8");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function optionalString(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
+function optionalNonNegativeNumber(value: unknown): number | null | undefined {
+  if (value === undefined) return null;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return undefined;
+  return value;
+}
+
+function optionalNonNegativeInteger(value: unknown): number | null | undefined {
+  const parsed = optionalNonNegativeNumber(value);
+  if (parsed === undefined || parsed === null) return parsed;
+  return Number.isInteger(parsed) ? parsed : undefined;
+}
+
+function unavailableStructuredEvidence(
+  reason: Exclude<RunMetadata["usageUnavailableReason"], null>,
+  finalResponse: string | null = null
+): ProviderStructuredEvidence {
+  return {
+    usageAuthority: "unavailable",
+    usageUnavailableReason: reason,
+    inputTokens: null,
+    cachedInputTokens: null,
+    cacheCreationInputTokens: null,
+    outputTokens: null,
+    totalCostUsd: null,
+    turnCount: null,
+    model: null,
+    sessionId: null,
+    finalResponse,
+  };
+}
+
+function parseProviderUsage(
+  usage: unknown,
+  cachedField: "cache_read_input_tokens" | "cached_input_tokens",
+  cacheCreationField: "cache_creation_input_tokens" | null,
+  extras: {
+    totalCostUsd?: unknown;
+    turnCount?: unknown;
+    model?: unknown;
+    sessionId?: unknown;
+    finalResponse?: string | null;
+  } = {}
+): ProviderStructuredEvidence {
+  if (usage === undefined || usage === null) {
+    return unavailableStructuredEvidence("missing_structured_usage", extras.finalResponse ?? null);
+  }
+  if (!isRecord(usage)) {
+    return unavailableStructuredEvidence("malformed_structured_usage", extras.finalResponse ?? null);
+  }
+
+  const inputTokens = optionalNonNegativeInteger(usage.input_tokens);
+  const cachedInputTokens = optionalNonNegativeInteger(usage[cachedField]);
+  const cacheCreationInputTokens = cacheCreationField === null
+    ? null
+    : optionalNonNegativeInteger(usage[cacheCreationField]);
+  const outputTokens = optionalNonNegativeInteger(usage.output_tokens);
+  const totalCostUsd = optionalNonNegativeNumber(extras.totalCostUsd);
+  const turnCount = optionalNonNegativeInteger(extras.turnCount);
+
+  if (
+    inputTokens === undefined ||
+    cachedInputTokens === undefined ||
+    cacheCreationInputTokens === undefined ||
+    outputTokens === undefined ||
+    totalCostUsd === undefined ||
+    turnCount === undefined ||
+    inputTokens === null ||
+    outputTokens === null
+  ) {
+    return unavailableStructuredEvidence("malformed_structured_usage", extras.finalResponse ?? null);
+  }
+
+  return {
+    usageAuthority: "structured_cli",
+    usageUnavailableReason: null,
+    inputTokens,
+    cachedInputTokens,
+    cacheCreationInputTokens,
+    outputTokens,
+    totalCostUsd,
+    turnCount,
+    model: optionalString(extras.model),
+    sessionId: optionalString(extras.sessionId),
+    finalResponse: extras.finalResponse ?? null,
+  };
+}
+
+export function parseClaudeStructuredOutput(stdout: string): ProviderStructuredEvidence {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    return unavailableStructuredEvidence("malformed_structured_output");
+  }
+
+  if (!isRecord(parsed) || parsed.type !== "result") {
+    return unavailableStructuredEvidence("malformed_structured_output");
+  }
+
+  const finalResponse = optionalString(parsed.result);
+  return parseProviderUsage(
+    parsed.usage,
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    {
+      totalCostUsd: parsed.total_cost_usd,
+      turnCount: parsed.num_turns,
+      model: parsed.model,
+      sessionId: parsed.session_id,
+      finalResponse,
+    },
+  );
+}
+
+export function parseCodexStructuredOutput(stdout: string): ProviderStructuredEvidence {
+  const lines = stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.length === 0) {
+    return unavailableStructuredEvidence("malformed_structured_output");
+  }
+
+  const events: Record<string, unknown>[] = [];
+  for (const line of lines) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      return unavailableStructuredEvidence("malformed_structured_output");
+    }
+    if (!isRecord(parsed) || typeof parsed.type !== "string") {
+      return unavailableStructuredEvidence("malformed_structured_output");
+    }
+    events.push(parsed);
+  }
+
+  const threadStarted = events.find((event) => event.type === "thread.started");
+  const turnCompleted = [...events].reverse().find((event) => event.type === "turn.completed");
+  if (!turnCompleted) {
+    return unavailableStructuredEvidence("missing_structured_usage");
+  }
+
+  return parseProviderUsage(turnCompleted.usage, "cached_input_tokens", null, {
+    model: turnCompleted.model,
+    sessionId: threadStarted?.thread_id,
+  });
 }
 
 function excerpt(content: string, maxLength = 220): string {
@@ -596,10 +947,22 @@ function renderEvalContract(evalEntry: EvalEntry): string {
   appendPathPatterns("files_not_contain", evalEntry.anti_graders?.files_not_contain);
 
   lines.push("```", "");
+
+  lines.push(
+    "## Evidence Requirements",
+    "",
+    "```yaml",
+    "evidence_requirements:",
+    "  # Set benchmark to required when this contract consumes the harness profile benchmark matrix.",
+    "  benchmark: not_applicable",
+    "```",
+    ""
+  );
+
   return `${lines.join("\n")}\n`;
 }
 
-function runEvalGraders(repoRoot: string, workspacePath: string, evalEntry: EvalEntry): {
+function runEvalGraders(repoRoot: string, workspacePath: string, evalEntry: EvalEntry, home?: string): {
   report: GraderReport;
   reportPath: string;
 } {
@@ -620,7 +983,15 @@ function runEvalGraders(repoRoot: string, workspacePath: string, evalEntry: Eval
       reportPath,
     ],
     workspacePath,
-    {}
+    {
+      // workspacePath is a disposable directory outside repoRoot, so
+      // verify-contract.sh's cwd-relative default lib path never resolves;
+      // point it at the packaged mirror explicitly (same pattern as
+      // tests/contract-run.test.ts and tests/helper-scripts.test.ts).
+      REPO_HARNESS_WORKFLOW_STATE_LIB: join(repoRoot, "assets", "hooks", "lib", "workflow-state.sh"),
+      ...(home ? { HOME: home } : {}),
+    },
+    Boolean(home),
   );
 
   if (!existsSync(reportPath)) {
@@ -657,6 +1028,7 @@ function buildRunMetadata(params: {
   changedFiles: string[];
   diffStat: string;
   finalResponse: string;
+  structuredEvidence: ProviderStructuredEvidence;
 }): RunMetadata {
   return {
     agent: params.agent,
@@ -703,14 +1075,25 @@ function buildRunMetadata(params: {
     gitDiffPath: params.gitDiffPath,
     diffStat: params.diffStat,
     changedFiles: params.changedFiles,
+    changedFileCount: params.changedFiles.length,
     finalResponseExcerpt: excerpt(params.finalResponse),
-    model: null,
-    sessionId: null,
+    usageAuthority: params.structuredEvidence.usageAuthority,
+    usageUnavailableReason: params.structuredEvidence.usageUnavailableReason,
+    inputTokens: params.structuredEvidence.inputTokens,
+    cachedInputTokens: params.structuredEvidence.cachedInputTokens,
+    cacheCreationInputTokens: params.structuredEvidence.cacheCreationInputTokens,
+    outputTokens: params.structuredEvidence.outputTokens,
+    totalCostUsd: params.structuredEvidence.totalCostUsd,
+    turnCount: params.structuredEvidence.turnCount,
+    artifactCount: null,
+    model: params.structuredEvidence.model,
+    sessionId: params.structuredEvidence.sessionId,
   };
 }
 
 function runSingleEval(params: {
   repoRoot: string;
+  home?: string;
   evalEntry: EvalEntry;
   agent: AgentName;
   profile: ProfileName;
@@ -718,13 +1101,13 @@ function runSingleEval(params: {
   config: BenchmarkConfig;
   dryRun: boolean;
 }): RunMetadata {
-  const { repoRoot, evalEntry, agent, profile, iterationPath, config, dryRun } = params;
+  const { repoRoot, home, evalEntry, agent, profile, iterationPath, config, dryRun } = params;
   const runPath = join(iterationPath, agent, profile, evalEntry.slug);
   ensureDir(runPath);
 
   copyEvalFixtures(evalEntry, repoRoot, runPath);
   prepareWorkspaceForRun(runPath, agent, profile, resolveSkillPath(repoRoot, profile, config));
-  initBenchmarkGitRepo(runPath);
+  initBenchmarkGitRepo(runPath, home);
 
   const promptPath = join(runPath, "prompt.txt");
   const commandPath = join(runPath, "command.txt");
@@ -746,6 +1129,7 @@ function runSingleEval(params: {
     runPath,
     finalResponsePath
   );
+  if (home) commandSpec.env.HOME = home;
   writeTextFile(commandPath, `${toShellCommand(commandSpec)}\n`);
 
   let exitCode: number | null = 0;
@@ -753,6 +1137,7 @@ function runSingleEval(params: {
   let stderr = "";
   let graderReport: GraderReport | null = null;
   let graderReportPath: string | null = null;
+  let structuredEvidence = unavailableStructuredEvidence("dry_run");
   const startedAt = Date.now();
 
   if (dryRun) {
@@ -760,12 +1145,19 @@ function runSingleEval(params: {
     writeTextFile(stderrPath, "");
     writeTextFile(finalResponsePath, "dry-run: no final response captured\n");
   } else {
-    const result = runProcess(commandSpec.command, commandSpec.args, runPath, commandSpec.env);
+    const result = runProcess(commandSpec.command, commandSpec.args, runPath, commandSpec.env, Boolean(home));
     exitCode = result.exitCode;
     stdout = result.stdout;
     stderr = result.stderr;
     writeTextFile(stdoutPath, stdout);
     writeTextFile(stderrPath, stderr);
+    structuredEvidence =
+      agent === "claude"
+        ? parseClaudeStructuredOutput(stdout)
+        : parseCodexStructuredOutput(stdout);
+    if (agent === "claude" && structuredEvidence.finalResponse !== null) {
+      writeTextFile(finalResponsePath, structuredEvidence.finalResponse);
+    }
     if (!existsSync(finalResponsePath)) {
       writeTextFile(finalResponsePath, stdout.trim().length > 0 ? stdout : "(no final response captured)\n");
     }
@@ -775,10 +1167,10 @@ function runSingleEval(params: {
   const finalResponse = readFileSync(finalResponsePath, "utf-8");
   const gitArtifacts = dryRun
     ? { changedFiles: [] as string[], diffPatch: "", diffStat: "" }
-    : captureGitArtifacts(runPath);
+    : captureGitArtifacts(runPath, home);
 
   if (!dryRun) {
-    const grading = runEvalGraders(repoRoot, runPath, evalEntry);
+    const grading = runEvalGraders(repoRoot, runPath, evalEntry, home);
     graderReport = grading.report;
     graderReportPath = grading.reportPath;
   }
@@ -811,6 +1203,7 @@ function runSingleEval(params: {
     changedFiles: gitArtifacts.changedFiles,
     diffStat: gitArtifacts.diffStat,
     finalResponse,
+    structuredEvidence,
   });
 
   writeTextFile(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`);
@@ -853,6 +1246,8 @@ export function buildBenchmarkSummary(report: IterationReport, repoRoot: string)
       ? "Effectiveness evidence is non-authoritative because dry_run_ratio is above 30%."
       : "Effectiveness evidence is authoritative for this benchmark run.",
     "",
+    "`without_skill` is a skill-disabled baseline; it is not a host-isolated No Harness profile.",
+    "",
     "## Command Matrix",
     "",
     "| Agent | Profile | Command |",
@@ -868,7 +1263,9 @@ export function buildBenchmarkSummary(report: IterationReport, repoRoot: string)
       );
       if (records.length === 0) continue;
 
-      lines.push(`## ${agent} / ${profile}`, "", "| Eval | Status | Exit / Graders | Duration | Changed Files | Raw Artifacts |", "| --- | --- | --- | ---: | ---: | --- |");
+      const profileLabel =
+        profile === "without_skill" ? `${profile} (skill-disabled baseline)` : profile;
+      lines.push(`## ${agent} / ${profileLabel}`, "", "| Eval | Status | Exit / Graders | Duration | Input / Cached / Output Tokens | Changed Files | Raw Artifacts |", "| --- | --- | --- | ---: | --- | ---: | --- |");
       for (const record of records) {
         const runLink = relativeLink(repoRoot, record.workspacePath);
         const graderCell =
@@ -878,7 +1275,7 @@ export function buildBenchmarkSummary(report: IterationReport, repoRoot: string)
               ? "graders pass"
               : `graders fail (${record.graderSummary.failed})`;
         lines.push(
-          `| ${record.evalSlug} | ${record.status} | ${record.exitCode ?? "n/a"} / ${graderCell} | ${record.durationMs}ms | ${record.changedFiles.length} | [workspace](${runLink}) |`
+          `| ${record.evalSlug} | ${record.status} | ${record.exitCode ?? "n/a"} / ${graderCell} | ${record.durationMs}ms | ${formatNullableNumber(record.inputTokens)} / ${formatNullableNumber(record.cachedInputTokens)} / ${formatNullableNumber(record.outputTokens)} | ${record.changedFileCount} | [workspace](${runLink}) |`
         );
       }
       lines.push("");
@@ -891,6 +1288,9 @@ export function buildBenchmarkSummary(report: IterationReport, repoRoot: string)
         lines.push(`- Diff summary: ${record.diffStat.length > 0 ? record.diffStat : "no diff captured"}`);
         lines.push(`- Agent status: ${record.agentStatus} (exit ${record.exitCode ?? "n/a"})`);
         lines.push(`- Graders: ${record.graderStatus} (${record.graderSummary.total - record.graderSummary.failed}/${record.graderSummary.total} passed)`);
+        lines.push(`- Usage authority: ${record.usageAuthority}${record.usageUnavailableReason ? ` (${record.usageUnavailableReason})` : ""}`);
+        lines.push(`- Provider usage: input=${formatNullableNumber(record.inputTokens)}, cached_input=${formatNullableNumber(record.cachedInputTokens)}, cache_creation_input=${formatNullableNumber(record.cacheCreationInputTokens)}, output=${formatNullableNumber(record.outputTokens)}, cost_usd=${formatNullableNumber(record.totalCostUsd)}, turns=${formatNullableNumber(record.turnCount)}`);
+        lines.push(`- Unavailable counters: workflow_artifacts=${formatNullableNumber(record.artifactCount)}`);
         lines.push(`- Final response excerpt: ${record.finalResponseExcerpt.length > 0 ? record.finalResponseExcerpt : "(empty)"}`);
         lines.push("- Expectations:");
         for (const expectation of record.expectations) {
@@ -911,13 +1311,53 @@ export function buildBenchmarkSummary(report: IterationReport, repoRoot: string)
 }
 
 export function runSkillEvals(options: RunSkillEvalsOptions = {}): IterationReport {
-  const repoRoot = options.repoRoot ?? REPO_ROOT;
-  const evalManifest = loadEvalManifest(options.evalsPath ?? join(repoRoot, "evals", "evals.json"));
-  const config = loadBenchmarkConfig(
-    options.configPath ?? join(repoRoot, "evals", "benchmark.config.json")
+  let repoRoot = options.repoRoot ?? REPO_ROOT;
+  const declaredRepoRoot = resolve(repoRoot);
+  let home = options.home;
+  if (options.requireDisposableBoundary) {
+    const boundary = assertDisposableRootBoundary({ repoRoot, home });
+    repoRoot = boundary.repoRoot;
+    home = boundary.home;
+  }
+  const resolveInputPath = (configured: string | undefined, fallback: string): string => {
+    if (!configured) return resolve(repoRoot, fallback);
+    if (!isAbsolute(configured)) return resolve(repoRoot, configured);
+    const absolute = resolve(configured);
+    return options.requireDisposableBoundary && isInside(declaredRepoRoot, absolute)
+      ? resolve(repoRoot, relative(declaredRepoRoot, absolute))
+      : absolute;
+  };
+  const evalsPath = resolveInputPath(options.evalsPath, "evals/evals.json");
+  const configPath = resolveInputPath(options.configPath, "evals/benchmark.config.json");
+  if (options.requireDisposableBoundary) {
+    assertDisposablePaths({
+      repoRoot,
+      declaredRepoRoot: repoRoot,
+      paths: [
+        ["eval manifest", evalsPath],
+        ["benchmark config", configPath],
+      ],
+    });
+  }
+  const evalManifest = loadEvalManifest(evalsPath);
+  const config = loadBenchmarkConfig(configPath);
+  const workspaceRoot = resolveRepoPath(
+    repoRoot,
+    options.workspaceRoot ?? (options.requireDisposableBoundary ? ".ai/harness/evals/workspace" : config.workspaceRoot),
   );
-  const workspaceRoot = resolveRepoPath(repoRoot, options.workspaceRoot ?? config.workspaceRoot);
   const summaryPath = resolveRepoPath(repoRoot, config.summaryPath);
+  if (options.requireDisposableBoundary) {
+    const boundary = assertDisposableEvaluationBoundary({
+      repoRoot,
+      home,
+      evalsPath,
+      configPath,
+      workspaceRoot,
+      summaryPath,
+    });
+    repoRoot = boundary.repoRoot;
+    home = boundary.home;
+  }
   const selected = selectEvals(evalManifest.evals, options.evalFilters ?? []);
 
   if (selected.length === 0) {
@@ -938,6 +1378,7 @@ export function runSkillEvals(options: RunSkillEvalsOptions = {}): IterationRepo
         records.push(
           runSingleEval({
             repoRoot,
+            home,
             evalEntry,
             agent,
             profile,
@@ -996,6 +1437,20 @@ export function parseCliArgs(args: string[]): RunSkillEvalsOptions {
         options.workspaceRoot = args[index + 1];
         index += 1;
         break;
+      case "--repo":
+        options.repoRoot = args[index + 1];
+        index += 1;
+        break;
+      case "--home":
+        options.home = args[index + 1];
+        index += 1;
+        break;
+      case "--require-disposable":
+        options.requireDisposableBoundary = true;
+        break;
+      case "--run-adoption-profile":
+        options.runAdoptionProfile = true;
+        break;
       case "--dry-run":
         options.dryRun = true;
         break;
@@ -1009,7 +1464,14 @@ export function parseCliArgs(args: string[]): RunSkillEvalsOptions {
 
 if (import.meta.main) {
   try {
-    const report = runSkillEvals(parseCliArgs(process.argv.slice(2)));
+    const options = parseCliArgs(process.argv.slice(2));
+    if (options.runAdoptionProfile) {
+      if (!options.repoRoot) throw new Error("--run-adoption-profile requires --repo");
+      const report = runDisposableAdoptionProfile({ repoRoot: options.repoRoot, home: options.home });
+      console.log(JSON.stringify(report, null, 2));
+      process.exit(0);
+    }
+    const report = runSkillEvals(options);
     console.log(
       `Benchmark complete: ${report.records.length} run(s) in ${report.iterationName}\n` +
       `Summary: ${report.summaryPath}\n` +

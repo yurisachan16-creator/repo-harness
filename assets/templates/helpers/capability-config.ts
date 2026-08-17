@@ -1,29 +1,17 @@
 #!/usr/bin/env bun
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
-import { dirname, resolve } from "path";
+import { existsSync, mkdirSync, writeFileSync } from "fs";
+import { basename, dirname, resolve } from "path";
 import { spawnSync } from "child_process";
+import { fileURLToPath } from "url";
+import {
+  CapabilitySourceError,
+  capabilitySourceMode,
+  readRegistry as readCapabilityRegistry,
+  type Capability,
+  type CapabilityRegistry,
+} from "./capability-resolver";
 
-type ContractFiles = {
-  agents: string;
-  claude: string;
-};
-
-type Capability = {
-  id: string;
-  domain: string;
-  name: string;
-  prefixes: string[];
-  contract_files: ContractFiles;
-  architecture_module: string;
-  workstream_dir: string;
-  lsp_profile: string;
-  verification_hints: string[];
-};
-
-type Registry = {
-  version: number;
-  capabilities: Capability[];
-};
+type Registry = CapabilityRegistry;
 
 type Format = "text" | "json";
 
@@ -49,6 +37,13 @@ type Args = {
 };
 
 const REGISTRY_PATH = ".ai/context/capabilities.json";
+const OWN_PATH = fileURLToPath(import.meta.url);
+const SCRIPT_DIR = dirname(OWN_PATH);
+const HELPER_SOURCE_PATH = process.env.REPO_HARNESS_HELPER_SOURCE_PATH;
+const HELPER_DIR =
+  HELPER_SOURCE_PATH && existsSync(HELPER_SOURCE_PATH) && basename(HELPER_SOURCE_PATH) === basename(OWN_PATH)
+    ? dirname(HELPER_SOURCE_PATH)
+    : SCRIPT_DIR;
 
 function usage(): never {
   console.error(
@@ -246,13 +241,11 @@ function buildCapability(args: Args, repo: string): Capability {
 }
 
 function readRegistry(repo: string): Registry {
-  const registryPath = resolve(repo, REGISTRY_PATH);
-  if (!existsSync(registryPath)) return { version: 1, capabilities: [] };
-  const parsed = JSON.parse(readFileSync(registryPath, "utf-8")) as Partial<Registry>;
-  return {
-    version: parsed.version ?? 1,
-    capabilities: Array.isArray(parsed.capabilities) ? parsed.capabilities : [],
-  };
+  if (!existsSync(resolve(repo, REGISTRY_PATH))) {
+    // This explicit add command is the sole creation path for a missing registry.
+    return { version: 1, capabilities: [] };
+  }
+  return readCapabilityRegistry(repo);
 }
 
 function writeRegistry(repo: string, registry: Registry): void {
@@ -289,8 +282,12 @@ function runChecked(repo: string, command: string, args: string[]): string {
   return result.stdout.trim();
 }
 
+function helperPath(fileName: string): string {
+  return resolve(HELPER_DIR, fileName);
+}
+
 function validateRegistry(repo: string): void {
-  runChecked(repo, process.execPath, ["scripts/capability-resolver.ts", "validate", "--repo", repo, "--format", "text"]);
+  runChecked(repo, process.execPath, [helperPath("capability-resolver.ts"), "validate", "--repo", repo, "--format", "text"]);
 }
 
 function syncContracts(repo: string, capability: Capability): void {
@@ -314,7 +311,7 @@ function syncContracts(repo: string, capability: Capability): void {
     contract_sync_required: true,
   };
 
-  runChecked(repo, "bash", ["scripts/context-contract-sync.sh", "sync-event", "--json", JSON.stringify(event)]);
+  runChecked(repo, "bash", [helperPath("context-contract-sync.sh"), "sync-event", "--json", JSON.stringify(event)]);
 }
 
 function createArchitectureModule(repo: string, capability: Capability): void {
@@ -342,12 +339,20 @@ function createArchitectureModule(repo: string, capability: Capability): void {
 }
 
 function createWorkstream(repo: string, capability: Capability): void {
-  runChecked(repo, "bash", ["scripts/workstream-sync.sh", "ensure", "--block", capability.prefixes[0]]);
+  runChecked(repo, "bash", [helperPath("workstream-sync.sh"), "ensure", "--block", capability.prefixes[0]]);
 }
 
 function main(): void {
   const args = parseArgs(process.argv.slice(2));
   const repo = repoRoot(args.repo);
+  // The JSON registry is a projection target, not an authority, once archcontext
+  // owns capabilities; writing here would create a second authority.
+  if (capabilitySourceMode(repo) === "archcontext") {
+    throw new CapabilitySourceError(
+      `capability source is "archcontext"; ${REGISTRY_PATH} is not writable. ` +
+        "Declare the capability as an archcontext node under .archcontext/model/nodes instead"
+    );
+  }
   const requestedCapability = buildCapability(args, repo);
   const prefixPath = resolve(repo, requestedCapability.prefixes[0]);
   const registry = readRegistry(repo);
@@ -390,5 +395,5 @@ try {
   main();
 } catch (error) {
   console.error(`capability-config: ${(error as Error).message}`);
-  process.exit(1);
+  process.exit((error as { exitCode?: number }).exitCode ?? 1);
 }

@@ -31,11 +31,19 @@ function directoryDenyGlobParts(pattern: string): string[] | undefined {
   return directoryPattern.split('/').filter(Boolean).map((part) => part.toLowerCase());
 }
 
+function stripPlatformCanonicalizationPrefix(parts: string[]): string[] {
+  // realpathSync resolves OS-managed temp roots through /private on macOS
+  // (e.g. /tmp -> /private/tmp, per-user tmp -> /private/var/folders/...).
+  // That is a filesystem canonicalization artifact, not a user-owned
+  // "private" directory, so strip it once before deny-glob matching runs.
+  if (parts[0] === 'private' && (parts[1] === 'var' || parts[1] === 'tmp')) {
+    return parts.slice(2);
+  }
+  return parts;
+}
+
 function partsContainDeniedRoot(parts: string[], deniedParts: string[]): boolean {
   for (let index = 0; index <= parts.length - deniedParts.length; index += 1) {
-    if (deniedParts.length === 1 && deniedParts[0] === 'private' && index === 0 && parts[1] === 'var') {
-      continue;
-    }
     const matches = deniedParts.every((part, offset) => parts[index + offset] === part);
     if (matches) return true;
   }
@@ -45,7 +53,7 @@ function partsContainDeniedRoot(parts: string[], deniedParts: string[]): boolean
 export function sensitiveAllowedRootReason(canonicalPath: string, denyGlobs = COMMON_DENY_GLOBS, rawPath?: string): string | undefined {
   const candidateParts = Array.from(new Set([rawPath, canonicalPath]
     .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
-    .map((value) => pathParts(value))));
+    .map((value) => stripPlatformCanonicalizationPrefix(pathParts(value)))));
 
   for (const pattern of denyGlobs) {
     const deniedParts = directoryDenyGlobParts(pattern);
@@ -90,18 +98,9 @@ export interface McpPolicyOptions {
   enableReader?: boolean;
   allowedRoots?: string[];
   discoveryRoots?: string[];
-  generalRepo?: Partial<McpPolicy['generalRepo']>;
 }
 
 const DEFAULT_RUNNER_TIMEOUT_MS = 120_000;
-const DEFAULT_GENERAL_REPO_FLAGS: McpPolicy['generalRepo'] = {
-  general_repo_read: false,
-  repo_write: false,
-  fs_fallback: false,
-  shadow_compare: false,
-  canary_repos: [],
-  rollback_to_legacy_tools: false,
-};
 
 function withWorkspacePrefixGlobs(globs: string[]): string[] {
   return Array.from(new Set([
@@ -115,6 +114,7 @@ function executionPolicy(overrides: Partial<McpPolicy['execution']> = {}): McpPo
     fixedWorkflowCheck: false,
     codexRunner: false,
     agentRunner: false,
+    codingShell: false,
     allowedAgents: [],
     runnerTimeoutMs: DEFAULT_RUNNER_TIMEOUT_MS,
     ...overrides,
@@ -127,20 +127,8 @@ function capabilities(overrides: Partial<McpPolicy['capabilities']> = {}): McpPo
     workflowPlanner: false,
     workflowExecutor: false,
     agentRunner: false,
+    workspaceCoder: false,
     ...overrides,
-  };
-}
-
-function generalRepoFlags(overrides: Partial<McpPolicy['generalRepo']> = {}): McpPolicy['generalRepo'] {
-  const normalized = Object.fromEntries(
-    Object.entries(overrides).filter(([key, value]) => key === 'canary_repos' ? Array.isArray(value) : typeof value === 'boolean'),
-  ) as Partial<McpPolicy['generalRepo']>;
-  return {
-    ...DEFAULT_GENERAL_REPO_FLAGS,
-    ...normalized,
-    canary_repos: Array.isArray(normalized.canary_repos)
-      ? Array.from(new Set(normalized.canary_repos.map((entry) => String(entry).trim()).filter(Boolean)))
-      : DEFAULT_GENERAL_REPO_FLAGS.canary_repos,
   };
 }
 
@@ -160,7 +148,6 @@ export function getMcpPolicy(profile: McpProfileName, opts: McpPolicyOptions = {
       denyGlobs: COMMON_DENY_GLOBS,
       allowAbsoluteRead: broadRead,
       maxFileBytes: 512 * 1024,
-      generalRepo: generalRepoFlags(opts.generalRepo),
       execution: executionPolicy({
         fixedWorkflowCheck: !broadRead,
       }),
@@ -179,7 +166,6 @@ export function getMcpPolicy(profile: McpProfileName, opts: McpPolicyOptions = {
       denyGlobs: COMMON_DENY_GLOBS,
       allowAbsoluteRead: broadRead,
       maxFileBytes: 512 * 1024,
-      generalRepo: generalRepoFlags(opts.generalRepo),
       execution: executionPolicy({
         fixedWorkflowCheck: !broadRead,
       }),
@@ -197,7 +183,6 @@ export function getMcpPolicy(profile: McpProfileName, opts: McpPolicyOptions = {
       writeGlobs: [],
       denyGlobs: devRunner ? COMMON_DENY_GLOBS : ['**'],
       maxFileBytes: devRunner ? 512 * 1024 : 0,
-      generalRepo: generalRepoFlags(opts.generalRepo),
       execution: executionPolicy({
         codexRunner: devRunner,
         agentRunner: devRunner,
@@ -207,10 +192,30 @@ export function getMcpPolicy(profile: McpProfileName, opts: McpPolicyOptions = {
     };
   }
 
+  if (profile === 'coding') {
+    return {
+      profile,
+      allowedRoots: opts.allowedRoots,
+      discoveryRoots: opts.discoveryRoots,
+      capabilities: capabilities({
+        workflowPlanner: true,
+        workspaceCoder: true,
+      }),
+      readGlobs: withWorkspacePrefixGlobs(PLANNER_READ_GLOBS),
+      writeGlobs: withWorkspacePrefixGlobs(PLANNER_WRITE_GLOBS),
+      denyGlobs: COMMON_DENY_GLOBS,
+      maxFileBytes: 512 * 1024,
+      execution: executionPolicy({
+        fixedWorkflowCheck: true,
+        codingShell: true,
+      }),
+    };
+  }
+
   throw new Error(`unknown MCP profile: ${String(profile)}`);
 }
 
 export function parseMcpProfile(value: string): McpProfileName {
-  if (value === 'planner' || value === 'executor' || value === 'orchestrator') return value;
-  throw new Error(`invalid MCP profile "${value}" (expected: planner, executor, orchestrator)`);
+  if (value === 'planner' || value === 'executor' || value === 'orchestrator' || value === 'coding') return value;
+  throw new Error(`invalid MCP profile "${value}" (expected: planner, executor, orchestrator, coding)`);
 }

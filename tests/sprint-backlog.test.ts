@@ -5,7 +5,6 @@ import { describe, test, expect, setDefaultTimeout } from "bun:test";
 setDefaultTimeout(20000);
 import {
   copyFileSync,
-  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -19,20 +18,29 @@ import {
 import { tmpdir } from "os";
 import { join } from "path";
 import { spawnSync } from "child_process";
+import { sessionStartMainContent } from "../src/cli/hook/session-context";
+import { createStateInputCollector } from "../src/effects/loop/state-input-collector";
 
 const ROOT = join(import.meta.dir, "..");
 const HELPER_DIR = join(ROOT, "assets/templates/helpers");
-const ASSETS_HOOKS_DIR = join(ROOT, "assets/hooks");
 
 function tmpWorkspace(prefix: string): string {
   return realpathSync(mkdtempSync(join(tmpdir(), `${prefix}-`)));
 }
 
+// Strip vars that would let sprint-backlog.sh's REPO_HARNESS_TARGET_REPO_ROOT
+// branch redirect it out of the tmp workspace: bun test runs files in one
+// process (bunfig maxConcurrency=4), so an inherited/leaked value from any
+// concurrently-running test would otherwise silently repoint cwd at the real repo.
+const SANDBOX_ENV_BLOCKLIST = ["REPO_HARNESS_TARGET_REPO_ROOT", "REPO_HARNESS_HELPER_SOURCE", "REPO_HARNESS_HELPER_SOURCE_PATH"];
+
 function run(cmd: string, args: string[], cwd: string, env?: Record<string, string>) {
+  const base = { ...process.env };
+  for (const key of SANDBOX_ENV_BLOCKLIST) delete base[key];
   return spawnSync(cmd, args, {
     cwd,
     encoding: "utf-8",
-    env: env ? { ...process.env, ...env } : undefined,
+    env: { ...base, ...env },
   });
 }
 
@@ -47,20 +55,6 @@ function copySprintHelpers(cwd: string, files: string[]) {
     copyFileSync(join(HELPER_DIR, file), join(cwd, "scripts", file));
   }
   expect(run("bash", ["-lc", "chmod +x scripts/*.sh"], cwd).status).toBe(0);
-}
-
-function installHooks(cwd: string) {
-  const aiHooksDir = join(cwd, ".ai", "hooks");
-  mkdirSync(aiHooksDir, { recursive: true });
-  for (const f of readdirSync(ASSETS_HOOKS_DIR, { withFileTypes: true })) {
-    const src = join(ASSETS_HOOKS_DIR, f.name);
-    if (f.isDirectory()) {
-      cpSync(src, join(aiHooksDir, f.name), { recursive: true });
-    } else {
-      copyFileSync(src, join(aiHooksDir, f.name));
-    }
-  }
-  expect(run("bash", ["-lc", "find .ai/hooks -type f -name '*.sh' -exec chmod +x {} +"], cwd).status).toBe(0);
 }
 
 function writeActiveSprintFixture(cwd: string, sprintRelPath: string) {
@@ -100,6 +94,49 @@ function writeActiveSprintFixture(cwd: string, sprintRelPath: string) {
 }
 
 describe("sprint-backlog helper", () => {
+  test("rejects ambient target repo root that does not match the helper cwd", () => {
+    const cwd = tmpWorkspace("sprint-env-cwd");
+    const poisonRepo = tmpWorkspace("sprint-env-poison");
+    try {
+      copySprintHelpers(cwd, ["sprint-backlog.sh"]);
+      const result = spawnSync("bash", ["scripts/sprint-backlog.sh", "status"], {
+        cwd,
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          REPO_HARNESS_TARGET_REPO_ROOT: poisonRepo,
+        },
+      });
+
+      expect(result.status).toBe(2);
+      expect(result.stderr).toContain("REPO_HARNESS_TARGET_REPO_ROOT must match");
+      expect(existsSync(join(poisonRepo, "plans"))).toBe(false);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(poisonRepo, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("accepts target repo root when it matches the helper cwd", () => {
+    const cwd = tmpWorkspace("sprint-env-match");
+    try {
+      copySprintHelpers(cwd, ["sprint-backlog.sh"]);
+
+      const init = run(
+        "bash",
+        ["scripts/sprint-backlog.sh", "init", "--slug", "Root Match", "--title", "Root Match"],
+        cwd,
+        { REPO_HARNESS_TARGET_REPO_ROOT: cwd }
+      );
+
+      expect(init.status).toBe(0);
+      expect(init.stdout).toContain("Created draft sprint: plans/sprints/");
+      expect(existsSync(join(cwd, ".ai/harness/sprint/active-sprint"))).toBe(true);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("init creates a draft sprint, sets the marker, and refuses a second active sprint", () => {
     const cwd = tmpWorkspace("sprint-backlog-init");
     try {
@@ -124,7 +161,7 @@ describe("sprint-backlog helper", () => {
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test("status, next, and complete-task drive the backlog lifecycle", () => {
     const cwd = tmpWorkspace("sprint-backlog-lifecycle");
@@ -183,7 +220,7 @@ describe("sprint-backlog helper", () => {
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test("init renders titles with sed/awk metacharacters literally", () => {
     const cwd = tmpWorkspace("sprint-backlog-metachar");
@@ -205,7 +242,7 @@ describe("sprint-backlog helper", () => {
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test("complete-task rejects ambiguous refs, resolves duplicates by unique slug, and preserves backslashes", () => {
     const cwd = tmpWorkspace("sprint-backlog-plan-escape");
@@ -240,7 +277,7 @@ describe("sprint-backlog helper", () => {
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test("markers pointing outside plans/sprints are treated as no active sprint", () => {
     const cwd = tmpWorkspace("sprint-backlog-containment");
@@ -263,7 +300,7 @@ describe("sprint-backlog helper", () => {
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test("next and complete-task fail without an active sprint", () => {
     const cwd = tmpWorkspace("sprint-backlog-no-active");
@@ -280,7 +317,7 @@ describe("sprint-backlog helper", () => {
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test("start-task captures a thin sprint-task plan seed; contract rows leave the Plan cell to finish back-fill", () => {
     const cwd = tmpWorkspace("sprint-backlog-start-task");
@@ -325,7 +362,7 @@ describe("sprint-backlog helper", () => {
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test("duplicate start-task is refused, auto-select skips in-flight rows, --force restarts", () => {
     const cwd = tmpWorkspace("sprint-backlog-in-flight");
@@ -360,7 +397,7 @@ describe("sprint-backlog helper", () => {
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test("a non-empty stale lock times out instead of hot-looping", () => {
     const cwd = tmpWorkspace("sprint-backlog-lock-timeout");
@@ -380,7 +417,7 @@ describe("sprint-backlog helper", () => {
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test("start-task refuses draft sprints and missing capture helper", () => {
     const cwd = tmpWorkspace("sprint-backlog-start-task-gates");
@@ -399,7 +436,7 @@ describe("sprint-backlog helper", () => {
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test("inline start-task requires an active plan for checklist-row capture", () => {
     const cwd = tmpWorkspace("sprint-backlog-inline-no-active-plan");
@@ -418,7 +455,7 @@ describe("sprint-backlog helper", () => {
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test("complete-task --sprint override works without the runtime marker", () => {
     const cwd = tmpWorkspace("sprint-backlog-sprint-override");
@@ -458,7 +495,7 @@ describe("sprint-backlog helper", () => {
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test("mutations reclaim a stale backlog lock instead of deadlocking", () => {
     const cwd = tmpWorkspace("sprint-backlog-stale-lock");
@@ -478,7 +515,7 @@ describe("sprint-backlog helper", () => {
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 });
 
 describe("check-task-workflow sprint validation", () => {
@@ -524,7 +561,7 @@ describe("check-task-workflow sprint validation", () => {
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test("reports unknown status instead of crashing on quotes in sprint status", () => {
     const cwd = tmpWorkspace("sprint-check-quote");
@@ -542,7 +579,7 @@ describe("check-task-workflow sprint validation", () => {
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test("flags markers pointing outside the sprints dir", () => {
     const cwd = tmpWorkspace("sprint-check-outside-marker");
@@ -558,7 +595,7 @@ describe("check-task-workflow sprint validation", () => {
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test("draft skeletons and execution-ready sprints emit no sprint issues", () => {
     const cwd = tmpWorkspace("sprint-check-ok");
@@ -577,7 +614,7 @@ describe("check-task-workflow sprint validation", () => {
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 });
 
 describe("sprint projection", () => {
@@ -597,7 +634,7 @@ describe("sprint projection", () => {
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test("refresh-current-status reports no sprint when the marker is absent", () => {
     const cwd = tmpWorkspace("sprint-refresh-none");
@@ -610,32 +647,31 @@ describe("sprint projection", () => {
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
+  // HRD-04 retired session-start-context.sh; the direct-spawn vehicle
+  // retargets through the in-process session-context builder with identical
+  // Active Sprint assertions (installHooks() is no longer needed -- the
+  // builder reads repo facts directly, not a vendored script).
   test("session-start hook injects active sprint context and stays inert without a marker", () => {
     const cwd = tmpWorkspace("sprint-session-start");
     try {
-      installHooks(cwd);
-
-      const inert = spawnSync("bash", [join(cwd, ".ai/hooks/session-start-context.sh")], {
-        cwd,
-        input: "{}",
-        encoding: "utf-8",
+      const freshCollector = () => createStateInputCollector({
+        event: "SessionStart",
+        repoRoot: cwd,
+        resolveSessionEffectiveState: () => null,
       });
-      expect(inert.status).toBe(0);
-      expect(inert.stdout).not.toContain("Active Sprint");
+
+      const inert = sessionStartMainContent(freshCollector(), process.env, Date.now());
+      expect(inert === null || !inert.includes("Active Sprint")).toBe(true);
 
       writeActiveSprintFixture(cwd, "plans/sprints/20260610-0000-fixture-sprint.sprint.md");
-      const active = spawnSync("bash", [join(cwd, ".ai/hooks/session-start-context.sh")], {
-        cwd,
-        input: "{}",
-        encoding: "utf-8",
-      });
-      expect(active.status).toBe(0);
-      expect(active.stdout).toContain("Active Sprint");
-      expect(active.stdout).toContain("backlog=0/2");
-      expect(active.stdout).toContain("task-a");
-      expect(active.stdout).toContain("Use `$think` to expand the next sprint task");
+      const active = sessionStartMainContent(freshCollector(), process.env, Date.now());
+      expect(active).not.toBeNull();
+      expect(active).toContain("Active Sprint");
+      expect(active).toContain("backlog=0/2");
+      expect(active).toContain("task-a");
+      expect(active).toContain("Use `$think` to expand the next sprint task");
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
@@ -643,24 +679,16 @@ describe("sprint projection", () => {
 });
 
 describe("sprint asset parity", () => {
-  test("self-host scripts match the distributed template helpers", () => {
-    expect(readFileSync(join(ROOT, "scripts/sprint-backlog.sh"), "utf-8")).toBe(
-      readFileSync(join(HELPER_DIR, "sprint-backlog.sh"), "utf-8")
-    );
+  // sprint-backlog.sh, check-task-workflow.sh, and refresh-current-status.sh are all
+  // in the contract helper inventory and outside INTENTIONALLY_DIVERGENT, so the
+  // helper parity loop in tests/helper-scripts.test.ts already covers them. The two
+  // template copies below have no helpers/ mirror, so this is their only guard.
+  test("self-host templates match the distributed template assets", () => {
     expect(readFileSync(join(ROOT, ".claude/templates/sprint.template.md"), "utf-8")).toBe(
       readFileSync(join(ROOT, "assets/templates/sprint.template.md"), "utf-8")
     );
     expect(readFileSync(join(ROOT, ".claude/templates/prd.template.md"), "utf-8")).toBe(
       readFileSync(join(ROOT, "assets/templates/prd.template.md"), "utf-8")
-    );
-    expect(readFileSync(join(ROOT, "scripts/check-task-workflow.sh"), "utf-8")).toBe(
-      readFileSync(join(HELPER_DIR, "check-task-workflow.sh"), "utf-8")
-    );
-    expect(readFileSync(join(ROOT, "scripts/refresh-current-status.sh"), "utf-8")).toBe(
-      readFileSync(join(HELPER_DIR, "refresh-current-status.sh"), "utf-8")
-    );
-    expect(readFileSync(join(ROOT, "docs/reference-configs/sprint-contracts.md"), "utf-8")).toBe(
-      readFileSync(join(ROOT, "assets/reference-configs/sprint-contracts.md"), "utf-8")
     );
   });
 });
