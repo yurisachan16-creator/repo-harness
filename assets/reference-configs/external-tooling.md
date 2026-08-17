@@ -353,6 +353,37 @@ It is not yet an automatic `repo-harness check` gate:
 - missing, skipped, or partial external evidence should be recorded as
   validation gaps, not treated as implicit passes
 
+### Acceptance boundary
+
+In repo-harness 0.15.2, keep these three artifacts distinct:
+
+1. The external manifest is provider-authored supporting evidence under the
+   ignored runtime surface. Its `outcome.status: pass` is not harness acceptance.
+2. `verify-sprint --prepare-acceptance` creates the canonical verification
+   evidence after the active contract's commands and exact manual checks pass.
+   It binds the normalized final subject, Change Assessment selection packet,
+   target revision, contract, review, allowed paths, and benchmark requirement.
+   It does not automatically ingest an external manifest.
+3. The host-owned protocol-2 `AcceptanceReceipt` records the semantic
+   disposition after prepared verification. Its `source` is closed to a
+   host-owned semantic reviewer or owner waiver; an external provider cannot
+   issue `external_pass`, create a waiver, or authorize merge.
+
+Until automatic ingestion exists, a task that depends on external runtime
+evidence must freeze that requirement in the active contract. Use a
+project-owned `tests_pass` or `commands_succeed` validator that checks the
+manifest schema, exact subject binding, artifact digests, validation gaps, and
+side effects, or name an exact `manual_checks` observation with concrete review
+evidence. Any validator must fail closed on missing, stale, partial, or
+unredacted evidence. Run `verify-sprint --prepare-acceptance` only after that
+contract evidence passes; the contract-frozen semantic reviewer may then inspect
+the manifest and artifacts before the host records the `AcceptanceReceipt`.
+
+For a dirty worktree, branch and commit alone do not identify the bytes that
+were tested. Providers should copy the current Change Assessment selection
+packet's exact-subject fields into the manifest. These fields remain claims
+until the project-owned validator compares them with the current packet:
+
 Recommended runtime layout:
 
 ```text
@@ -377,6 +408,10 @@ Minimal manifest shape:
     "version": "1.5.0"
   },
   "subject": {
+    "scope": "normalized-final-content",
+    "review_subject_sha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "target_ref": "refs/remotes/origin/main",
+    "target_revision": "0123456789abcdef0123456789abcdef01234567",
     "task_type": "unity.ui",
     "branch": "feat/example",
     "commit": "26eff6fc70b2c24cc3a00616204d3611f61df18e",
@@ -423,7 +458,9 @@ paths inside a manifest are relative to the manifest directory unless explicitly
 documented otherwise. Providers should prefer summaries over absolute local
 paths, mark whether artifacts are redacted, avoid storing secrets or private
 payloads in durable summaries, and record skipped validation explicitly so
-reviewers can see what was not exercised.
+reviewers can see what was not exercised. The exact-subject fields do not make
+the manifest an `AcceptanceReceipt`; they only let a project-owned validator
+reject evidence for stale or different content.
 
 Use `read_only` only when the provider did not mutate project files, runtime
 caches, devices, external services, or build outputs.
