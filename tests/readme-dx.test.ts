@@ -154,6 +154,10 @@ describe("README DX contract", () => {
     const spec = read("docs/spec.md");
     const flow = read("docs/reference-configs/agentic-development-flow.md");
     const externalTooling = read("docs/reference-configs/external-tooling.md");
+    const externalToolingAsset = read("assets/reference-configs/external-tooling.md");
+    const externalEvidenceResearch = read(
+      "docs/researches/20260629-external-verification-evidence-contract.md",
+    );
 
     expect(spec).toContain("## Product Outcome");
     expect(spec).toContain("## Core Invariants");
@@ -171,16 +175,27 @@ describe("README DX contract", () => {
     expect(readme).toContain("external verification manifests");
     expect(readme).toContain("manual convention today");
     expect(readme).toMatch(/not an automatic\s+`repo-harness check` gate/);
+    expect(readme).toContain("not an `AcceptanceReceipt`");
+    expect(readme).toContain("`verify-sprint --prepare-acceptance`");
     expect(zhReadme).toContain("external verification manifest");
     expect(zhReadme).toContain("人工约定");
     expect(zhReadme).toContain("`repo-harness check` 会自动执行的 gate");
+    expect(zhReadme).toContain("不是 `AcceptanceReceipt`");
+    expect(externalToolingAsset).toBe(externalTooling);
     expect(externalTooling).toContain("## External Verification Evidence");
+    expect(externalTooling).toContain("### Acceptance boundary");
     expect(externalTooling).toContain("convention only");
     expect(externalTooling).toContain("does not automatically discover");
     expect(externalTooling).toContain("not yet an automatic `repo-harness check` gate");
+    expect(externalTooling).toContain("an external provider cannot");
+    expect(externalTooling).toContain('"scope": "normalized-final-content"');
+    expect(externalTooling).toContain('"review_subject_sha256": "sha256:');
     expect(externalTooling).toContain(".ai/harness/runs/external/<task-id>/<run-id>/manifest.json");
     expect(externalTooling).toContain("relative to the manifest directory");
     expect(externalTooling).toContain("\"side_effects\": \"writes_ignored_runtime_state\"");
+    expect(externalEvidenceResearch).toContain("protocol-2 `AcceptanceReceipt`");
+    expect(externalEvidenceResearch).toContain("closed `source` enum");
+    expect(externalEvidenceResearch).toMatch(/must never\s+become an acceptance gate/);
   });
 
   test("localized READMEs track the current English release surface", () => {

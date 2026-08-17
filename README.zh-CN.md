@@ -355,6 +355,10 @@ rig、staging smoke test）可以把 external verification manifest 发布到
 被忽略的 run-evidence surface——目前这只是人工约定，还不是
 `repo-harness check` 会自动执行的 gate。见
 [external tooling](docs/reference-configs/external-tooling.md#external-verification-evidence)。
+Manifest 只是 provider 产生的辅助证据，不是 `AcceptanceReceipt`；它不能签发
+`external_pass`，也不能授权 merge。依赖它的 task 必须在 active contract 中声明
+项目自有的 validator 或精确 manual check，再由
+`verify-sprint --prepare-acceptance` 把结果绑定到 normalized final subject。
 
 ## Skills
 

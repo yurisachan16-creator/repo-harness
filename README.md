@@ -351,6 +351,11 @@ staging smoke tests) can publish external verification manifests under the
 ignored run-evidence surface — a manual convention today, not an automatic
 `repo-harness check` gate. See
 [external tooling](docs/reference-configs/external-tooling.md#external-verification-evidence).
+The manifest is supporting provider evidence, not an `AcceptanceReceipt`; it
+cannot issue `external_pass` or authorize a merge. A task that depends on it
+must put a project-owned validator or exact manual check in the active contract
+before `verify-sprint --prepare-acceptance` binds the result to the normalized
+final subject.
 
 ## Skills
 
